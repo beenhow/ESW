@@ -1,0 +1,22 @@
+# Flutter/Dart
+.dart_tool/
+.packages
+build/
+*.iml
+.idea/
+.vscode/
+*.lock
+pubspec.lock
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (user-specific, should not be versioned)
+esw_config.json
+eva_config.json
+
+# Build logs
+build_log*.txt
+cmake_build.txt
+debug_build.log
