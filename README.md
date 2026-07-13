@@ -1,16 +1,5 @@
 # ESW
 
-A new Flutter project.
+Exam-tested Syllabus Words（真题课标词）
 
-## Getting Started
-
-This project is a starting point for a Flutter application.
-
-A few resources to get you started if this is your first Flutter project:
-
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+E = Exam-tested（真题验证的），S = Syllabus（课标/考纲），W = Words（词汇）。
