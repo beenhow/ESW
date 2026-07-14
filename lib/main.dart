@@ -3,6 +3,8 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:file_picker/file_picker.dart';
 import 'dart:async';
 import 'dart:collection';
+import 'dart:ffi' hide Size;
+import 'package:ffi/ffi.dart';
 import 'theme/app_theme.dart';
 import 'dart:convert';
 import 'dart:io';
@@ -12,6 +14,13 @@ import 'package:archive/archive.dart';
 import 'package:xml/xml.dart';
 import 'package:pdfrx/pdfrx.dart';
 import 'package:path/path.dart' as p;
+
+typedef _GetDroppedFileC = Pointer<Utf8> Function();
+typedef _GetDroppedFileDart = Pointer<Utf8> Function();
+
+final DynamicLibrary _exeLib = DynamicLibrary.process();
+final _GetDroppedFileDart _getDroppedFile = _exeLib
+    .lookupFunction<_GetDroppedFileC, _GetDroppedFileDart>('get_dropped_file');
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -108,9 +117,12 @@ class _MainWindowState extends State<MainWindow> {
   int? _selectedYear;
 
   // ======== 导入文本分析 ========
+  bool _isDragging = false;
   bool _inImportedMode = false;
   String? _importedFileName;
   String? _importedFilePath;
+  /// 已筛选过的文件路径集合，打开这些文件时自动积累分类结果
+  final Set<String> _processedFilePaths = {};
   List<_ImportedWord> _importedWords = [];
   String _importedActiveFilter = '真题词';
   int _importedTotalWords = 0;
@@ -183,10 +195,21 @@ class _MainWindowState extends State<MainWindow> {
   @override
   void initState() {
     super.initState();
+    _initDragDrop();
     _initOcr();
     _loadStandardWords();
     _loadConfig();
     _autoImportLast();
+  }
+
+  void _initDragDrop() {
+    Timer.periodic(const Duration(milliseconds: 300), (_) {
+      final ptr = _getDroppedFile();
+      if (ptr != nullptr) {
+        final path = ptr.toDartString();
+        _handleDroppedFile(path);
+      }
+    });
   }
 
   Future<void> _initOcr() async {
@@ -315,6 +338,12 @@ class _MainWindowState extends State<MainWindow> {
       for (final w in _manualExtraWords) {
         _classificationMemory[w.toLowerCase()] = '专有词';
       }
+
+      // 加载已筛选文件路径集合
+      final pf = json['processedFilePaths'];
+      if (pf is List) {
+        _processedFilePaths.addAll(pf.map((e) => e.toString()));
+      }
     } catch (_) {}
   }
 
@@ -377,6 +406,7 @@ class _MainWindowState extends State<MainWindow> {
         'manualChaoGangWords': _manualChaoGangWords.toList(),
         'manualExtraWords': _manualExtraWords.toList(),
         'classificationMemory': _classificationMemory,
+        'processedFilePaths': _processedFilePaths.toList(),
       };
       final data = jsonEncode(json);
       File(_configPath).writeAsString(data);
@@ -659,6 +689,37 @@ class _MainWindowState extends State<MainWindow> {
     }
   }
 
+  /// 拖拽文件到输入框时自动读取内容并开始检测
+  Future<void> _handleDroppedFile(String filePath) async {
+    final ext = filePath.toLowerCase();
+    if (!ext.endsWith('.txt') && !ext.endsWith('.docx') && !ext.endsWith('.pdf')) {
+      return;
+    }
+    try {
+      String content;
+      if (ext.endsWith('.docx')) {
+        content = _readDocxContent(filePath);
+      } else if (ext.endsWith('.pdf')) {
+        content = await _readPdfContent(filePath);
+      } else {
+        content = File(filePath).readAsStringSync();
+      }
+      _searchController.text = content;
+      _importedFileName = File(filePath).uri.pathSegments.last;
+      _importedFilePath = filePath;
+      _lastDocImportPath = File(filePath).parent.path;
+      _lastImportMode = 'files';
+      await _analyzeImportedText();
+      _saveConfig();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('导入失败: $e')),
+        );
+      }
+    }
+  }
+
   void _applyCorpusFiles(List<CorpusFile> files) {
     if (files.isEmpty) return;
     files.sort((a, b) => a.name.compareTo(b.name));
@@ -889,6 +950,54 @@ class _MainWindowState extends State<MainWindow> {
   }
 
   /// 分析导入文本中的所有单词
+  /// 自动将已筛选文件的分析结果积累到全局词汇列表
+  void _autoAccumulateImportedResults() {
+    if (_importedFilePath == null) return;
+    // 未被标记为已处理时，检查是否存在分类记忆（历史兼容：v1.2.70 及之前无 processedFilePaths）
+    if (!_processedFilePaths.contains(_importedFilePath!)) {
+      final hasClassified = _importedWords.any(
+        (iw) => _classificationMemory.containsKey(iw.word.toLowerCase()),
+      );
+      if (!hasClassified) return;
+      _processedFilePaths.add(_importedFilePath!);
+    }
+
+    for (final iw in _importedWords) {
+      final cat = _classificationMemory[iw.word.toLowerCase()];
+      if (cat == null) continue;
+      switch (cat) {
+        case '拓展词':
+          final alreadyExisted = _extendWords.any((e) => e.toLowerCase() == iw.word.toLowerCase());
+          if (!alreadyExisted) {
+            _extendWords.add(iw.word);
+            _filterCounts['拓展词'] = (_filterCounts['拓展词'] ?? 0) + 1;
+          }
+          // 如果缺失 base map 映射，用标准词列表补充
+          if (!_extendBaseMap.containsKey(iw.word)) {
+            final suggestions = _findBestSyllabusMatch(iw.word);
+            if (suggestions.isNotEmpty) {
+              _extendBaseMap[iw.word] = suggestions.first;
+              _extendReverseIndex[iw.word.toLowerCase()] = suggestions.first.toLowerCase();
+            }
+          }
+          break;
+        case '超纲词':
+          if (!_manualChaoGangWords.any((e) => e.toLowerCase() == iw.word.toLowerCase())) {
+            _manualChaoGangWords.add(iw.word);
+            _filterCounts['超纲词'] = (_filterCounts['超纲词'] ?? 0) + 1;
+          }
+          break;
+        case '专有词':
+          if (!_manualExtraWords.any((e) => e.toLowerCase() == iw.word.toLowerCase())) {
+            _manualExtraWords.add(iw.word);
+            _filterCounts['专有词'] = (_filterCounts['专有词'] ?? 0) + 1;
+          }
+          break;
+      }
+    }
+    _saveConfig();
+  }
+
   Future<void> _analyzeImportedText() async {
     final text = _searchController.text.trim();
     if (text.isEmpty) {
@@ -989,6 +1098,7 @@ class _MainWindowState extends State<MainWindow> {
         ..clear()
         ..addAll(counts);
     });
+    _autoAccumulateImportedResults();
   }
 
   @override
@@ -997,16 +1107,16 @@ class _MainWindowState extends State<MainWindow> {
 
     return Scaffold(
       body: Row(
-        children: [
-          RepaintBoundary(
-            child: SizedBox(width: leftWidth, child: _buildLeftPanel()),
-          ),
-          const VerticalDivider(width: 1, thickness: 1),
-          Expanded(
-            child: RepaintBoundary(child: _buildRightPanel()),
-          ),
-        ],
-      ),
+          children: [
+            RepaintBoundary(
+              child: SizedBox(width: leftWidth, child: _buildLeftPanel()),
+            ),
+            const VerticalDivider(width: 1, thickness: 1),
+            Expanded(
+              child: RepaintBoundary(child: _buildRightPanel()),
+            ),
+          ],
+        ),
     );
   }
 
@@ -1622,6 +1732,16 @@ class _MainWindowState extends State<MainWindow> {
             .where((iw) => iw.category == _importedActiveFilter)
             .toList();
       }
+      // 专有词优先显示未筛选分类的单词，已标记专有词排在末尾
+      if (_importedActiveFilter == '专有词') {
+        _cachedFilteredImportedWords.sort((a, b) {
+          final aManual = _manualExtraWords.any((e) => e.toLowerCase() == a.word.toLowerCase());
+          final bManual = _manualExtraWords.any((e) => e.toLowerCase() == b.word.toLowerCase());
+          if (aManual && !bManual) return 1;
+          if (!aManual && bManual) return -1;
+          return 0;
+        });
+      }
       _cachedImportedFilter = _importedActiveFilter;
       _cachedImportedWordsRef = _importedWords;
     }
@@ -1981,12 +2101,28 @@ class _MainWindowState extends State<MainWindow> {
         break;
     }
 
+    // 专有词筛选模式：自动进入下一个专有词
+    if (_importedActiveFilter == '专有词') {
+      for (final next in _importedWords) {
+        if (next.category == '专有词' && !cancelled.contains(next.word)) {
+          await _startClassifyBatch(next, cancelled: cancelled);
+          return;
+        }
+      }
+    }
+
     // 查找下一个未标记且未被跳过的真题词
     for (final next in _importedWords) {
       if (next.isInCorpus && next.category == '真题词' && !cancelled.contains(next.word)) {
         await _startClassifyBatch(next, cancelled: cancelled);
         return;
       }
+    }
+
+    // 批量筛选走完——标记当前文件为已处理，下次打开自动积累
+    if (_importedFilePath != null) {
+      _processedFilePaths.add(_importedFilePath!);
+      _saveConfig();
     }
   }
 
@@ -2041,90 +2177,112 @@ class _MainWindowState extends State<MainWindow> {
             child: CompositedTransformTarget(
               link: _searchBoxLink,
               child: Stack(
-                key: _searchBoxKey,
-                alignment: Alignment.center,
-                children: [
-                  TextField(
-                    controller: _searchController,
-                    focusNode: _searchFocus,
-                    maxLines: 10,
-                    minLines: 1,
-                    textAlignVertical: TextAlignVertical.center,
-                    style: const TextStyle(fontSize: 14),
-                    decoration: const InputDecoration(
-                      hintText: '',
-                      contentPadding: EdgeInsets.symmetric(
-                          horizontal: 16, vertical: 12),
-                      border: OutlineInputBorder(
-                          borderRadius: BorderRadius.all(Radius.circular(6))),
-                      focusedBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.all(Radius.circular(6)),
-                        borderSide: BorderSide(
-                          color: AppTheme.primaryBlue,
-                          width: 1.5,
+                    key: _searchBoxKey,
+                    alignment: Alignment.center,
+                    children: [
+                      TextField(
+                        controller: _searchController,
+                        focusNode: _searchFocus,
+                        maxLines: 10,
+                        minLines: 1,
+                        textAlignVertical: TextAlignVertical.center,
+                        style: const TextStyle(fontSize: 14),
+                        decoration: const InputDecoration(
+                          hintText: '',
+                          contentPadding: EdgeInsets.symmetric(
+                              horizontal: 16, vertical: 12),
+                          border: OutlineInputBorder(
+                              borderRadius: BorderRadius.all(Radius.circular(6))),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.all(Radius.circular(6)),
+                            borderSide: BorderSide(
+                              color: AppTheme.primaryBlue,
+                              width: 1.5,
+                            ),
+                          ),
+                          isDense: false,
+                          filled: true,
+                          fillColor: Color(0xFFF5F5F5),
                         ),
-                      ),
-                      isDense: false,
-                      filled: true,
-                      fillColor: Color(0xFFF5F5F5),
-                    ),
-                    onChanged: (_) {
-                      final text = _searchController.text;
-                      // maxLines>1 旀Enter 产生换行而非 onSubmitted，单行单词按 Enter 触发检测
-                      if (text.contains('\n')) {
-                        final trimmed = text.trim();
-                        if (!trimmed.contains(_anyWhitespaceChar)) {
-                          _searchController.text = trimmed;
-                          _searchController.selection = TextSelection.collapsed(offset: trimmed.length);
+                        onChanged: (_) {
+                          final text = _searchController.text;
+                          // maxLines>1 旀Enter 产生换行而非 onSubmitted，单行单词按 Enter 触发检测
+                          if (text.contains('\n')) {
+                            final trimmed = text.trim();
+                            if (!trimmed.contains(_anyWhitespaceChar)) {
+                              _searchController.text = trimmed;
+                              _searchController.selection = TextSelection.collapsed(offset: trimmed.length);
+                              _onDetect();
+                              _cancelHistoryTimer();
+                              setState(() => _showHistory = false);
+                              return;
+                            }
+                          }
+                          _cancelHistoryTimer();
+                          setState(() {
+                            _showHistory = false;
+                          });
+                          // 检测是否为多单词文本（粘贴场景），自动切换导入模式
+                          final trimmed = _searchController.text.trim();
+                          if (trimmed.contains(_anyWhitespaceChar) &&
+                              _wordTokenRegex.allMatches(trimmed).length >= 2) {
+                            _importedFileName = null;
+                            _analyzeImportedText();
+                          } else if (trimmed.isEmpty) {
+                            setState(() {
+                              _inImportedMode = false;
+                              _importedWords.clear();
+                            });
+                          }
+                        },
+                        onTap: () {
+                          setState(() => _showHistory = true);
+                          _cancelHistoryTimer();
+                          _historyTimer = Timer(const Duration(seconds: 2), () {
+                            if (mounted) setState(() => _showHistory = false);
+                          });
+                        },
+                        onSubmitted: (_) {
                           _onDetect();
                           _cancelHistoryTimer();
                           setState(() => _showHistory = false);
-                          return;
-                        }
-                      }
-                      _cancelHistoryTimer();
-                      setState(() {
-                        _showHistory = false;
-                      });
-                      // 检测是否为多单词文本（粘贴场景），自动切换导入模式
-                      final trimmed = _searchController.text.trim();
-                      if (trimmed.contains(_anyWhitespaceChar) &&
-                          _wordTokenRegex.allMatches(trimmed).length >= 2) {
-                        _importedFileName = null;
-                        _analyzeImportedText();
-                      } else if (trimmed.isEmpty) {
-                        setState(() {
-                          _inImportedMode = false;
-                          _importedWords.clear();
-                        });
-                      }
-                    },
-                    onTap: () {
-                      setState(() => _showHistory = true);
-                      _cancelHistoryTimer();
-                      _historyTimer = Timer(const Duration(seconds: 2), () {
-                        if (mounted) setState(() => _showHistory = false);
-                      });
-                    },
-                    onSubmitted: (_) {
-                      _onDetect();
-                      _cancelHistoryTimer();
-                      setState(() => _showHistory = false);
-                    },
-                  ),
-                  IgnorePointer(
-                    child: AnimatedOpacity(
-                      opacity: _searchController.text.isEmpty ? 1.0 : 0.0,
-                      duration: const Duration(milliseconds: 150),
-                      child: const Text(
-                        '输入单词或者粘贴文本后按Enter检测',
-                        style: TextStyle(fontSize: 14, color: AppTheme.textDisabled),
+                        },
                       ),
-                    ),
-                  ),
-                ],
+                      IgnorePointer(
+                        child: AnimatedOpacity(
+                          opacity: _searchController.text.isEmpty ? 1.0 : 0.0,
+                          duration: const Duration(milliseconds: 150),
+                          child: const Text(
+                            '输入单词或者粘贴文本后按Enter检测',
+                            style: TextStyle(fontSize: 14, color: AppTheme.textDisabled),
+                          ),
+                        ),
+                      ),
+                      // 拖拽文件时的视觉提示
+                      if (_isDragging)
+                        Positioned.fill(
+                          child: IgnorePointer(
+                            child: Container(
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(6),
+                                border: Border.all(color: AppTheme.primaryBlue, width: 2),
+                                color: AppTheme.primaryBlue.withValues(alpha: 0.05),
+                              ),
+                              alignment: Alignment.center,
+                              child: const Text(
+                                '松开以导入文档',
+                                style: TextStyle(
+                                  color: AppTheme.primaryBlue,
+                                  fontWeight: FontWeight.w600,
+                                  fontSize: 14,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                    ],
               ),
-            ),
+          ),
           ),
           const SizedBox(width: 12),
           _buildToolbarRightButton(),
@@ -4556,11 +4714,9 @@ print("OK")
       }
     }
 
-    pruneSet(_manualChaoGangWords, '超纲词',
-        (w) => _manualChaoGangWords.remove(w));
-    pruneSet(_extendWords, '拓展词', (w) => _extendWords.remove(w));
-    pruneSet(_manualExtraWords, '专有词',
-        (w) => _manualExtraWords.remove(w));
+    // ⚠️ 全局词汇列表（超纲词/拓展词/专有词）不在此处修剪
+    //    它们是跨文档累积的结果，仅当用户在对话框中手动移除时才删除。
+    //    此处只做导入文档的 filterCounts 同步（会话级计数可重置）
 
     if (changed) {
       _saveConfig();
