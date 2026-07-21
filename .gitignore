@@ -20,3 +20,6 @@ eva_config.json
 build_log*.txt
 cmake_build.txt
 debug_build.log
+
+# APK
+eva.apk

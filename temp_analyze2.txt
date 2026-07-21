@@ -1,0 +1,266 @@
+﻿Resolving dependencies...
+Downloading packages...
+  _fe_analyzer_shared 85.0.0 (105.0.0 available)
+  analyzer 7.7.1 (14.1.0 available)
+  archive 3.6.1 (4.0.9 available)
+  characters 1.4.0 (1.4.1 available)
+  cli_util 0.4.2 (0.5.1 available)
+  cross_file 0.3.5+2 (0.3.5+4 available)
+  flutter_lints 5.0.0 (6.0.0 available)
+  flutter_plugin_android_lifecycle 2.0.34 (2.0.35 available)
+  lints 5.1.1 (6.1.0 available)
+  matcher 0.12.17 (0.12.20 available)
+  material_color_utilities 0.11.1 (0.13.0 available)
+  meta 1.16.0 (1.19.0 available)
+  package_config 2.2.0 (3.0.0 available)
+  pana 0.22.21 (0.23.14 available)
+  path_provider 2.1.5 (2.1.6 available)
+  path_provider_android 2.2.23 (2.3.1 available)
+  path_provider_foundation 2.5.1 (2.6.0 available)
+  path_provider_linux 2.2.1 (2.2.2 available)
+  path_provider_platform_interface 2.1.2 (2.1.3 available)
+  pdfrx 1.3.5 (2.4.7 available)
+  synchronized 3.4.0 (3.4.1 available)
+  test 1.26.2 (1.31.2 available)
+  test_api 0.7.6 (0.7.13 available)
+  test_core 0.6.11 (0.6.19 available)
+  url_launcher_android 6.3.29 (6.3.32 available)
+  url_launcher_ios 6.3.6 (6.4.1 available)
+  url_launcher_web 2.4.1 (2.4.3 available)
+  vector_math 2.2.0 (2.4.0 available)
+  win32 5.15.0 (6.3.0 available)
+  xml 6.6.1 (7.0.1 available)
+Got dependencies!
+30 packages have newer versions incompatible with dependency constraints.
+Try `flutter pub outdated` for more information.
+Analyzing android_app.dart...                                   
+
+  error - The method 'cancel' can't be unconditionally invoked because the receiver can be 'null' - lib\android_app.dart:47:21 - unchecked_use_of_nullable_value
+  error - The method '_VocabTabPage' isn't defined for the type '_AndroidEswAppState' - lib\android_app.dart:157:12 - undefined_method
+  error - The method 'copyWith' can't be unconditionally invoked because the receiver can be 'null' - lib\android_app.dart:203:74 - unchecked_use_of_nullable_value
+  error - The method 'copyWith' can't be unconditionally invoked because the receiver can be 'null' - lib\android_app.dart:255:108 - unchecked_use_of_nullable_value
+  error - The method 'cancel' can't be unconditionally invoked because the receiver can be 'null' - lib\android_app.dart:483:39 - unchecked_use_of_nullable_value
+  error - The method 'copyWith' can't be unconditionally invoked because the receiver can be 'null' - lib\android_app.dart:497:109 - unchecked_use_of_nullable_value
+  error - The method 'cancel' can't be unconditionally invoked because the receiver can be 'null' - lib\android_app.dart:529:21 - unchecked_use_of_nullable_value
+  error - The method '_getBaseWordCandidates' isn't defined for the type '_AndroidEswAppState' - lib\android_app.dart:567:28 - undefined_method
+  error - The method '_getBaseWordCandidates' isn't defined for the type '_AndroidEswAppState' - lib\android_app.dart:594:39 - undefined_method
+  error - The method '_getBaseWordCandidates' isn't defined for the type '_AndroidEswAppState' - lib\android_app.dart:596:39 - undefined_method
+warning - Dead code - lib\android_app.dart:826:63 - dead_code
+warning - The left operand can't be null, so the right operand is never executed - lib\android_app.dart:826:66 - dead_null_aware_expression
+warning - Dead code - lib\android_app.dart:940:69 - dead_code
+warning - The left operand can't be null, so the right operand is never executed - lib\android_app.dart:940:72 - dead_null_aware_expression
+  error - The name '_AnalyzedWord' isn't a type, so it can't be used as a type argument - lib\android_app.dart:1200:13 - non_type_as_type_argument
+  error - The method '_AnalyzedWord' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1257:14 - undefined_method
+  error - The property 'frequency' can't be unconditionally accessed because the receiver can be 'null' - lib\android_app.dart:1259:26 - unchecked_use_of_nullable_value
+  error - The property 'frequency' can't be unconditionally accessed because the receiver can be 'null' - lib\android_app.dart:1259:48 - unchecked_use_of_nullable_value
+  error - The name '_AnalyzedWord' isn't a type, so it can't be used as a type argument - lib\android_app.dart:1293:8 - non_type_as_type_argument
+  error - The property 'category' can't be unconditionally accessed because the receiver can be 'null' - lib\android_app.dart:1295:31 - unchecked_use_of_nullable_value
+  error - The method 'cancel' can't be unconditionally invoked because the receiver can be 'null' - lib\android_app.dart:1323:21 - unchecked_use_of_nullable_value
+warning - The declaration '_buildSourceHighlight' isn't referenced - lib\android_app.dart:1335:10 - unused_element
+  error - The method '_chipColor' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1347:61 - undefined_method
+  error - The method 'cancel' can't be unconditionally invoked because the receiver can be 'null' - lib\android_app.dart:1411:21 - unchecked_use_of_nullable_value
+  error - Undefined name '_exportResult' - lib\android_app.dart:1446:24 - undefined_identifier
+  error - The method '_FilterChip' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1463:19 - undefined_method
+  error - The method '_FilterChip' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1464:70 - undefined_method
+  error - The method '_chipColor' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1514:50 - undefined_method
+  error - The method '_chipColor' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1522:40 - undefined_method
+  error - The method '_chipColor' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1527:71 - undefined_method
+  error - The method 'call' can't be unconditionally invoked because the receiver can be 'null' - lib\android_app.dart:1540:63 - unchecked_use_of_nullable_value
+  error - The method '_showBaseWordDialog' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1557:55 - undefined_method
+  error - Function expressions can't be named - lib\android_app.dart:1579:16 - named_function_expression
+  error - The element type 'Future<Null> Function(String)' can't be assigned to the list type 'Widget' - lib\android_app.dart:1579:35 - list_element_type_not_assignable
+  error - Expected to find ',' - lib\android_app.dart:1664:3 - expected_token
+  error - Function expressions can't be named - lib\android_app.dart:1664:10 - named_function_expression
+  error - The element type 'String Function()' can't be assigned to the list type 'Widget' - lib\android_app.dart:1664:29 - list_element_type_not_assignable
+  error - Expected to find ',' - lib\android_app.dart:1696:3 - expected_token
+  error - Function expressions can't be named - lib\android_app.dart:1696:16 - named_function_expression
+  error - The element type 'Future<Null> Function()' can't be assigned to the list type 'Widget' - lib\android_app.dart:1696:29 - list_element_type_not_assignable
+   info - Don't use 'BuildContext's across async gaps, guarded by an unrelated 'mounted' check - lib\android_app.dart:1723:40 - use_build_context_synchronously
+  error - The method '_buildAnnotatedText' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1746:24 - undefined_method
+   info - Don't use 'BuildContext's across async gaps, guarded by an unrelated 'mounted' check - lib\android_app.dart:1750:32 - use_build_context_synchronously
+  error - The method '_exportDocx' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1754:15 - undefined_method
+   info - Don't use 'BuildContext's across async gaps, guarded by an unrelated 'mounted' check - lib\android_app.dart:1756:32 - use_build_context_synchronously
+   info - Don't use 'BuildContext's across async gaps, guarded by an unrelated 'mounted' check - lib\android_app.dart:1761:30 - use_build_context_synchronously
+  error - Expected to find ',' - lib\android_app.dart:1768:3 - expected_token
+  error - Function expressions can't be named - lib\android_app.dart:1768:16 - named_function_expression
+  error - The element type 'Future<Null> Function(String)' can't be assigned to the list type 'Widget' - lib\android_app.dart:1768:27 - list_element_type_not_assignable
+  error - The method '_docxParagraph' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1770:19 - undefined_method
+  error - The method '_docxParagraph' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1771:19 - undefined_method
+  error - The method '_docxParagraph' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1773:19 - undefined_method
+  error - The method '_docxParagraph' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1774:19 - undefined_method
+  error - The method '_docxParagraph' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1775:19 - undefined_method
+  error - The method '_docxParagraph' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1776:19 - undefined_method
+  error - The method '_docxAnnotatedParagraph' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1777:19 - undefined_method
+  error - Expected to find ',' - lib\android_app.dart:1814:3 - expected_token
+  error - Function expressions can't be named - lib\android_app.dart:1814:10 - named_function_expression
+  error - The element type 'String Function(String, {int? heading})' can't be assigned to the list type 'Widget' - lib\android_app.dart:1814:24 - list_element_type_not_assignable
+  error - Expected to find ',' - lib\android_app.dart:1825:3 - expected_token
+  error - Function expressions can't be named - lib\android_app.dart:1825:10 - named_function_expression
+  error - The element type 'String Function()' can't be assigned to the list type 'Widget' - lib\android_app.dart:1825:33 - list_element_type_not_assignable
+  error - The method '_docxRun' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1849:18 - undefined_method
+  error - The method '_docxRun' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1852:18 - undefined_method
+  error - The method '_docxRun' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1854:18 - undefined_method
+  error - The method '_docxRun' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1859:35 - undefined_method
+  error - Expected to find ',' - lib\android_app.dart:1864:3 - expected_token
+  error - Function expressions can't be named - lib\android_app.dart:1864:10 - named_function_expression
+  error - The element type 'String Function(String, String)' can't be assigned to the list type 'Widget' - lib\android_app.dart:1864:18 - list_element_type_not_assignable
+  error - Expected to find ',' - lib\android_app.dart:1872:3 - expected_token
+  error - Function expressions can't be named - lib\android_app.dart:1872:9 - named_function_expression
+  error - The element type 'Color Function(String)' can't be assigned to the list type 'Widget' - lib\android_app.dart:1872:19 - list_element_type_not_assignable
+  error - Expected to find ';' - lib\android_app.dart:1880:3 - expected_token
+  error - Expected to find ')' - lib\android_app.dart:1881:1 - expected_token
+  error - Expected to find ']' - lib\android_app.dart:1881:1 - expected_token
+  error - Classes can't be declared inside other classes - lib\android_app.dart:1883:1 - class_in_class
+  error - Classes can't be declared inside other classes - lib\android_app.dart:1891:1 - class_in_class
+  error - The name '_ScoredWord' isn't a type, so it can't be used as a type argument - lib\android_app.dart:1902:19 - non_type_as_type_argument
+  error - The method '_ScoredWord' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1912:20 - undefined_method
+  error - The method '_ScoredWord' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1918:20 - undefined_method
+  error - The method '_ScoredWord' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1924:20 - undefined_method
+  error - The method '_ScoredWord' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1930:20 - undefined_method
+  error - The property 'score' can't be unconditionally accessed because the receiver can be 'null' - lib\android_app.dart:1937:27 - unchecked_use_of_nullable_value
+  error - The property 'score' can't be unconditionally accessed because the receiver can be 'null' - lib\android_app.dart:1937:45 - unchecked_use_of_nullable_value
+  error - The property 'word' can't be unconditionally accessed because the receiver can be 'null' - lib\android_app.dart:1938:30 - unchecked_use_of_nullable_value
+  error - Classes can't be declared inside other classes - lib\android_app.dart:1993:1 - class_in_class
+  error - Expected a class member - lib\android_app.dart:1993:19 - expected_class_member
+   info - The variable name 'StatelessWidget' isn't a lowerCamelCase identifier - lib\android_app.dart:1993:27 - non_constant_identifier_names
+  error - Methods must have an explicit list of parameters - lib\android_app.dart:1993:27 - missing_method_parameters
+  error - The name '_FilterChip' isn't a class - lib\android_app.dart:1999:9 - creation_with_non_type
+  error - Expected to find ',' - lib\android_app.dart:1999:31 - expected_token
+  error - The getter 'label' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1999:36 - undefined_getter
+  error - Expected to find ',' - lib\android_app.dart:1999:52 - expected_token
+  error - The getter 'count' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1999:57 - undefined_getter
+  error - Expected to find ',' - lib\android_app.dart:1999:73 - expected_token
+  error - The getter 'selected' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1999:78 - undefined_getter
+  error - Expected to find ',' - lib\android_app.dart:1999:97 - expected_token
+  error - The getter 'onTap' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:1999:102 - undefined_getter
+warning - The declaration 'build' isn't referenced - lib\android_app.dart:2002:10 - unused_element
+  error - The final variable 'label' can't be read because it's potentially unassigned at this point - lib\android_app.dart:2006:23 - read_potentially_unassigned_final
+  error - The final variable 'count' can't be read because it's potentially unassigned at this point - lib\android_app.dart:2006:30 - read_potentially_unassigned_final
+  error - The final variable 'selected' can't be read because it's potentially unassigned at this point - lib\android_app.dart:2007:19 - read_potentially_unassigned_final
+  error - The final variable 'onTap' can't be read because it's potentially unassigned at this point - lib\android_app.dart:2008:28 - read_potentially_unassigned_final
+  error - Classes can't be declared inside other classes - lib\android_app.dart:2019:1 - class_in_class
+  error - Classes can't be declared inside other classes - lib\android_app.dart:2031:1 - class_in_class
+  error - Expected a class member - lib\android_app.dart:2031:17 - expected_class_member
+   info - The variable name 'StatelessWidget' isn't a lowerCamelCase identifier - lib\android_app.dart:2031:25 - non_constant_identifier_names
+  error - Methods must have an explicit list of parameters - lib\android_app.dart:2031:25 - missing_method_parameters
+  error - The name 'StatelessWidget' is already defined - lib\android_app.dart:2031:25 - duplicate_definition
+  error - The name '_HelpPage' isn't a class - lib\android_app.dart:2032:9 - creation_with_non_type
+warning - The declaration 'build' isn't referenced - lib\android_app.dart:2035:10 - unused_element
+  error - The method '_HelpItem' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:2037:7 - undefined_method
+  error - The method '_HelpItem' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:2042:7 - undefined_method
+  error - The method '_HelpItem' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:2047:7 - undefined_method
+  error - The method '_HelpItem' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:2052:7 - undefined_method
+  error - Classes can't be declared inside other classes - lib\android_app.dart:2104:1 - class_in_class
+  error - Expected a class member - lib\android_app.dart:2104:21 - expected_class_member
+   info - The variable name 'StatefulWidget' isn't a lowerCamelCase identifier - lib\android_app.dart:2104:29 - non_constant_identifier_names
+  error - Methods must have an explicit list of parameters - lib\android_app.dart:2104:29 - missing_method_parameters
+warning - The value of the local variable 'vocab' isn't used - lib\android_app.dart:2105:22 - unused_local_variable
+warning - The value of the local variable 'onSaveConfig' isn't used - lib\android_app.dart:2106:22 - unused_local_variable
+warning - The value of the local variable 'showBaseWordDialog' isn't used - lib\android_app.dart:2107:66 - unused_local_variable
+warning - The value of the local variable 'onWordTap' isn't used - lib\android_app.dart:2108:31 - unused_local_variable
+  error - The name '_VocabTabPage' isn't a class - lib\android_app.dart:2110:9 - creation_with_non_type
+  error - Expected to find ',' - lib\android_app.dart:2110:33 - expected_token
+  error - The getter 'vocab' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:2110:38 - undefined_getter
+  error - Expected to find ',' - lib\android_app.dart:2110:54 - expected_token
+  error - The getter 'onSaveConfig' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:2110:59 - undefined_getter
+  error - Expected to find ',' - lib\android_app.dart:2110:82 - expected_token
+  error - The getter 'showBaseWordDialog' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:2110:87 - undefined_getter
+  error - The getter 'onWordTap' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:2110:112 - undefined_getter
+  error - State isn't a type - lib\android_app.dart:2113:3 - not_a_type
+  error - The name '_VocabTabPage' isn't a type, so it can't be used as a type argument - lib\android_app.dart:2113:9 - non_type_as_type_argument
+warning - The declaration 'createState' isn't referenced - lib\android_app.dart:2113:24 - unused_element
+  error - The method '_VocabTabPageState' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:2113:41 - undefined_method
+  error - Classes can't be declared inside other classes - lib\android_app.dart:2116:1 - class_in_class
+  error - Expected a class member - lib\android_app.dart:2116:26 - expected_class_member
+   info - The variable name 'State' isn't a lowerCamelCase identifier - lib\android_app.dart:2116:34 - non_constant_identifier_names
+  error - Methods must have an explicit list of parameters - lib\android_app.dart:2116:34 - missing_method_parameters
+   info - The local variable '_searchCtrl' starts with an underscore - lib\android_app.dart:2117:31 - no_leading_underscores_for_local_identifiers
+warning - The declaration 'dispose' isn't referenced - lib\android_app.dart:2120:8 - unused_element
+   info - The local variable '_allWordsWithCategory' starts with an underscore - lib\android_app.dart:2126:23 - no_leading_underscores_for_local_identifiers
+   info - The local variable '_catColor' starts with an underscore - lib\android_app.dart:2143:9 - no_leading_underscores_for_local_identifiers
+   info - The local variable '_openWordList' starts with an underscore - lib\android_app.dart:2154:8 - no_leading_underscores_for_local_identifiers
+  error - The method '_WordListPage' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:2156:23 - undefined_method
+  error - The getter 'showBaseWordDialog' isn't defined for the type '_AnalysisPage' - lib\android_app.dart:2160:36 - undefined_getter
+   info - The local variable '_exportVocab' starts with an underscore - lib\android_app.dart:2167:16 - no_leading_underscores_for_local_identifiers
+   info - The local variable '_importVocab' starts with an underscore - lib\android_app.dart:2188:16 - no_leading_underscores_for_local_identifiers
+warning - The declaration 'build' isn't referenced - lib\android_app.dart:2214:10 - unused_element
+  error - The method 'copyWith' can't be unconditionally invoked because the receiver can be 'null' - lib\android_app.dart:2291:97 - unchecked_use_of_nullable_value
+  error - The method 'copyWith' can't be unconditionally invoked because the receiver can be 'null' - lib\android_app.dart:2322:104 - unchecked_use_of_nullable_value
+  error - The name '_HelpPage' isn't a class - lib\android_app.dart:2365:63 - creation_with_non_type
+  error - Classes can't be declared inside other classes - lib\android_app.dart:2394:1 - class_in_class
+  error - Expected a class member - lib\android_app.dart:2394:21 - expected_class_member
+   info - The variable name 'StatefulWidget' isn't a lowerCamelCase identifier - lib\android_app.dart:2394:29 - non_constant_identifier_names
+  error - Methods must have an explicit list of parameters - lib\android_app.dart:2394:29 - missing_method_parameters
+  error - The name 'StatefulWidget' is already defined - lib\android_app.dart:2394:29 - duplicate_definition
+warning - The value of the local variable 'category' isn't used - lib\android_app.dart:2395:16 - unused_local_variable
+warning - The value of the local variable 'vocab' isn't used - lib\android_app.dart:2396:22 - unused_local_variable
+warning - The value of the local variable 'onSaveConfig' isn't used - lib\android_app.dart:2397:22 - unused_local_variable
+warning - The value of the local variable 'showBaseWordDialog' isn't used - lib\android_app.dart:2398:66 - unused_local_variable
+warning - The value of the local variable 'onWordTap' isn't used - lib\android_app.dart:2399:31 - unused_local_variable
+  error - The name '_WordListPage' isn't a class - lib\android_app.dart:2401:9 - creation_with_non_type
+  error - Expected to find ',' - lib\android_app.dart:2402:14 - expected_token
+  error - The getter 'category' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:2402:19 - undefined_getter
+  error - Expected to find ',' - lib\android_app.dart:2403:14 - expected_token
+  error - The getter 'vocab' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:2403:19 - undefined_getter
+  error - Expected to find ',' - lib\android_app.dart:2404:14 - expected_token
+  error - The getter 'onSaveConfig' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:2404:19 - undefined_getter
+  error - Expected to find ',' - lib\android_app.dart:2405:14 - expected_token
+  error - The getter 'showBaseWordDialog' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:2405:19 - undefined_getter
+  error - The getter 'onWordTap' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:2406:10 - undefined_getter
+  error - State isn't a type - lib\android_app.dart:2410:3 - not_a_type
+  error - The name '_WordListPage' isn't a type, so it can't be used as a type argument - lib\android_app.dart:2410:9 - non_type_as_type_argument
+warning - The declaration 'createState' isn't referenced - lib\android_app.dart:2410:24 - unused_element
+  error - The method '_WordListPageState' isn't defined for the type '_AnalysisPageState' - lib\android_app.dart:2410:41 - undefined_method
+  error - Classes can't be declared inside other classes - lib\android_app.dart:2413:1 - class_in_class
+  error - Expected a class member - lib\android_app.dart:2413:26 - expected_class_member
+   info - The variable name 'State' isn't a lowerCamelCase identifier - lib\android_app.dart:2413:34 - non_constant_identifier_names
+  error - Methods must have an explicit list of parameters - lib\android_app.dart:2413:34 - missing_method_parameters
+  error - The name 'State' is already defined - lib\android_app.dart:2413:34 - duplicate_definition
+   info - The local variable '_words' starts with an underscore - lib\android_app.dart:2414:21 - no_leading_underscores_for_local_identifiers
+warning - The declaration 'initState' isn't referenced - lib\android_app.dart:2417:8 - unused_element
+  error - Local variable '_load' can't be referenced before it is declared - lib\android_app.dart:2419:5 - referenced_before_declaration
+   info - The local variable '_load' starts with an underscore - lib\android_app.dart:2422:8 - no_leading_underscores_for_local_identifiers
+  error - The getter 'category' isn't defined for the type '_AnalysisPage' - lib\android_app.dart:2423:20 - undefined_getter
+   info - The local variable '_colorFor' starts with an underscore - lib\android_app.dart:2443:9 - no_leading_underscores_for_local_identifiers
+   info - The local variable '_convertTo' starts with an underscore - lib\android_app.dart:2453:16 - no_leading_underscores_for_local_identifiers
+  error - The getter 'category' isn't defined for the type '_AnalysisPage' - lib\android_app.dart:2456:20 - undefined_getter
+  error - The method 'showBaseWordDialog' isn't defined for the type '_AnalysisPage' - lib\android_app.dart:2471:20 - undefined_method
+   info - The local variable '_editBase' starts with an underscore - lib\android_app.dart:2481:16 - no_leading_underscores_for_local_identifiers
+  error - The method 'showBaseWordDialog' isn't defined for the type '_AnalysisPage' - lib\android_app.dart:2482:18 - undefined_method
+warning - The declaration 'build' isn't referenced - lib\android_app.dart:2488:10 - unused_element
+  error - The getter 'category' isn't defined for the type '_AnalysisPage' - lib\android_app.dart:2489:36 - undefined_getter
+  error - The getter 'category' isn't defined for the type '_AnalysisPage' - lib\android_app.dart:2492:31 - undefined_getter
+  error - Expected to find ',' - lib\android_app.dart:2492:42 - expected_token
+  error - Too many positional arguments: 1 expected, but 4 found - lib\android_app.dart:2492:42 - extra_positional_arguments_could_be_named
+  error - Expected to find ',' - lib\android_app.dart:2492:57 - expected_token
+  error - Illegal character '38171' - lib\android_app.dart:2492:57 - illegal_character
+  error - Undefined name '锛' - lib\android_app.dart:2492:57 - undefined_identifier
+  error - Expected to find ',' - lib\android_app.dart:2492:58 - expected_token
+  error - Unterminated string literal - lib\android_app.dart:2492:98 - unterminated_string_literal
+  error - Expected to find ',' - lib\android_app.dart:2493:9 - expected_token
+  error - The named parameter 'leading' isn't defined - lib\android_app.dart:2493:9 - undefined_named_parameter
+  error - The named parameter 'body' isn't defined - lib\android_app.dart:2498:7 - undefined_named_parameter
+  error - The getter 'category' isn't defined for the type '_AnalysisPage' - lib\android_app.dart:2499:45 - undefined_getter
+  error - Local variable '_buildActions' can't be referenced before it is declared - lib\android_app.dart:2513:29 - referenced_before_declaration
+  error - Expected to find ')' - lib\android_app.dart:2524:6 - expected_token
+   info - The local variable '_buildActions' starts with an underscore - lib\android_app.dart:2527:10 - no_leading_underscores_for_local_identifiers
+  error - The getter 'category' isn't defined for the type '_AnalysisPage' - lib\android_app.dart:2529:20 - undefined_getter
+  error - Local variable '_opBtn' can't be referenced before it is declared - lib\android_app.dart:2531:21 - referenced_before_declaration
+  error - Local variable '_opBtn' can't be referenced before it is declared - lib\android_app.dart:2532:21 - referenced_before_declaration
+  error - Local variable '_confirmConvert' can't be referenced before it is declared - lib\android_app.dart:2532:68 - referenced_before_declaration
+  error - Local variable '_opBtn' can't be referenced before it is declared - lib\android_app.dart:2533:21 - referenced_before_declaration
+  error - Local variable '_confirmConvert' can't be referenced before it is declared - lib\android_app.dart:2533:69 - referenced_before_declaration
+  error - Local variable '_opBtn' can't be referenced before it is declared - lib\android_app.dart:2536:21 - referenced_before_declaration
+  error - Local variable '_confirmConvert' can't be referenced before it is declared - lib\android_app.dart:2536:69 - referenced_before_declaration
+  error - Local variable '_opBtn' can't be referenced before it is declared - lib\android_app.dart:2537:21 - referenced_before_declaration
+  error - Local variable '_confirmConvert' can't be referenced before it is declared - lib\android_app.dart:2537:69 - referenced_before_declaration
+  error - Local variable '_opBtn' can't be referenced before it is declared - lib\android_app.dart:2540:21 - referenced_before_declaration
+  error - Local variable '_confirmConvert' can't be referenced before it is declared - lib\android_app.dart:2540:69 - referenced_before_declaration
+  error - Local variable '_opBtn' can't be referenced before it is declared - lib\android_app.dart:2541:21 - referenced_before_declaration
+  error - Local variable '_confirmConvert' can't be referenced before it is declared - lib\android_app.dart:2541:68 - referenced_before_declaration
+   info - The local variable '_opBtn' starts with an underscore - lib\android_app.dart:2554:10 - no_leading_underscores_for_local_identifiers
+   info - The local variable '_confirmConvert' starts with an underscore - lib\android_app.dart:2563:16 - no_leading_underscores_for_local_identifiers
+  error - The getter 'category' isn't defined for the type '_AnalysisPage' - lib\android_app.dart:2568:44 - undefined_getter
+  error - The body might complete normally, causing 'null' to be returned, but the return type, 'FutureOr<Map<String, int>>', is a potentially non-nullable type - lib\android_app.dart:2587:26 - body_might_complete_normally
+  error - Expected to find '}' - lib\android_app.dart:2631:1 - expected_token
+
