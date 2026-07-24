@@ -770,7 +770,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
             ),
             // 3. 閲婁箟灞呬腑
             // 3. 释义区：中文优先，英文辅助（最多3行）
-            if (_wordInfo != null && (_wordInfo!['def'] ?? '').isNotEmpty) ...[
+            if (_wordInfo != null && ((_wordInfo!['def'] ?? '').isNotEmpty || (_wordInfo!['zh_def'] ?? '').isNotEmpty)) ...[
               if (_wordFormDesc != null)
                 Padding(
                   padding: const EdgeInsets.only(top: 4, bottom: 2),
@@ -781,12 +781,12 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                   ),
                 ),
               // 中文释义（优先，较大字体）
-              if (_wordInfo!['zh_def'] != null && (_wordInfo!['zh_def'] ?? '').isNotEmpty)
+              if ((_wordInfo!['zh_def'] ?? _wordInfo!['def'] ?? '').isNotEmpty)
                 Padding(
                   padding: const EdgeInsets.only(top: 6),
                   child: Center(
                     child: Text(
-                      _wordInfo!['zh_def'] ?? '',
+                      (_wordInfo!['zh_def'] ?? _wordInfo!['def'] ?? ''),
                       style: const TextStyle(color: Colors.black87, fontSize: 15),
                       textAlign: TextAlign.center,
                     ),
