@@ -14,7 +14,6 @@ Thumbs.db
 
 # Config (user-specific, should not be versioned)
 esw_config.json
-eva_config.json
 
 # Build logs
 build_log*.txt

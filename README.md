@@ -91,7 +91,7 @@ flutter run -d windows
 ## 项目结构
 
 ```
-eva/
+ESW/
 ├── lib/                    # Dart 源码
 │   ├── main.dart           # 主入口（窗口、词库、语料分析）
 │   └── theme/              # 主题配置
