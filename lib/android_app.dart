@@ -13,7 +13,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'theme/app_theme.dart';
 import 'shared/vocab_service.dart';
 import 'porter_stemmer.dart';
-import 'translation_service.dart';
+import 'dictionary_service.dart';
 
 /// 涓婃瀵煎嚭璺緞锛堟ā鍧楃骇璁板繂锛岄伩鍏嶆瘡娆￠噸鏂伴€夋嫨锛?
 String? _lastExportPath;
@@ -134,6 +134,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: const Color(0xFFFFF8E1),
       body: IndexedStack(
         index: _currentIndex,
         children: [
@@ -143,6 +144,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
         ],
       ),
       bottomNavigationBar: NavigationBar(
+        backgroundColor: const Color(0xFFFFF8E1),
         selectedIndex: _currentIndex,
         onDestinationSelected: (i) => setState(() => _currentIndex = i),
         destinations: const [
@@ -174,6 +176,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
       child: CustomScrollView(
         slivers: [
           const SliverAppBar(
+            backgroundColor: Color(0xFFFFF8E1),
             title: Text('文本检测', style: TextStyle(fontWeight: FontWeight.bold)),
             centerTitle: true,
             pinned: true,
@@ -186,7 +189,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                 children: [
                   Card(
                     elevation: 0,
-                    color: AppTheme.surfaceLighter,
+                    color: const Color(0xFFFFF8E1),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                     child: Padding(
                       padding: const EdgeInsets.all(16),
@@ -226,7 +229,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                       hintText: '粘贴文本到这里',
                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                       filled: true,
-                      fillColor: AppTheme.surfaceLighter,
+                      fillColor: const Color(0xFFFFF8E1),
                       alignLabelWithHint: true,
                     ),
                   ),
@@ -242,8 +245,9 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                     },
                     icon: const Icon(Icons.analytics_outlined),
                     label: const Text('开始分析'),
-                    style: ElevatedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 14),
+                    style: const ButtonStyle(
+                      backgroundColor: WidgetStatePropertyAll(Color(0xFFFFF8E1)),
+                      padding: WidgetStatePropertyAll(EdgeInsets.symmetric(vertical: 14)),
                     ),
                   ),
                   const SizedBox(height: 24),
@@ -277,6 +281,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                           .join(' / ');
                       return Card(
                         elevation: 0,
+                        color: const Color(0xFFFFF8E1),
                         margin: const EdgeInsets.only(bottom: 6),
                         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                         child: ListTile(
@@ -449,6 +454,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
       child: CustomScrollView(
         slivers: [
           SliverAppBar(
+            backgroundColor: const Color(0xFFFFF8E1),
             title: const Text('真题查词', style: TextStyle(fontWeight: FontWeight.bold)),
             centerTitle: true,
             pinned: true,
@@ -501,7 +507,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                             borderSide: BorderSide.none,
                           ),
                           filled: true,
-                          fillColor: Colors.white,
+                          fillColor: const Color(0xFFFFF8E1),
                           contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
                         ),
                         onChanged: _onSearchChanged,
@@ -608,16 +614,41 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
       }
     }
 
-    // 非课标词释义：ML Kit 中文翻译
-    if (_wordInfo == null) {
-      TranslationService.getChineseMeaning(word).then((zh) {
-        if (zh != null && zh.isNotEmpty && mounted) {
+    // 统一用离线词典数据（含课标词）：异步查询覆盖 pos/def/phonetic/collins
+    final isStd = info.isNotEmpty;
+    final savedCat = isStd ? (info['category'] ?? '课标词') : null;
+    DictionaryService.lookup(word).then((entry) {
+      if (!mounted || _searchResult != word) return;
+      if (entry != null) {
+        final dictDef = entry['definition'] ?? '';
+        final dictPos = entry['pos'] ?? '';
+        if (dictDef.isNotEmpty || dictPos.isNotEmpty) {
           setState(() {
-            _wordInfo = {'zh_def': zh, 'def': '', 'pos': '', 'category': _vocab.isExtend(word) ? '拓展词' : '翻译'};
+            _wordInfo = {
+              'def': dictDef,
+              'pos': dictPos,
+              'zh_def': dictDef,
+              'category': isStd ? savedCat! : (_vocab.isExtend(word) ? '拓展词' : '词典'),
+              'phonetic': entry['phonetic'] ?? '',
+              'collins': entry['collins'] ?? '0',
+            };
           });
         }
-      });
-    }
+      } else if (!isStd && mounted) {
+        // 非课标词且词典未收录：后缀推断词性
+        final inferredPos = _inferPos(word);
+        setState(() {
+          _wordInfo = {
+            'def': '',
+            'pos': inferredPos,
+            'zh_def': '',
+            'category': _vocab.isExtend(word) ? '拓展词' : '未收录',
+            'phonetic': '',
+            'collins': '0',
+          };
+        });
+      }
+    });
   }
 
   /// 寮瑰嚭鍏宠仈课标词嶅璇濇锛岀敤鎴烽€夋嫨鍩虹课标词嶅悗娣诲姞涓烘嫇灞曡瘝銆?
@@ -697,6 +728,25 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     );
   }
 
+  /// 基于英语单词后缀推断词性标签（n./v./adj./adv.），无法推断则返回空字符串。
+  String _inferPos(String word) {
+    final w = word.toLowerCase();
+    if (RegExp(r'(tion|sion|ment|ness|ity|ance|ence|ism|ship|hood|ure|dom|th|tude)$').hasMatch(w) && w.length > 4) {
+      return 'n.';
+    }
+    if (RegExp(r'(ive|able|ible|ial|ous|eous|ious|ful|less|ish|ant|ent|ary|ory|ic|al)$').hasMatch(w) && w.length > 4) {
+      if (w.endsWith('ly') && w.length > 4) return 'adv.';
+      return 'adj.';
+    }
+    if (w.endsWith('ly') && w.length > 4) {
+      return 'adv.';
+    }
+    if (RegExp(r'(ize|ise|ate|ify|en)$').hasMatch(w) && w.length > 4) {
+      return 'v.';
+    }
+    return '';
+  }
+
   Widget _buildWordResult() {
     final canMark = !_vocab.isStandard(_searchResult);
     final isStandard = _vocab.isStandard(_searchResult);
@@ -735,65 +785,111 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
       labelColor = AppTheme.grey;
     }
 
+    // 解析词性+释义（按 / 拆分为多行）
+    final posDefPairs = _parsePosDef(_wordInfo?['pos'] ?? '');
+    final phonetic = _wordInfo?['phonetic'] ?? '';
+    final collins = int.tryParse(_wordInfo?['collins'] ?? '0') ?? 0;
+
     return Card(
       elevation: 0,
-      color: AppTheme.surfaceLighter,
+      color: const Color(0xFFFFF8E1),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.fromLTRB(18, 16, 18, 16),
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
+          crossAxisAlignment: CrossAxisAlignment.center,
           children: [
-            // 1. 鍒嗙被鏍囩灞呬腑
+            // 分类标签 — 音标正上方，居中，长方形框，加粗
             if (categoryLabel != null)
-              Center(
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
                 child: Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
                   decoration: BoxDecoration(
-                    color: labelColor.withValues(alpha: 0.2),
+                    border: Border.all(color: labelColor, width: 1.5),
                     borderRadius: BorderRadius.circular(4),
                   ),
                   child: Text(
                     categoryLabel,
-                    style: TextStyle(color: labelColor, fontWeight: FontWeight.bold, fontSize: 14),
+                    style: TextStyle(fontSize: 13, color: labelColor, fontWeight: FontWeight.bold),
+                    textAlign: TextAlign.center,
                   ),
                 ),
               ),
-            if (categoryLabel != null) const SizedBox(height: 8),
-            // 2. 鍗曡瘝灞呬腑
-            Center(
-              child: Text(
-                _searchResult,
-                style: const TextStyle(fontSize: 28, fontWeight: FontWeight.bold),
-                textAlign: TextAlign.center,
+            // 音标 + 柯林斯星级
+            if (phonetic.isNotEmpty || collins > 0)
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  if (phonetic.isNotEmpty)
+                    Text(
+                      '[$phonetic]',
+                      style: const TextStyle(fontSize: 15, fontFamily: 'monospace', color: Color(0xFF0066CC)),
+                    ),
+                  if (phonetic.isNotEmpty && collins > 0)
+                    const Text(' - ', style: TextStyle(fontSize: 15)),
+                  if (collins > 0) _buildCollinsStars(collins),
+                ],
+              ),
+            if (phonetic.isNotEmpty || collins > 0) const SizedBox(height: 10),
+            // 单词居中
+            Text(
+              _searchResult,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                fontSize: 28,
+                fontWeight: FontWeight.bold,
+                color: Color(0xFFB20000),
               ),
             ),
-            // 3. 閲婁箟灞呬腑
-            // 3. 释义区：中文优先，英文辅助（最多3行）
-            if (_wordInfo != null && ((_wordInfo!['def'] ?? '').isNotEmpty || (_wordInfo!['zh_def'] ?? '').isNotEmpty)) ...[
-              if (_wordFormDesc != null)
-                Padding(
-                  padding: const EdgeInsets.only(top: 4, bottom: 2),
-                  child: Text(
-                    _wordFormDesc!,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(fontSize: 13, color: Color(0xFF666666)),
-                  ),
-                ),
-              // 中文释义（优先，较大字体）
-              if ((_wordInfo!['zh_def'] ?? _wordInfo!['def'] ?? '').isNotEmpty)
-                Padding(
-                  padding: const EdgeInsets.only(top: 6),
-                  child: Center(
-                    child: Text(
-                      (_wordInfo!['zh_def'] ?? _wordInfo!['def'] ?? ''),
-                      style: const TextStyle(color: Colors.black87, fontSize: 15),
+            const SizedBox(height: 8),
+            // 词性+释义行
+            if (posDefPairs.isNotEmpty)
+              ...posDefPairs.map((p) => Padding(
+                    padding: const EdgeInsets.only(top: 3),
+                    child: RichText(
                       textAlign: TextAlign.center,
+                      text: TextSpan(
+                        style: const TextStyle(fontSize: 15, color: Colors.black),
+                        children: [
+                          TextSpan(
+                            text: '${p['pos']!} ',
+                            style: const TextStyle(
+                              fontStyle: FontStyle.italic,
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFF0000FF),
+                            ),
+                          ),
+                          TextSpan(text: p['def']),
+                        ],
+                      ),
                     ),
+                  )),
+            // 兜底释义
+            if (posDefPairs.isEmpty || posDefPairs.every((p) => (p['def'] ?? '').isEmpty))
+              Builder(builder: (_) {
+                final fallback = _wordInfo?['def'] ?? '';
+                if (fallback.isEmpty) return const SizedBox.shrink();
+                return Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Text(
+                    fallback,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(fontSize: 15, color: Colors.black),
                   ),
+                );
+              }),
+            // 词形说明
+            if (_wordFormDesc != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(
+                  _wordFormDesc!,
+                  style: const TextStyle(fontSize: 13, color: Color(0xFF008080)),
+                  textAlign: TextAlign.center,
                 ),
-            ],
-            // 4. 涓変釜娣诲姞鎸夐挳灞呬腑
+              ),
+            // 三个添加按钮
             if (canMark)
               Padding(
                 padding: const EdgeInsets.only(top: 12),
@@ -808,10 +904,9 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                   ],
                 ),
               ),
-            const Divider(height: 24),
             if (canMark && !_hasFreq)
               Padding(
-                padding: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.only(top: 8),
                 child: const Center(
                   child: Text(
                     '本单词从未在高考真题中出现过',
@@ -820,15 +915,9 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                   ),
                 ),
               ),
-            if (_wordInfo != null && (_wordInfo!['pos'] ?? '').isNotEmpty)
-              Center(
-                child: Text(
-                  '璇嶆€э細${_wordInfo!['pos'] ?? ''}',
-                  style: const TextStyle(fontWeight: FontWeight.w600, color: AppTheme.textSecondary),
-                  textAlign: TextAlign.center,
-                ),
-              ),
-            const Divider(height: 24),
+            const SizedBox(height: 8),
+            const Divider(height: 1),
+            const SizedBox(height: 8),
             _buildWordFrequency(),
           ],
         ),
@@ -836,7 +925,43 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     );
   }
 
-  /// 绱у噾鏍囪鎸夐挳锛氭樉绀虹缉鍐欐枃瀛楋紝甯﹀垎绫婚鑹插簳绾癸紱鑻ュ綋鍓嶅凡鏄绫诲埆鍒欏彉鐏颁笉鍙偣鍑汇€?
+  /// 解析 pos 字段（格式: "vt. 释义 / vi. 释义"），返回 [{pos, def}] 列表
+  List<Map<String, String?>> _parsePosDef(String raw) {
+    if (raw.isEmpty) return [];
+    final parts = raw.split(RegExp(r'\s*/\s*'));
+    final results = <Map<String, String?>>[];
+    for (final part in parts) {
+      final match = RegExp(r'^([a-z]+\.(?:\s*&\s*[a-z]+\.)?)\s*(.*)$').firstMatch(part.trim());
+      if (match != null) {
+        results.add({'pos': match.group(1), 'def': match.group(2)});
+      }
+    }
+    return results;
+  }
+
+  /// 根据词性返回对应颜色
+  Color _posColor(String pos) {
+    if (pos.startsWith('vt') || pos == 'v.') return const Color(0xFFB20000);
+    if (pos.startsWith('vi')) return const Color(0xFF008000);
+    if (pos.startsWith('n')) return AppTheme.primaryBlue;
+    if (pos.startsWith('adj') || pos.startsWith('a.')) return AppTheme.purple;
+    if (pos.startsWith('adv')) return AppTheme.orange;
+    return const Color(0xFFB20000);
+  }
+
+  /// 柯林斯星级（0~5）
+  Widget _buildCollinsStars(int stars) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: List.generate(5, (i) => Icon(
+        i < stars ? Icons.star : Icons.star_border,
+        size: 14,
+        color: const Color(0xFFFFD700),
+      )),
+    );
+  }
+
+  /// 紧凑标记按钮
   Widget _markButton(String label, Color color, VoidCallback onPressed) {
     final isCurrent = _wordCategory == label;
     return OutlinedButton(
@@ -1198,6 +1323,7 @@ class _ExamPaperViewerState extends State<_ExamPaperViewer> {
   Widget build(BuildContext context) {
     final name = widget.filePath.split(RegExp(r'[\\/]')).last;
     return Scaffold(
+      backgroundColor: const Color(0xFFFFF8E1),
       appBar: AppBar(
         title: Text(name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
         centerTitle: true,
@@ -1285,6 +1411,7 @@ class _HistoryTile extends StatelessWidget {
   Widget build(BuildContext context) {
     return Card(
       elevation: 0,
+      color: const Color(0xFFFFF8E1),
       margin: const EdgeInsets.only(bottom: 4),
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
       child: ListTile(
@@ -1425,7 +1552,9 @@ class _AnalysisPageState extends State<_AnalysisPage> {
         if (!didPop) _popWithResult();
       },
       child: Scaffold(
+      backgroundColor: const Color(0xFFFFF8E1),
       appBar: AppBar(
+        backgroundColor: const Color(0xFFFFF8E1),
         title: Text(widget.fileName, style: const TextStyle(fontSize: 16)),
         leading: IconButton(
           icon: const Icon(Icons.arrow_back),
@@ -1568,7 +1697,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
           if (_batchMode && _selectedOthers.isNotEmpty)
             Container(
               decoration: BoxDecoration(
-                color: Colors.white,
+                color: const Color(0xFFFFF8E1),
                 boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 4, offset: Offset(0, -2))],
               ),
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
@@ -1619,6 +1748,8 @@ class _AnalysisPageState extends State<_AnalysisPage> {
                         prefixIcon: Icon(Icons.search, size: 20),
                         border: OutlineInputBorder(),
                         isDense: true,
+                        filled: true,
+                        fillColor: Color(0xFFFFF8E1),
                         contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                       ),
                       onChanged: (q) {
@@ -1703,6 +1834,8 @@ class _AnalysisPageState extends State<_AnalysisPage> {
                         prefixIcon: Icon(Icons.search, size: 20),
                         border: OutlineInputBorder(),
                         isDense: true,
+                        filled: true,
+                        fillColor: Color(0xFFFFF8E1),
                         contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                       ),
                       onChanged: (q) {
@@ -2142,6 +2275,7 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: const Color(0xFFFFF8E1),
       appBar: AppBar(
         title: Text('"${widget.keyword}" 在原文中的位置'),
         titleTextStyle: const TextStyle(fontSize: 16, color: Colors.white),
@@ -2503,7 +2637,9 @@ class _HelpPage extends StatelessWidget {
     ];
 
     return Scaffold(
+      backgroundColor: const Color(0xFFFFF8E1),
       appBar: AppBar(
+        backgroundColor: const Color(0xFFFFF8E1),
         title: const Text('使用说明', style: TextStyle(fontWeight: FontWeight.bold)),
         centerTitle: true,
       ),
@@ -2678,6 +2814,7 @@ class _VocabTabPageState extends State<_VocabTabPage> {
             child: CustomScrollView(
               slivers: [
                 SliverAppBar(
+                  backgroundColor: const Color(0xFFFFF8E1),
                   title: const Text('ESW词库', style: TextStyle(fontWeight: FontWeight.bold)),
                   centerTitle: true,
                   pinned: true,
@@ -2705,7 +2842,7 @@ class _VocabTabPageState extends State<_VocabTabPage> {
                       ),
                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                       filled: true,
-                      fillColor: AppTheme.surfaceLight,
+                      fillColor: const Color(0xFFFFF8E1),
                       isDense: true,
                       contentPadding: const EdgeInsets.symmetric(vertical: 8),
                     ),
@@ -2774,7 +2911,7 @@ class _VocabTabPageState extends State<_VocabTabPage> {
                         decoration: BoxDecoration(
                           border: Border(left: BorderSide(color: color, width: 4)),
                           borderRadius: BorderRadius.circular(8),
-                          color: AppTheme.surfaceLighter,
+                          color: const Color(0xFFFFF8E1),
                         ),
                         child: ListTile(
                           onTap: widget.onWordTap == null ? null : () => widget.onWordTap!(e.key),
@@ -2934,8 +3071,10 @@ class _WordListPageState extends State<_WordListPage> {
   Widget build(BuildContext context) {
     final color = _colorFor(widget.category);
     return Scaffold(
+      backgroundColor: const Color(0xFFFFF8E1),
       appBar: AppBar(
         title: Text('${widget.category}（${_words.length}个）', style: const TextStyle(fontSize: 16)),
+        backgroundColor: const Color(0xFFFFF8E1),
         leading: IconButton(
           icon: const Icon(Icons.arrow_back),
           onPressed: () => Navigator.of(context).pop(),
@@ -3077,4 +3216,28 @@ Future<Map<String, int>> _loadCorpusIndex(String corpusPath) async {
 
   }
   return index;
+}
+
+/// 红色虚线绘制器（用于卡片内分隔线）
+class _DottedLinePainter extends CustomPainter {
+  final Color color;
+  _DottedLinePainter({this.color = const Color(0xFFB20000)});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = 1.5
+      ..strokeCap = StrokeCap.round;
+    const dashWidth = 4.0;
+    const dashSpace = 3.0;
+    double startX = 0;
+    while (startX < size.width) {
+      canvas.drawLine(Offset(startX, 1), Offset(startX + dashWidth, 1), paint);
+      startX += dashWidth + dashSpace;
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
