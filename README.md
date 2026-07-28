@@ -1,3 +1,16 @@
+<<<<<<< HEAD
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 58517953bc17ebd4c00e5d39198d03e4_319d4f7389cd11f1a00c525400826444
+    ReservedCode1: ZkYXS0DNG3TA8nxLMJAq70+b1I+UGlsw7VrJYNqkO3MS1Ci38sfRoFQ5Om0st+RPZ82vZQPaxR2desM14GicyOgrqjQyTxSjixhkv9sMElRfEu1Rwx6DFgEToScSnaE1TA/DuPpnYCpam1TYSwIxoYmRNUIrIeHx8LratVAnfPunx57DDWF3tJFDMlI=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 58517953bc17ebd4c00e5d39198d03e4_319d4f7389cd11f1a00c525400826444
+    ReservedCode2: ZkYXS0DNG3TA8nxLMJAq70+b1I+UGlsw7VrJYNqkO3MS1Ci38sfRoFQ5Om0st+RPZ82vZQPaxR2desM14GicyOgrqjQyTxSjixhkv9sMElRfEu1Rwx6DFgEToScSnaE1TA/DuPpnYCpam1TYSwIxoYmRNUIrIeHx8LratVAnfPunx57DDWF3tJFDMlI=
+---
+=======
+>>>>>>> 709b3684810134ba693011e39da06ce06c3e267c
 
 # ESW — 真题课标词
 
@@ -38,10 +51,17 @@
 
 ESW 同时提供 Android APK，支持手机端查词。
 
+<<<<<<< HEAD
+**Windows**
+- 修复超纲词导出 Word 文档黄色高亮背景不生效
+- 代码清理：删除约 325 行无效代码，13 处性能优化
+- 修复 Dart 空安全编译错误
+=======
 - **最新版本**：[ESW](https://github.com/beenhow/ESW/releases/latest)
 - 词典：本地离线词典（340万词条），含音标、释义、柯林斯星级、词频、变形词反查
 - 功能：真题检测、词频统计、词库积累、离线查词
 - UI：全局浅黄背景 #FFF8E1，词类标签置于音标上方加边框加粗
+>>>>>>> 709b3684810134ba693011e39da06ce06c3e267c
 
 > 安卓版与桌面版共享词库数据，通过数据备份功能可跨平台同步。
 
@@ -102,6 +122,22 @@ ESW/
 
 版本号格式：`主版本.次版本.修订号`（如 `1.3.0`），窗口标题显示为 `真题课标词 v1.x.xx`。
 
+<<<<<<< HEAD
+```powershell
+flutter pub get
+flutter build windows --release
+# 产物：build/windows/x64/runner/Release/ESW1.3.1.exe（需同目录 DLL 和 data/）
+```
+
+### Android
+
+```powershell
+flutter pub get
+flutter build apk --release
+# 产物：build/app/outputs/flutter-apk/app-release.apk
+```
+=======
+>>>>>>> 709b3684810134ba693011e39da06ce06c3e267c
 
 ---
 

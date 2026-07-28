@@ -36,6 +36,10 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
   /// 文本检测嬪巻鍙茶褰?
   final List<_DetectHistory> _detectHistory = [];
 
+  /// corpus 词频索引缓存（O(1) 查表，替代 getWordFrequency 全量扫描）
+  Map<String, int>? _corpusIndex;
+  bool _corpusIndexLoading = false;
+
   @override
   void initState() {
     super.initState();
@@ -569,6 +573,28 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     });
   }
 
+  // 懒加载 corpus 词频索引（仅首次触发扫描，之后 O(1) 查表）
+  Future<bool> _loadCorpusFreq(String word) async {
+    if (_corpusIndex != null) {
+      return (_corpusIndex![word.toLowerCase()] ?? 0) > 0;
+    }
+    if (_corpusIndexLoading) return false;
+    _corpusIndexLoading = true;
+    try {
+      final corpusPath = await _corpusDirPath();
+      final indexFile = File('$corpusPath/corpus_index.json');
+      if (indexFile.existsSync()) {
+        final json = await indexFile.readAsString();
+        final decoded = jsonDecode(json) as Map<String, dynamic>;
+        _corpusIndex = {for (final e in decoded.entries) e.key: (e.value as num).toInt()};
+      }
+    } catch (_) {
+    } finally {
+      _corpusIndexLoading = false;
+    }
+    return (_corpusIndex?[word.toLowerCase()] ?? 0) > 0;
+  }
+
   void _lookupWord(String word) {
     if (word.isEmpty) return;
     final info = _vocab.lookup(word);
@@ -596,12 +622,10 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
       _hasFreq = false;
     });
 
-    // 异步查询真题词频，用于决定是否显示「从未出现」提示
-    _corpusDirPath().then((p) => _vocab.getWordFrequency(word, p)).then((data) {
+    // 查 corpus 词频索引（O(1)，懒加载一次）
+    _loadCorpusFreq(word).then((hasFreq) {
       if (mounted && _searchResult == word) {
-        setState(() {
-          _hasFreq = data != null && (data['total'] as int) > 0;
-        });
+        setState(() => _hasFreq = hasFreq);
       }
     });
 
@@ -1443,6 +1467,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
   late List<_AnalyzedWord> _words;
   late Map<String, int> _categoryCounts;
   String _filter = '全部';
+  List<_AnalyzedWord> _cachedFiltered = [];
   bool _batchMode = false;
   final Set<String> _selectedOthers = {};
 
@@ -1498,6 +1523,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
 
     // 寮傛鑾峰彇真题词频锛堜笉闃诲鍒嗘瀽涓绘祦绋嬶級
     _loadRealFreq();
+    _rebuildFiltered();
   }
 
   /// 鑾峰彇鐪熼璇枡搴撶洰褰曡矾寰勶紙搴旂敤鏂囨。鐩綍涓嬬殑 corpus 瀛愮洰褰曪級銆?
@@ -1523,9 +1549,13 @@ class _AnalysisPageState extends State<_AnalysisPage> {
     }
   }
 
-  List<_AnalyzedWord> get _filtered => _filter == '全部'
-      ? _words
-      : _words.where((w) => w.category == _filter).toList();
+  List<_AnalyzedWord> get _filtered => _cachedFiltered;
+
+  void _rebuildFiltered() {
+    _cachedFiltered = _filter == '全部'
+        ? _words
+        : _words.where((w) => w.category == _filter).toList();
+  }
   @override
   void dispose() {
     super.dispose();
@@ -1581,11 +1611,11 @@ class _AnalysisPageState extends State<_AnalysisPage> {
               scrollDirection: Axis.horizontal,
               child: Row(
                 children: [
-                  _FilterChip(label: '全部', count: _words.length, selected: _filter == '全部', onTap: () => setState(() => _filter = '全部')),
-                  ...['课标词', '拓展词', '超纲词', '专有词', '其他'].map((cat) => _FilterChip(
+                  _FilterChip(label: '全部', count: _words.length, selected: _filter == '全部', onTap: () => setState(() { _filter = '全部'; _rebuildFiltered(); })),
+                  ...['课标词', '拓展词', '超标词', '专有词', '其他'].map((cat) => _FilterChip(
                     label: cat, count: _categoryCounts[cat] ?? 0,
                     selected: _filter == cat,
-                    onTap: () => setState(() => _filter = cat),
+                    onTap: () => setState(() { _filter = cat; _rebuildFiltered(); }),
                   )),
                 ],
               ),
@@ -2949,8 +2979,8 @@ class _VocabTabPageState extends State<_VocabTabPage> {
                     ),
                     child: const Text('使用说明'),
                   ),
-                  const Text('V 1.3.0', style: TextStyle(color: Colors.grey, fontSize: 12)),
-                  const SizedBox(height: 4),
+                  Text('V 1.3.6', style: TextStyle(color: Colors.grey, fontSize: phoneScale.fontSize(context, 12))),
+                  SizedBox(height: phoneScale.spacing(context, 4)),
                   GestureDetector(
                     onTap: () async {
                       final uri = Uri.parse('https://github.com/beenhow/ESW');

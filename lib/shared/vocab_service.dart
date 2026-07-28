@@ -21,6 +21,8 @@ class VocabService {
   Map<String, String> extendReverseIndex = {};
   /// 首字母索引
   Map<String, List<String>> wordsByFirstChar = {};
+  /// 拓展词首字母索引（加速 searchSuggestions）
+  final Map<String, List<String>> _extendWordsByFirstChar = {};
   /// 用户添加的拓展词列表
   final List<String> extendWords = [];
   /// 拓展词→基础课标词映射
@@ -188,6 +190,27 @@ class VocabService {
     }
   }
 
+  /// 重建三个手动词表的小写索引（在加载/合并数据后调用）
+  void _rebuildLowerSets() {
+    extendWordsLowerSet.clear();
+    _extendWordsByFirstChar.clear();
+    for (final w in extendWords) {
+      final lw = w.toLowerCase();
+      extendWordsLowerSet.add(lw);
+      final fc = w.isNotEmpty ? w[0].toLowerCase() : '_';
+      _extendWordsByFirstChar.putIfAbsent(fc, () => []);
+      _extendWordsByFirstChar[fc]!.add(w);
+    }
+    chaoGangLowerSet.clear();
+    for (final w in manualChaoGangWords) {
+      chaoGangLowerSet.add(w.toLowerCase());
+    }
+    extraLowerSet.clear();
+    for (final w in manualExtraWords) {
+      extraLowerSet.add(w.toLowerCase());
+    }
+  }
+
   /// 判断单词当前的手动分类（不含课标词/其他）
   String? _classifyManually(String lower) {
     if (extendWords.any((e) => e.toLowerCase() == lower)) return '拓展词';
@@ -218,8 +241,9 @@ class VocabService {
         results.add(w);
       }
     }
-    // 补充拓展词匹配
-    for (final w in extendWords) {
+    // 补充拓展词匹配（首字母索引，O(1) 分桶）
+    final extCandidates = _extendWordsByFirstChar[firstChar] ?? [];
+    for (final w in extCandidates) {
       if (w.toLowerCase().startsWith(lower) && !results.contains(w) && results.length < limit) {
         results.add(w);
       }
