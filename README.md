@@ -38,7 +38,7 @@
 
 ESW 同时提供 Android APK，支持手机端查词。
 
-- **最新版本**：[ESW v1.3.0](https://github.com/beenhow/ESW/releases/latest)
+- **最新版本**：[ESW](https://github.com/beenhow/ESW/releases/latest)
 - 词典：本地离线词典（340万词条），含音标、释义、柯林斯星级、词频、变形词反查
 - 功能：真题检测、词频统计、词库积累、离线查词
 - UI：全局浅黄背景 #FFF8E1，词类标签置于音标上方加边框加粗
