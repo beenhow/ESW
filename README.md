@@ -1,13 +1,3 @@
----
-AIGC:
-    Label: "1"
-    ContentProducer: 001191440300708461136T1XGW3
-    ProduceID: 58517953bc17ebd4c00e5d39198d03e4_505711ab7f2311f18ce5525400826444
-    ReservedCode1: qdhgJ6vQu90WRDqSgLFAWX0OHfFxXznhFqeoQQZcW+e1xZ6Fqc/3N9OdGBxZGOGvksR/BxEZaoyzpA5MLO0Quj5+ERthoBXP2C1OuPyvwChPfqTTyG/c/zme+xrSonAOeU0HRVS+OxMtpoALMKFfk+1Y3d453fOK2CJtN+ijWrHEOMduvJRrSAYz0Jk=
-    ContentPropagator: 001191440300708461136T1XGW3
-    PropagateID: 58517953bc17ebd4c00e5d39198d03e4_505711ab7f2311f18ce5525400826444
-    ReservedCode2: qdhgJ6vQu90WRDqSgLFAWX0OHfFxXznhFqeoQQZcW+e1xZ6Fqc/3N9OdGBxZGOGvksR/BxEZaoyzpA5MLO0Quj5+ERthoBXP2C1OuPyvwChPfqTTyG/c/zme+xrSonAOeU0HRVS+OxMtpoALMKFfk+1Y3d453fOK2CJtN+ijWrHEOMduvJRrSAYz0Jk=
----
 
 # ESW — 真题课标词
 
@@ -112,19 +102,8 @@ ESW/
 
 版本号格式：`主版本.次版本.修订号`（如 `1.3.0`），窗口标题显示为 `真题课标词 v1.x.xx`。
 
-每个正式版本部署到 `D:\UserData\Desktop\ESW\`，同时备份到 `E:\ESW{版本号}\`。
 
 ---
-
-## 更新日志
-
-### v1.3.1 (2026-07-27)
-- 修复超纲词导出 Word 文档黄色高亮背景不生效的问题
-- 代码清理：删除约 325 行无效代码
-- 修复 Dart 空安全编译错误
-
-### v1.3.0
-- 初始公开发布
 
 ## 许可证
 
