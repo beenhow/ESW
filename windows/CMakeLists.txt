@@ -4,7 +4,7 @@ project(ESW LANGUAGES CXX)
 
 # The name of the executable created for the application. Change this to change
 # the on-disk name of your application.
-set(BINARY_NAME "ESW1.3.6")
+set(BINARY_NAME "ESW1.4.9")
 
 # Explicitly opt in to modern CMake behaviors to avoid warnings with recent
 # versions of CMake.
@@ -105,4 +105,10 @@ install(DIRECTORY "${PROJECT_BUILD_DIR}/${FLUTTER_ASSET_DIR_NAME}"
 # Install the AOT library on non-Debug builds only.
 install(FILES "${AOT_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
   CONFIGURATIONS Profile;Release
+  COMPONENT Runtime)
+
+# Bundle the tesseract OCR runtime (tesseract.exe + tessdata) next to the exe,
+# so OCR works out of the box in the released package.
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../tesseract"
+  DESTINATION "${CMAKE_INSTALL_PREFIX}"
   COMPONENT Runtime)

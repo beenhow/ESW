@@ -1,16 +1,42 @@
-import 'package:sqflite/sqflite.dart';
+import 'package:sqlite3/sqlite3.dart' as sqlite3;
 import 'package:path/path.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import 'dart:io';
 
 class DictionaryService {
-  static Database? _db;
-  static const int _dbVersion = 4;
+  static sqlite3.Database? _db;
+  static const int _dbVersion = 8;
+  static const Map<String, String> _posMap = {
+    'j': 'adj.',
+    'r': 'adv.',
+    'n': 'n.',
+    'v': 'v.',
+    'p': 'pron.',
+    'd': 'det.',
+    'c': 'conj.',
+    'i': 'prep.',
+    'u': 'interj.',
+    't': 'abbr.',
+  };
 
-  static Future<Database> _database() async {
+  static Future<sqlite3.Database> _database() async {
     if (_db != null) return _db!;
-    final dir = await getApplicationDocumentsDirectory();
+
+    // 跨平台目录：Android 用 path_provider，Windows 用 LOCALAPPDATA
+    String baseDir;
+    if (Platform.isWindows) {
+      baseDir = Platform.environment['LOCALAPPDATA'] ??
+          Platform.environment['APPDATA'] ??
+          '.';
+    } else {
+      final appDir = await getApplicationDocumentsDirectory();
+      baseDir = appDir.path;
+    }
+
+    final dir = Directory(join(baseDir, 'ESW'));
+    if (!await dir.exists()) await dir.create(recursive: true);
     final dbPath = join(dir.path, 'ecdict.db');
     final versionPath = join(dir.path, 'ecdict.version');
 
@@ -33,8 +59,43 @@ class DictionaryService {
       await File(versionPath).writeAsString(_dbVersion.toString());
     }
 
-    _db = await openDatabase(dbPath, readOnly: true);
+    _db = sqlite3.sqlite3.open(dbPath);
     return _db!;
+  }
+
+  static Map<String, String>? _rowToResult(sqlite3.Row row) {
+    final def = row['definition'];
+    final pos = row['pos'];
+    if ((def == null || (def as String).isEmpty) &&
+        (pos == null || (pos as String).isEmpty)) {
+      return null;
+    }
+    final rawPos = (pos as String?) ?? '';
+    var cleanPos = rawPos.split('/').map((s) {
+      final code = s.split(':').first;
+      return _posMap[code] ?? code;
+    }).join('/');
+    // pos 为空时，从 exchange 推断词性
+    if (cleanPos.isEmpty) {
+      final exchange = (row['exchange'] as String?) ?? '';
+      if (exchange.isNotEmpty) {
+        final ex = exchange.replaceAll(RegExp(r'/\d+:'), '/').replaceAll(RegExp(r'^\d+:/'), '');
+        if (RegExp(r'(^|/)s:').hasMatch(exchange)) {
+          cleanPos = 'n.';
+        } else if (RegExp(r'(^|/)(d|i|3):').hasMatch(exchange)) {
+          cleanPos = 'v.';
+        } else if (RegExp(r'(^|/)(r|t):').hasMatch(exchange)) {
+          cleanPos = 'adj./adv.';
+        }
+      }
+    }
+    return {
+      'pos': cleanPos,
+      'definition': (def as String?) ?? '',
+      'phonetic': (row['phonetic'] as String?) ?? '',
+      'tag': (row['tag'] as String?) ?? '',
+      'exchange': (row['exchange'] as String?) ?? '',
+    };
   }
 
   /// 查询单词：返回 {pos, definition, ...}，未收录返回 null
@@ -45,74 +106,64 @@ class DictionaryService {
       final lower = word.toLowerCase();
 
       // 1. 精确匹配
-      var results = await db.query('dict',
-        columns: ['pos', 'definition', 'phonetic', 'collins', 'tag', 'bnc', 'frq', 'exchange'],
-        where: 'word = ?',
-        whereArgs: [lower],
-        limit: 1,
-      );
+      final rows = db.select(
+        'SELECT pos, definition, phonetic, tag, exchange '
+        'FROM dict WHERE word = ? LIMIT 1',
+        [lower],
+      ).toList();
+      var result = rows.isNotEmpty ? _rowToResult(rows.first) : null;
 
       // 1b. 找到但可能是变形词 → exchange 中有 0:xxx 则改用原形
-      if (results.isNotEmpty) {
-        final ex = (results.first['exchange'] as String?) ?? '';
+      if (result != null) {
+        final ex = result['exchange'] ?? '';
         for (final seg in ex.split('/')) {
           final parts = seg.split(':');
           if (parts.length == 2 && parts[0] == '0') {
-            // 当前词是变形词，查原形
-            final baseResults = await db.query('dict',
-              columns: ['pos', 'definition', 'phonetic', 'collins', 'tag', 'bnc', 'frq', 'exchange'],
-              where: 'word = ?',
-              whereArgs: [parts[1]],
-              limit: 1,
-            );
-            if (baseResults.isNotEmpty) {
-              results = baseResults;
-            }
+            final baseRows = db.select(
+              'SELECT pos, definition, phonetic, tag, exchange '
+              'FROM dict WHERE word = ? LIMIT 1',
+              [parts[1]],
+            ).toList();
+            final baseResult = baseRows.isNotEmpty ? _rowToResult(baseRows.first) : null;
+            if (baseResult != null) result = baseResult;
             break;
           }
         }
       }
 
       // 2. 未找到 → exchange 反查变形词
-      if (results.isEmpty) {
-        final rev = await db.query('dict',
-          columns: ['pos', 'definition', 'phonetic', 'collins', 'tag', 'bnc', 'frq', 'exchange'],
-          where: 'exchange LIKE ?',
-          whereArgs: ['%:%$lower%'],
-          limit: 10,
-        );
-        for (final r in rev) {
-          final ex = (r['exchange'] as String?) ?? '';
+      if (result == null) {
+        for (final row in db.select(
+          'SELECT pos, definition, phonetic, tag, exchange '
+          'FROM dict WHERE exchange LIKE ? LIMIT 10',
+          ['%:%$lower%'],
+        )) {
+          final ex = (row['exchange'] as String?) ?? '';
           for (final seg in ex.split('/')) {
             final parts = seg.split(':');
             if (parts.length == 2 && parts[1].toLowerCase() == lower) {
-              // 找到原形词，返回原形的释义
-              results = [r];
+              result = _rowToResult(row);
               break;
             }
           }
-          if (results.length == 1) break;
+          if (result != null) break;
         }
       }
 
-      if (results.isEmpty) return null;
-      final r = results.first;
-      return {
-        'pos': (r['pos'] as String?) ?? '',
-        'definition': (r['definition'] as String?) ?? '',
-        'phonetic': (r['phonetic'] as String?) ?? '',
-        'collins': (r['collins'] ?? 0).toString(),
-        'tag': (r['tag'] as String?) ?? '',
-        'bnc': (r['bnc'] ?? 0).toString(),
-        'frq': (r['frq'] ?? 0).toString(),
-      };
-    } catch (_) {
+      if (result == null) {
+        return null;
+      }
+      return result;
+    } catch (e, st) {
+      debugPrint('[DictService] lookup error: $e');
       return null;
     }
   }
 
   static Future<void> close() async {
-    await _db?.close();
-    _db = null;
+    if (_db != null) {
+      _db!.dispose();
+      _db = null;
+    }
   }
 }

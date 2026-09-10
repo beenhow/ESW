@@ -6,6 +6,7 @@ class AppTheme {
 
   // ── 主色系 ──
   static const primaryBlue = Color(0xFF1565C0);
+  static const primaryYellow = Color(0xFFF9A825);
   static const orange = Color(0xFFE65100);
   static const green = Color(0xFF2E7D32);
   static const red = Color(0xFFD32F2F);
@@ -15,13 +16,13 @@ class AppTheme {
   static const purple = Color(0xFF6A1B9A);
 
   // ── 表面/背景色 (层级: lightest → lighter → light) ──
-  static const surfaceLightest = Color(0xFFFCFCFD);
-  static const surfaceLighter = Color(0xFFF8F9FB);
-  static const surfaceLight = Color(0xFFF5F6F8);
+  static const surfaceLightest = Color(0xFFFFFDE7);
+  static const surfaceLighter = Color(0xFFFFF9C4);
+  static const surfaceLight = Color(0xFFFFF8E1);
 
   // ── 边框色 ──
-  static const borderLight = Color(0xFFDEE2E6);
-  static const borderLighter = Color(0xFFE8E8EC);
+  static const borderLight = Color(0xFFE0DCC0);
+  static const borderLighter = Color(0xFFECECD0);
 
   // ── 文本色 ──
   static const textPrimary = Color(0xFF212121);

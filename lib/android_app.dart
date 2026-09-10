@@ -1,4 +1,5 @@
-﻿import 'package:flutter/material.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart' show SelectedContent;
 import 'package:file_picker/file_picker.dart';
 import 'dart:io';
 import 'dart:convert';
@@ -9,9 +10,13 @@ import 'package:flutter/gestures.dart';
 import 'package:archive/archive.dart';
 import 'package:xml/xml.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 import 'theme/app_theme.dart';
 import 'shared/vocab_service.dart';
+import 'shared/word_sync_service.dart';
+import 'shared/doc_extractor.dart';
+import 'shared/export_extra_table.dart';
 import 'porter_stemmer.dart';
 import 'dictionary_service.dart';
 
@@ -39,15 +44,26 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
   /// corpus 词频索引缓存（O(1) 查表，替代 getWordFrequency 全量扫描）
   Map<String, int>? _corpusIndex;
   bool _corpusIndexLoading = false;
+  bool _syncing = false;
+  final WordSyncService _wordSyncService = WordSyncService();
+  String _userId = '';
 
   @override
   void initState() {
     super.initState();
+    _searchFocus.addListener(_onSearchFocusChanged);
+    _pasteFocus.addListener(_onPasteFocusChanged);
     _initApp();
   }
 
+  void _onSearchFocusChanged() => setState(() {});
+
+  void _onPasteFocusChanged() => setState(() {});
+
   @override
   void dispose() {
+    _searchFocus.dispose();
+    _pasteFocus.dispose();
     _searchCtrl.dispose();
     _pasteCtrl.dispose();
     _searchDebounce?.cancel();
@@ -55,10 +71,12 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
   }
 
   Future<void> _initApp() async {
-    await _vocab.loadStandardWords();
-    await _loadPreloadVocab();
-    await _extractCorpus();
-    await _loadConfig();
+    // 三项初始化相互独立，并行执行以缩短首屏等待
+    await Future.wait([
+      _vocab.loadStandardWords(),
+      _extractCorpus(),
+      _loadConfig(),
+    ]);
     if (mounted) setState(() {});
   }
 
@@ -74,6 +92,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
       if (await f.exists()) {
         final json = jsonDecode(await f.readAsString());
         _vocab.fromJson(json);
+        _userId = json['userId'] as String? ?? _genUserId();
       }
     } catch (_) {}
   }
@@ -81,18 +100,477 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
   Future<void> _saveConfig() async {
     try {
       final configPath = await _getConfigPath();
-      await File(configPath).writeAsString(jsonEncode(_vocab.toJson()));
+      final data = _vocab.toJson();
+      data['userId'] = _userId;
+      await File(configPath).writeAsString(jsonEncode(data));
     } catch (_) {}
   }
 
-  Future<void> _loadPreloadVocab() async {
+  String _genUserId() {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final rand = (now * 1103515245 + 12345) & 0x7fffffff;
+    return 'android_${now.toRadixString(36)}_${rand.toRadixString(36)}';
+  }
+
+  // ---------------- 词库同步（WebDAV） ----------------
+
+  /// 构建当前本地词库快照（决策后再次同步时需重建，反映最新的本地分类状态）。
+  Map<String, Map<String, String>> _buildLocalWords() {
+    final localWords = <String, Map<String, String>>{};
+    for (final w in _vocab.extendWords) {
+      localWords[w.toLowerCase()] = {'original_case': w, 'category': '拓展词'};
+    }
+    for (final w in _vocab.manualChaoGangWords) {
+      localWords[w.toLowerCase()] = {'original_case': w, 'category': '超标词'};
+    }
+    for (final w in _vocab.manualExtraWords) {
+      localWords[w.toLowerCase()] = {'original_case': w, 'category': '专有词'};
+    }
+    return localWords;
+  }
+
+  Future<void> _syncVocab() async {
+    if (_syncing) return; // 防止重复点击导致并发同步
+    setState(() => _syncing = true);
     try {
-      final data = await rootBundle.loadString('assets/preload_vocab.json');
-      final json = jsonDecode(data) as Map<String, dynamic>;
-      // 浣跨敤 mergeFromJson 杩藉姞棰勫姞杞借瘝锛岄伩鍏嶈鐩栫敤鎴峰凡绉疮鐨勫垎绫昏瘝锛?
-      // 涓嶅湪姝ゅ璋冪敤 _saveConfig()锛岄槻姝㈣鐩栫鐩樹笂宸叉湁鐨勭敤鎴烽厤缃€?
-      _vocab.mergeFromJson(json);
-    } catch (_) {}
+      final result = await _wordSyncService.sync(
+        localWords: _buildLocalWords(),
+        localExtendBaseMap: _vocab.extendBaseMap,
+        source: 'android',
+      );
+
+      final remoteChanges = result['remote_changes'] as List<dynamic>;
+
+      if (remoteChanges.isNotEmpty && mounted) {
+        final decisions = await _showSyncConflictDialog(remoteChanges);
+        // 取消（null）无副作用，仅保存配置
+        await _saveConfig();
+        if (decisions != null && decisions.isNotEmpty) {
+          final reasonMap = <String, String>{
+            for (final ch in remoteChanges)
+              (ch['word'] as String): (ch['reason'] as String? ?? ''),
+          };
+          // 删除保护（对齐 Windows 主流程）：统计将传播删除到云端的词（仅 remote_only）
+          // 超过 10 个 → 确认；超过 50 个 → 先自动备份云端再确认；取消则无副作用。
+          final willDelete = <String>{
+            for (final d in decisions)
+              if (d['action'] != 'accept' && reasonMap[d['word']!] == 'remote_only')
+                d['word']!,
+          };
+          final delCount = willDelete.length;
+          final remoteCount = result['remote_count'] as int? ?? 0;
+          if (delCount > 10) {
+            final backedUp = delCount > 50
+                ? await _wordSyncService.backupRemoteState()
+                : false;
+            if (!mounted) return;
+            final confirmed = await _confirmLargeDelete(
+              context,
+              delCount,
+              remoteCount,
+              backedUp,
+            );
+            if (!confirmed) return; // 用户取消：不执行任何删除，无副作用
+          }
+          // 执行逐词决策
+          for (final d in decisions) {
+            final word = d['word']!;
+            final reason = reasonMap[word];
+            if (d['action'] == 'accept') {
+              if (reason == 'remote_deleted') {
+                // 接收云端删除 → 本地也删除（reclassify 空分类即移除），并记录删除墓碑防止再上传
+                _vocab.reclassifyWord(word, '');
+                _wordSyncService.markDeleted(word);
+              } else {
+                final cat = d['category'] ?? '';
+                if (cat.isNotEmpty) _vocab.reclassifyWord(word, cat);
+                _wordSyncService.markChanged(word);
+              }
+            } else {
+              // 拒绝/上传本地：云端新增词（remote_only）→ 记墓碑传播删除；
+              // 分类更新（remote_newer）→ 保留本地分类/以本地为准恢复
+              if (reason == 'remote_only') {
+                _wordSyncService.markDeleted(word);
+              } else {
+                _wordSyncService.markChanged(word);
+              }
+            }
+          }
+          await _saveConfig();
+          // 决策落地后立即再同步一次把结果推送云端，避免对端反复弹窗、本端"确认后未生效"
+          await _wordSyncService.sync(
+            localWords: _buildLocalWords(),
+            localExtendBaseMap: _vocab.extendBaseMap,
+            source: 'android',
+          );
+        }
+      }
+
+      final ebm = result['extendBaseMap'] as Map<String, dynamic>?;
+      if (ebm != null) {
+        for (final entry in ebm.entries) {
+          if (!_vocab.extendBaseMap.containsKey(entry.key)) {
+            _vocab.extendBaseMap[entry.key] = entry.value.toString();
+          }
+        }
+      }
+
+      await _saveConfig();
+      if (mounted) {
+        setState(() {});
+        final msg = remoteChanges.isEmpty ? '同步完成 (已是最新)' : '同步完成 (已处理${remoteChanges.length}条云端变更)';
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('同步失败: $e'), duration: const Duration(seconds: 4)),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _syncing = false);
+    }
+  }
+
+  /// 删除确认弹窗（同步主流程用）：将传播删除到云端的单词超过 10 个时提示确认，
+  /// 超过 50 个时云端已自动备份全部词库。返回 true=确认执行，false=取消（无副作用）。
+  Future<bool> _confirmLargeDelete(
+    BuildContext context,
+    int delCount,
+    int total,
+    bool backedUp,
+  ) async {
+    final backupMsg = delCount > 50
+        ? (backedUp
+            ? '已自动在云端备份全部词库。'
+            : '警告：云端备份失败，请确认网络正常后再操作！')
+        : '';
+    final res = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除确认'),
+        content: Text(
+          '本次操作将删除 $delCount 个单词（词库当前共 $total 个）。\n\n$backupMsg\n\n确认要继续执行该删除操作吗？',
+          textAlign: TextAlign.left,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('确认删除'),
+          ),
+        ],
+      ),
+    );
+    return res ?? false;
+  }
+
+  /// 同步冲突弹窗：逐词接收/拒绝/上传本地云端更新。
+  /// 弹窗内不做任何二次确认（删除保护统一由 _syncVocab 主流程在弹窗关闭后处理，
+  /// 避免弹窗内连续嵌套 showDialog 导致 Android 路由竞态卡死）。
+  /// 取消无副作用（不写墓碑）。返回逐词决策列表（null=取消，空=无实际决策），
+  /// 每项 {word, action('accept'/'reject'/'upload_local'), category}。
+  Future<List<Map<String, String>>?> _showSyncConflictDialog(List<dynamic> changes) async {
+    final accepted = <String, bool>{};
+    // 默认全部接收（应用云端更新，不会删除本地词，安全）
+    for (final ch in changes) {
+      accepted[ch['word'] as String] = true;
+    }
+
+    int acceptCount() => accepted.values.where((v) => v).length;
+    int rejectCount() => accepted.values.where((v) => !v).length;
+
+    // 根据当前开关状态构造决策列表：接收→accepted==true 的词；拒绝/上传本地→accepted==false 的词
+    List<Map<String, String>> buildDecisions(String action) {
+      final result = <Map<String, String>>[];
+      for (final ch in changes) {
+        final c = ch as Map<String, dynamic>;
+        final w = c['word'] as String;
+        final isAccepted = accepted[w] ?? true;
+        final match = (action == 'accept') ? isAccepted : !isAccepted;
+        if (match) {
+          result.add({
+            'word': w,
+            'action': action,
+            'category': (action == 'accept' && c['new_category'] != null)
+                ? (c['new_category'] as String)
+                : '',
+          });
+        }
+      }
+      return result;
+    }
+
+    // 点击按钮后的二次确认弹窗：等待用户确认后再执行主操作，
+    // 通过 await 串行化避免连续 showDialog 引发的路由竞态卡死
+    Future<bool> confirmAction(String title, String message) async {
+      final ok = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (c) => AlertDialog(
+          title: Text(title),
+          content: Text(message),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(c, false),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(c, true),
+              child: const Text('确认'),
+            ),
+          ],
+        ),
+      );
+      return ok ?? false;
+    }
+
+    final decisions = await showDialog<List<Map<String, String>>>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) {
+          return AlertDialog(
+            title: const Center(child: Text('云端词库有更新')),
+            insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+            content: ConstrainedBox(
+              constraints: BoxConstraints(
+                maxWidth: double.maxFinite,
+                // 自适应高度：内容区最多占屏幕可用高度的 55%，超出部分由列表滚动承载，杜绝固定高度导致的底部截断
+                maxHeight: MediaQuery.of(ctx).size.height * 0.55,
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // 全接收/全拒绝 快捷栏（带实时计数）
+                  Row(
+                    children: [
+                      TextButton(
+                        style: TextButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                        ),
+                        onPressed: () async {
+                          final ok = await confirmAction('全部接收', '将全部应用云端更新，不删除本地词，确认执行？');
+                          if (ok) {
+                            setDialogState(() {
+                              for (final ch in changes) {
+                                accepted[ch['word'] as String] = true;
+                              }
+                            });
+                          }
+                        },
+                        child: Text('全部接收（${acceptCount()}）', style: const TextStyle(fontSize: 12)),
+                      ),
+                      TextButton(
+                        style: TextButton.styleFrom(
+                          visualDensity: VisualDensity.compact,
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                        ),
+                        onPressed: () async {
+                          final ok = await confirmAction('全部拒绝', '将全部拒绝云端更新，保留本地状态，确认执行？');
+                          if (ok) {
+                            setDialogState(() {
+                              for (final ch in changes) {
+                                accepted[ch['word'] as String] = false;
+                              }
+                            });
+                          }
+                        },
+                        child: Text('全部拒绝（${rejectCount()}）', style: const TextStyle(fontSize: 12)),
+                      ),
+                    ],
+                  ),
+                  const Divider(height: 1),
+                  Flexible(
+                    child: ListView.builder(
+                      shrinkWrap: true,
+                      itemCount: changes.length,
+                      itemBuilder: (_, i) {
+                        final ch = changes[i] as Map<String, dynamic>;
+                        final word = ch['word'] as String? ?? '';
+                        final isAccepted = accepted[word] ?? true;
+                        return SwitchListTile(
+                          dense: true,
+                          title: Text(word, style: const TextStyle(fontWeight: FontWeight.w500)),
+                          subtitle: Text(
+                            (ch['reason'] as String?) == 'remote_deleted'
+                                ? '云端已删除'
+                                : '${ch['old_category'] ?? '无'} → ${ch['new_category'] ?? ''}',
+                            style: const TextStyle(fontSize: 12),
+                          ),
+                          value: isAccepted,
+                          onChanged: (v) {
+                            accepted[word] = v;
+                            setDialogState(() {});
+                          },
+                        );
+                      },
+                    ),
+                  ),
+                  // 底部按钮：左「接收更新」「拒绝更新」，右「取消」
+                  Padding(
+                    padding: const EdgeInsets.only(top: 8),
+                    child: Wrap(
+                      alignment: WrapAlignment.center,
+                      spacing: 4,
+                      runSpacing: 0,
+                      children: [
+                        TextButton(
+                          onPressed: () async {
+                            final ok = await confirmAction('接收更新', '将应用云端更新到本地，确认执行？');
+                            if (ok) {
+                              Navigator.pop(ctx, buildDecisions('accept'));
+                            }
+                          },
+                          child: const Text('接收更新'),
+                        ),
+                        TextButton(
+                          onPressed: () async {
+                            final ok = await confirmAction('拒绝更新', '将拒绝云端更新，保留本地状态，确认执行？');
+                            if (ok) {
+                              Navigator.pop(ctx, buildDecisions('reject'));
+                            }
+                          },
+                          child: const Text('拒绝更新'),
+                        ),
+                        // 上传本地：自动将所选单词全部拒绝云端更新并直接上传本地，
+                        // 无需用户先手动点「全部拒绝」再点「上传本地」（确认后执行，由主流程删除保护兜底）
+                        TextButton(
+                          onPressed: () async {
+                            final ok = await confirmAction('上传本地', '将自动拒绝云端更新，把本地所选单词全部上传覆盖云端，确认执行？');
+                            if (ok) {
+                              // 一步到位：全部标记为拒绝云端更新（accepted=false），
+                              // 随后 buildDecisions('upload_local') 即收集全部单词作为上传决策
+                              setDialogState(() {
+                                for (final ch in changes) {
+                                  accepted[ch['word'] as String] = false;
+                                }
+                              });
+                              Navigator.pop(ctx, buildDecisions('upload_local'));
+                            }
+                          },
+                          child: const Text('上传本地'),
+                        ),
+                        const SizedBox(width: 4),
+                        TextButton(
+                          onPressed: () => Navigator.pop(ctx, null),
+                          child: const Text('取消'),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+
+    return decisions;
+  }
+
+  Future<void> _checkUpdate(BuildContext context) async {
+    try {
+      final apiUrl = 'https://api.github.com/repos/beenhow/ESW/releases/latest';
+      // 公开仓库 Releases API 无需鉴权（与 Windows 端一致）
+      final resp = await http.get(
+        Uri.parse(apiUrl),
+        headers: const {'Accept': 'application/vnd.github.v3+json'},
+      );
+      if (resp.statusCode != 200) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('检查更新失败(${resp.statusCode})')),
+          );
+        }
+        return;
+      }
+      final json = jsonDecode(resp.body) as Map<String, dynamic>;
+      final tagName = (json['tag_name'] as String?)?.replaceFirst('v', '') ?? '0.0.0';
+      if (_compareVersions(tagName, '1.4.9') <= 0) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('已是最新版本')),
+          );
+        }
+        return;
+      }
+      if (!mounted) return;
+      showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('发现新版本'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('当前版本: 1.4.9'),
+              Text('最新版本: $tagName'),
+              const SizedBox(height: 12),
+              const Text('请选择下载入口：'),
+              const SizedBox(height: 8),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  TextButton.icon(
+                    onPressed: () async {
+                      final uri = Uri.parse('https://github.com/beenhow/ESW/releases');
+                      try {
+                        await launchUrl(uri, mode: LaunchMode.externalApplication);
+                      } catch (e) {
+                        // 打开外部浏览器失败时静默处理
+                      }
+                    },
+                    icon: const Text('</>'),
+                    label: const Text('GitHub'),
+                  ),
+                  const SizedBox(width: 16),
+                  TextButton.icon(
+                    onPressed: () async {
+                      final uri = Uri.parse('https://wwbcj.lanzouu.com/b02qeywze');
+                      try {
+                        await launchUrl(uri, mode: LaunchMode.externalApplication);
+                      } catch (e) {
+                        // 打开外部浏览器失败时静默处理
+                      }
+                    },
+                    icon: const Icon(Icons.cloud_download, size: 18),
+                    label: const Text('蓝奏云'),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              const Text('(密码 52pj)', style: TextStyle(fontSize: 11, color: Colors.grey)),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.of(ctx).pop(), child: const Text('取消')),
+          ],
+        ),
+      );
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('检查更新失败，请检查网络')),
+        );
+      }
+    }
+  }
+
+  int _compareVersions(String a, String b) {
+    final ap = a.split('.').map((e) => int.tryParse(e) ?? 0).toList();
+    final bp = b.split('.').map((e) => int.tryParse(e) ?? 0).toList();
+    for (int i = 0; i < ap.length || i < bp.length; i++) {
+      final av = i < ap.length ? ap[i] : 0;
+      final bv = i < bp.length ? bp[i] : 0;
+      if (av != bv) return av - bv;
+    }
+    return 0;
   }
 
   Future<void> _extractCorpus() async {
@@ -166,6 +644,10 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
       vocab: _vocab,
       onSaveConfig: _saveConfig,
       showBaseWordDialog: _showBaseWordDialog,
+      onSyncVocab: _syncVocab,
+      onCheckUpdate: () => _checkUpdate(context),
+      syncing: _syncing,
+      wordSyncService: _wordSyncService,
       onWordTap: (word) {
         setState(() => _currentIndex = 0);
         _searchCtrl.text = word;
@@ -226,11 +708,12 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                   const SizedBox(height: 12),
                   TextField(
                     controller: _pasteCtrl,
+                    focusNode: _pasteFocus,
                     maxLines: 8,
                     minLines: 4,
                     textAlign: TextAlign.center,
                     decoration: InputDecoration(
-                      hintText: '粘贴文本到这里',
+                      hintText: _pasteFocus.hasFocus ? null : '粘贴文本到这里',
                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                       filled: true,
                       fillColor: const Color(0xFFFFF8E1),
@@ -283,6 +766,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                           .where((e) => e.value > 0)
                           .map((e) => '${e.key}${e.value}')
                           .join(' / ');
+                      final annotatedPart = h.annotatedCount > 0 ? ' · 标注词${h.annotatedCount}' : '';
                       return Card(
                         elevation: 0,
                         color: const Color(0xFFFFF8E1),
@@ -292,7 +776,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                           leading: const Icon(Icons.history, size: 20, color: AppTheme.textSecondary),
                           title: Text(h.fileName, style: const TextStyle(fontWeight: FontWeight.w500, fontSize: 14)),
                           subtitle: Text(
-                            '${_formatTime(h.time)} · ${h.totalWords}词${summary.isNotEmpty ? ' · $summary' : ''}',
+                            '${_formatTime(h.time)} · ${h.totalWords}词${summary.isNotEmpty ? ' · $summary' : ''}$annotatedPart',
                             style: const TextStyle(fontSize: 12, color: AppTheme.textSecondary),
                           ),
                           trailing: const Icon(Icons.chevron_right, size: 18),
@@ -349,24 +833,15 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
       if (lowerName.endsWith('.doc')) {
         // 鏃х増 .doc 涓轰簩杩涘埗鏍煎紡锛屾棤娉曠洿鎺ヨВ鏋愶紝灏濊瘯鎻愬彇鍙鏂囨湰娈点€?
         if (file.bytes != null) {
-          try {
-            content = utf8.decode(file.bytes!, allowMalformed: true)
-                .replaceAll(_controlCharRegex, ' ')
-                .replaceAll(_whitespaceRegex, ' ')
-                .trim();
-            if (content.isEmpty) throw Exception('提取为空');
-          } catch (_) {
-            throw Exception('暂不支持旧版 .doc，请转换为 .docx 或 .txt');
-          }
+          content = extractDocText(file.bytes!);
         } else if (file.path != null) {
           final raw = await File(file.path!).readAsBytes();
-          content = utf8.decode(raw, allowMalformed: true)
-              .replaceAll(_controlCharRegex, ' ')
-              .replaceAll(_whitespaceRegex, ' ')
-              .trim();
-          if (content.isEmpty) throw Exception('暂不支持旧版 .doc，请转换为 .docx 或 .txt');
+          content = extractDocText(raw);
         } else {
           throw Exception('无法读取文件内容');
+        }
+        if (content.trim().isEmpty) {
+          throw Exception('暂不支持旧版 .doc，请转换专.docx 成.txt');
         }
       } else if (lowerName.endsWith('.docx')) {
         // DOCX 涓?ZIP 鍖咃紝瑙ｅ帇鍚庤В鏋?word/document.xml 鎻愬彇鏂囨湰
@@ -390,7 +865,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("鏂囦欢璇诲彇澶辫触: $e")),
+          SnackBar(content: Text("文件读取失败: $e")),
         );
       }
       return;
@@ -408,6 +883,8 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
         fileName: fileName,
         vocab: _vocab,
         onSaveConfig: _saveConfig,
+        wordSyncService: _wordSyncService,
+        userId: _userId,
         onWordTap: (word) {
           setState(() => _currentIndex = 0);
           _searchCtrl.text = word;
@@ -425,6 +902,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
           totalWords: result['totalWords'] as int,
           categoryCounts: Map<String, int>.from(result['categoryCounts'] as Map),
           text: result['text'] as String,
+          annotatedCount: result['annotatedCount'] as int? ?? 0,
         ));
       });
     }
@@ -434,6 +912,8 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
   final TextEditingController _searchCtrl = TextEditingController();
   Timer? _searchDebounce;
   final TextEditingController _pasteCtrl = TextEditingController();
+  final FocusNode _searchFocus = FocusNode();
+  final FocusNode _pasteFocus = FocusNode();
   String _searchResult = '';
   String _query = '';
   Map<String, String?>? _wordInfo;
@@ -486,10 +966,11 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                       ),
                       child: TextField(
                         controller: _searchCtrl,
+                        focusNode: _searchFocus,
                         textAlign: TextAlign.center,
                         style: const TextStyle(fontSize: 16),
                         decoration: InputDecoration(
-                          hintText: '输入英文单词',
+                          hintText: _searchFocus.hasFocus ? null : '输入英文单词',
                           hintStyle: const TextStyle(color: Colors.grey, fontSize: 15),
                           prefixIcon: const Padding(
                             padding: EdgeInsets.only(left: 12, right: 4),
@@ -602,7 +1083,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     if (_vocab.isExtend(word)) {
       cat = '拓展词';
     } else if (_vocab.isChaoGang(word)) {
-      cat = '超纲词';
+      cat = '超标词';
     } else if (_vocab.isExtra(word)) {
       cat = '专有词';
     } else if (info.isNotEmpty) {
@@ -659,7 +1140,6 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
           });
         }
       } else if (!isStd && mounted) {
-        // 非课标词且词典未收录：后缀推断词性
         final inferredPos = _inferPos(word);
         setState(() {
           _wordInfo = {
@@ -798,15 +1278,20 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
         categoryLabel = null;
       }
       labelColor = categoryColor;
-    } else if (_vocab.extendWords.contains(_searchResult)) {
-      categoryLabel = '拓展词';
-      labelColor = AppTheme.green;
-    } else if (_vocab.manualChaoGangWords.contains(_searchResult)) {
-      categoryLabel = '超纲词';
-      labelColor = AppTheme.red;
-    } else if (_vocab.manualExtraWords.contains(_searchResult)) {
-      categoryLabel = '专有词';
-      labelColor = AppTheme.grey;
+    } else {
+      // 手动分类统一走大小写不敏感判断（与词库页/检测页一致），
+      // 保证词库页已分类的单词在查词页能同步显示分类标签。
+      final manualCat = _currentManualCategory(_searchResult.toLowerCase());
+      if (manualCat == '拓展词') {
+        categoryLabel = '拓展词';
+        labelColor = AppTheme.green;
+      } else if (manualCat == '超标词') {
+        categoryLabel = '超标词';
+        labelColor = AppTheme.red;
+      } else if (manualCat == '专有词') {
+        categoryLabel = '专有词';
+        labelColor = AppTheme.grey;
+      }
     }
 
     // 解析词性+释义（按 / 拆分为多行）
@@ -840,7 +1325,6 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                   ),
                 ),
               ),
-            // 音标 + 柯林斯星级
             if (phonetic.isNotEmpty || collins > 0)
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
@@ -856,7 +1340,10 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                 ],
               ),
             if (phonetic.isNotEmpty || collins > 0) const SizedBox(height: 10),
-            // 单词居中
+            // 单词居中展示（修改入口移至例句单词点击，见真题查看器）
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
             Text(
               _searchResult,
               textAlign: TextAlign.center,
@@ -865,9 +1352,10 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                 fontWeight: FontWeight.bold,
                 color: Color(0xFFB20000),
               ),
+              ),
+              ],
             ),
             const SizedBox(height: 8),
-            // 词性+释义行
             if (posDefPairs.isNotEmpty)
               ...posDefPairs.map((p) => Padding(
                     padding: const EdgeInsets.only(top: 3),
@@ -922,21 +1410,10 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                   children: [
                     _markButton('+ 拓展词', AppTheme.green, () => _handleReclassify('拓展词')),
                     const SizedBox(width: 12),
-                    _markButton('+ 超纲词', AppTheme.red, () => _handleReclassify('超纲词')),
+                    _markButton('+ 超标词', AppTheme.red, () => _handleReclassify('超标词')),
                     const SizedBox(width: 12),
                     _markButton('+ 专有词', AppTheme.grey, () => _handleReclassify('专有词')),
                   ],
-                ),
-              ),
-            if (canMark && !_hasFreq)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: const Center(
-                  child: Text(
-                    '本单词从未在高考真题中出现过',
-                    style: TextStyle(fontSize: 12, color: Color(0xFF999999)),
-                    textAlign: TextAlign.center,
-                  ),
                 ),
               ),
             const SizedBox(height: 8),
@@ -963,17 +1440,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     return results;
   }
 
-  /// 根据词性返回对应颜色
-  Color _posColor(String pos) {
-    if (pos.startsWith('vt') || pos == 'v.') return const Color(0xFFB20000);
-    if (pos.startsWith('vi')) return const Color(0xFF008000);
-    if (pos.startsWith('n')) return AppTheme.primaryBlue;
-    if (pos.startsWith('adj') || pos.startsWith('a.')) return AppTheme.purple;
-    if (pos.startsWith('adv')) return AppTheme.orange;
-    return const Color(0xFFB20000);
-  }
-
-  /// 柯林斯星级（0~5）
+  /// （0~5，
   Widget _buildCollinsStars(int stars) {
     return Row(
       mainAxisSize: MainAxisSize.min,
@@ -987,7 +1454,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
 
   /// 紧凑标记按钮
   Widget _markButton(String label, Color color, VoidCallback onPressed) {
-    final isCurrent = _wordCategory == label;
+    final isCurrent = _currentManualCategory(_searchResult.toLowerCase()) == label;
     return OutlinedButton(
       onPressed: isCurrent ? null : onPressed,
       style: OutlinedButton.styleFrom(
@@ -1001,10 +1468,10 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     );
   }
 
-  /// 判断单词当前的手动分类（拓展词/超纲词/专有词），无则返回 null。
+  /// 判断单词当前的手动分类（拓展词/超标词/专有词），无则返回 null。
   String? _currentManualCategory(String lower) {
     if (_vocab.extendWords.any((e) => e.toLowerCase() == lower)) return '拓展词';
-    if (_vocab.manualChaoGangWords.any((e) => e.toLowerCase() == lower)) return '超纲词';
+    if (_vocab.manualChaoGangWords.any((e) => e.toLowerCase() == lower)) return '超标词';
     if (_vocab.manualExtraWords.any((e) => e.toLowerCase() == lower)) return '专有词';
     return null;
   }
@@ -1033,11 +1500,13 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     if (targetCategory == '拓展词') {
       _showBaseWordDialog(_searchResult, () {
         _vocab.reclassifyWord(_searchResult, '拓展词');
+        _wordSyncService.markChanged(_searchResult);
         _saveConfig();
         if (mounted) setState(() => _wordCategory = '拓展词');
       });
     } else {
       _vocab.reclassifyWord(_searchResult, targetCategory);
+      _wordSyncService.markChanged(_searchResult);
       _saveConfig();
       if (mounted) {
         setState(() => _wordCategory = targetCategory);
@@ -1048,15 +1517,31 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     }
   }
 
+
   /// 真题词频鍖哄煙锛氫粠 corpus 鐩綍缁熻褰撳墠鏌ヨ鍗曡瘝鐨勫嚭鐜版鏁颁笌閫愬勾鍒嗗竷銆?
   Widget _buildWordFrequency() {
     return FutureBuilder<Map<String, dynamic>?>(
       future: _corpusDirPath().then((p) => _vocab.getWordFrequency(_searchResult, p)),
       builder: (context, snap) {
-        if (!snap.hasData || snap.data == null) return const SizedBox.shrink();
-        final data = snap.data!;
+        if (snap.connectionState != ConnectionState.done) return const SizedBox.shrink();
+
+        final data = snap.data;
+        if (data == null || (data['total'] as int) == 0) {
+          return const Padding(
+            padding: EdgeInsets.only(top: 8),
+            child: Center(
+              child: Text(
+                '本单词从未在高考真题中出现过',
+                style: TextStyle(fontSize: 12, color: Color(0xFF999999)),
+                textAlign: TextAlign.center,
+              ),
+            ),
+          );
+        }
+
         _lastFreqData = data;
         final total = data['total'] as int;
+
         final byYear = data['byYear'] as Map<String, dynamic>;
 
         return Column(
@@ -1096,6 +1581,11 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                                 filePath: filePath,
                                 keyword: _searchResult,
                                 offset: offset,
+                                onLookupWord: (w) {
+                                  setState(() => _currentIndex = 0);
+                                  _searchCtrl.text = w;
+                                  _lookupWord(w);
+                                },
                               ),
                             ))
                         : null,
@@ -1192,7 +1682,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
               title: const Text('打开真题'),
               onTap: () {
                 Navigator.pop(ctx);
-                // 鍦ㄥ綋鍓嶈瘝棰戠粨鏋滀腑鏌ユ壘鍖归厤璇ュ叧閿瘝鐨勭湡棰樻潯鐩苟璺宠浆
+                // 鍦ㄥ綋鍓嶈瘝棰戠粨鏋滀腑鏌ユ壘鍖归厤璇ュ叧閿瘝鐨勭湡棰樻潯鐩苟璺宠测
                 final data = _lastFreqData;
                 if (data != null) {
                   final byYear = data['byYear'] as Map<String, dynamic>? ?? {};
@@ -1209,6 +1699,11 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                               filePath: filePath,
                               keyword: word,
                               offset: offset,
+                              onLookupWord: (w) {
+                                setState(() => _currentIndex = 0);
+                                _searchCtrl.text = w;
+                                _lookupWord(w);
+                              },
                             ),
                           ));
                           return;
@@ -1232,23 +1727,25 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     switch (cat) {
       case '课标词': return AppTheme.primaryBlue;
       case '拓展词': return AppTheme.green;
-      case '超纲词': return AppTheme.red;
+      case '超标词': return AppTheme.red;
       case '专有词': return AppTheme.grey;
       default: return AppTheme.orange;
     }
   }
 }
 
-/// 鐪熼鍘熸枃鏌ョ湅鍣細鎵撳紑鎸囧畾鐪熼 txt 鏂囦欢锛屾粴鍔ㄥ苟楂樹寒鍏抽敭璇嶆墍鍦ㄤ綅缃€?
+
 class _ExamPaperViewer extends StatefulWidget {
   final String filePath;
   final String keyword;
   final int offset;
+  final void Function(String word) onLookupWord;
 
   const _ExamPaperViewer({
     required this.filePath,
     required this.keyword,
     required this.offset,
+    required this.onLookupWord,
   });
 
   @override
@@ -1261,6 +1758,7 @@ class _ExamPaperViewerState extends State<_ExamPaperViewer> {
   bool _loading = true;
   int _highlightStart = -1;
   int _highlightEnd = -1;
+  SelectedContent? _selectedContent;
 
   @override
   void initState() {
@@ -1310,7 +1808,7 @@ class _ExamPaperViewerState extends State<_ExamPaperViewer> {
       // 绛夊緟甯冨眬完成鍚庢粴鍔ㄥ埌鍏抽敭璇嶄綅缃?
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (_scrollController.hasClients && _highlightStart >= 0) {
-          // 浼扮畻婊氬姩浣嶇疆锛氭寜瀛楃鏁扮矖鐣ユ槧灏勫埌婊氬姩鍋忕Щ
+          // 浼扮畻婊氬姩浣嶇疆锛氭寜瀛楃鏁扮矖鐣ユ槧灏勫埌婊氬姩鍋忕В
           final total = _content.length;
           final maxScroll = _scrollController.position.maxScrollExtent;
           final ratio = _highlightStart / total;
@@ -1325,22 +1823,161 @@ class _ExamPaperViewerState extends State<_ExamPaperViewer> {
     }
   }
 
+  /// 构建正文 TextSpan：每个英文单词独立可点击，keyword 高亮」
+  /// 构建正文 TextSpan：仅 keyword 拆为高亮 span，其余整段保留，
+  /// 避免逐词拆分导致大量 span 造成卡顿；点击命中由 GestureDetector 统一处理」
   List<TextSpan> _buildSpans() {
-    if (_highlightStart < 0 || _highlightEnd <= _highlightStart) {
-      return [TextSpan(text: _content)];
+    if (_content.isEmpty) return const [];
+    final wordRe = RegExp(r"[a-zA-Z]+(?:['“][a-zA-Z]+)*");
+    final spans = <TextSpan>[];
+    final keyword = widget.keyword.toLowerCase();
+    var cursor = 0;
+    for (final m in wordRe.allMatches(_content)) {
+      final word = m.group(0)!;
+      if (word.toLowerCase() != keyword) continue;
+      if (m.start > cursor) {
+        spans.add(TextSpan(text: _content.substring(cursor, m.start)));
     }
-    return [
-      TextSpan(text: _content.substring(0, _highlightStart)),
-      TextSpan(
-        text: _content.substring(_highlightStart, _highlightEnd),
+      spans.add(TextSpan(
+        text: word,
         style: const TextStyle(
           backgroundColor: Color(0x66FFEB3B),
           fontWeight: FontWeight.bold,
           color: Colors.red,
         ),
+      ));
+      cursor = m.end;
+    }
+    if (spans.isEmpty) return [TextSpan(text: _content)];
+    if (cursor < _content.length) {
+      spans.add(TextSpan(text: _content.substring(cursor)));
+    }
+    return spans;
+  }
+
+  /// 长按选中单词后的自定义菜单：复制 / 修改 / 查词」
+  /// 位置由系统按选区自动定位（选区上方），避免手动命中测试因分辨率导致偏移」
+  Widget _buildWordContextMenu(BuildContext context, SelectableRegionState state) {
+    final content = _selectedContent;
+    final word = content?.plainText.trim() ?? '';
+    if (word.isEmpty) return const SizedBox.shrink();
+    final isWord = RegExp(r"^[a-zA-Z]+(?:['“][a-zA-Z]+)*$").hasMatch(word);
+    if (!isWord) {
+      return AdaptiveTextSelectionToolbar.buttonItems(
+        anchors: state.contextMenuAnchors,
+        buttonItems: [
+          ContextMenuButtonItem(
+            label: '复制',
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: word));
+              state.hideToolbar();
+            },
+          ),
+        ],
+      );
+    }
+    return AdaptiveTextSelectionToolbar.buttonItems(
+      anchors: state.contextMenuAnchors,
+      buttonItems: [
+        ContextMenuButtonItem(
+          label: '复制',
+          onPressed: () {
+            Clipboard.setData(ClipboardData(text: word));
+            state.hideToolbar();
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('已复制 $word')),
+            );
+          },
+        ),
+        ContextMenuButtonItem(
+          label: '修改',
+          onPressed: () {
+            state.hideToolbar();
+            _editWord(word);
+          },
+        ),
+        ContextMenuButtonItem(
+          label: '查词',
+          onPressed: () {
+            state.hideToolbar();
+            Navigator.of(context).pop();
+            widget.onLookupWord(word);
+          },
+        ),
+      ],
+    );
+  }
+
+  /// 编辑标注单词：将真题文件原文中所有该词替换为新拼写并写回文件，
+  /// 重新高亮新词（对齐分析页/Windows 版仅改语料文本语义，不修改词库分类）」
+  Future<void> _editWord(String oldWord) async {
+    final controller = TextEditingController(text: oldWord);
+    final newWord = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('编辑此词'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: '新拼写（将替换真题文件中所有该词）',
+            border: OutlineInputBorder(),
+            isDense: true,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, controller.text.trim()),
+            child: const Text('保存'),
+          ),
+        ],
       ),
-      TextSpan(text: _content.substring(_highlightEnd)),
-    ];
+    );
+    controller.dispose();
+    if (newWord == null || newWord.isEmpty || newWord == oldWord) return;
+    if (!RegExp(r'^[a-zA-Z]+$').hasMatch(newWord)) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('$newWord 不是合法的英文单词')),
+      );
+      return;
+    }
+    final replaced = _content.replaceAllMapped(
+      RegExp('\\b${RegExp.escape(oldWord)}\\b', caseSensitive: false),
+      (_) => newWord,
+    );
+    if (replaced == _content) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('文本中未找到 $oldWord')),
+      );
+      return;
+    }
+    try {
+      await File(widget.filePath).writeAsString(replaced);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('写入真题文件失败 $e')),
+      );
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _content = replaced;
+      // 重新定位新词高亮范围
+      final pattern = RegExp(r'\b' + RegExp.escape(newWord) + r'\b', caseSensitive: false);
+      final m = pattern.firstMatch(_content);
+      _highlightStart = m?.start ?? -1;
+      _highlightEnd = m?.end ?? -1;
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('已将真题文件中 $oldWord 改为 $newWord')),
+    );
   }
 
   @override
@@ -1359,10 +1996,14 @@ class _ExamPaperViewerState extends State<_ExamPaperViewer> {
               child: SingleChildScrollView(
                 controller: _scrollController,
                 padding: const EdgeInsets.all(16),
-                child: SelectableText.rich(
-                  TextSpan(
-                    style: const TextStyle(fontSize: 15, height: 1.6, color: Colors.black87),
-                    children: _buildSpans(),
+                child: SelectionArea(
+                  onSelectionChanged: (content) => _selectedContent = content,
+                  contextMenuBuilder: _buildWordContextMenu,
+                  child: Text.rich(
+                    TextSpan(
+                      style: const TextStyle(fontSize: 15, height: 1.6, color: Colors.black87),
+                      children: _buildSpans(),
+                    ),
                   ),
                 ),
               ),
@@ -1414,6 +2055,7 @@ class _DetectHistory {
   final int totalWords;
   final Map<String, int> categoryCounts;
   final String text;
+  final int annotatedCount;
 
   _DetectHistory({
     required this.fileName,
@@ -1421,10 +2063,10 @@ class _DetectHistory {
     required this.totalWords,
     required this.categoryCounts,
     required this.text,
+    required this.annotatedCount,
   });
 }
 
-/// 鍘嗗彶璁板綍纾佽创
 class _HistoryTile extends StatelessWidget {
   final String word;
   final VoidCallback onTap;
@@ -1449,15 +2091,16 @@ class _HistoryTile extends StatelessWidget {
   }
 }
 
-/// 鏂囨湰鍒嗘瀽缁撴灉椤甸潰
 class _AnalysisPage extends StatefulWidget {
   final String text;
   final String fileName;
   final VocabService vocab;
   final VoidCallback onSaveConfig;
   final ValueChanged<String>? onWordTap;
+  final WordSyncService wordSyncService;
+  final String userId;
 
-  const _AnalysisPage({required this.text, required this.fileName, required this.vocab, required this.onSaveConfig, this.onWordTap});
+  const _AnalysisPage({required this.text, required this.fileName, required this.vocab, required this.onSaveConfig, this.onWordTap, required this.wordSyncService, required this.userId});
 
   @override
   State<_AnalysisPage> createState() => _AnalysisPageState();
@@ -1466,10 +2109,13 @@ class _AnalysisPage extends StatefulWidget {
 class _AnalysisPageState extends State<_AnalysisPage> {
   late List<_AnalyzedWord> _words;
   late Map<String, int> _categoryCounts;
+  int _annotatedCount = 0;
   String _filter = '全部';
   List<_AnalyzedWord> _cachedFiltered = [];
   bool _batchMode = false;
   final Set<String> _selectedOthers = {};
+  String _lastClassificationTime = '';
+  late String _text;
 
   final Map<String, int?> _realFreq = {};
   bool _freqLoading = false;
@@ -1480,6 +2126,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
   @override
   void initState() {
     super.initState();
+    _text = widget.text;
     _analyze();
   }
 
@@ -1506,7 +2153,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
       } else if (widget.vocab.isExtend(original)) {
         cat = '拓展词';
       } else if (widget.vocab.isChaoGang(original)) {
-        cat = '超纲词';
+        cat = '超标词';
       } else if (widget.vocab.isExtra(original)) {
         cat = '专有词';
       } else {
@@ -1520,6 +2167,38 @@ class _AnalysisPageState extends State<_AnalysisPage> {
     for (final w in _words) {
       _categoryCounts[w.category] = (_categoryCounts[w.category] ?? 0) + 1;
     }
+
+    // 构建汉语标注词集合（统计用，仅计数不加色）
+    // O(N) 实现：避免对全文反复 substring + firstMatch 造成 O(N^2) 卡顿
+    final _parenChineseRegex = RegExp(r'^\s*[\(（][^)）]*[\u4e00-\u9fa5]+[^)）]*[\)）]');
+    final _importedWordsLower = _words.map((aw) => aw.word.toLowerCase()).toSet();
+    final annotatedPhrases = <String>{};
+    final wordPattern = RegExp(r'\b[a-zA-Z]{2,}\b');
+    bool isAsciiLetter(int u) =>
+        (u >= 0x41 && u <= 0x5A) || (u >= 0x61 && u <= 0x7A);
+    bool isSep(int u) =>
+        u == 0x20 || u == 0x09 || u == 0x2D; // 空格 / 制表 / 连字符
+    // 用 allMatches 遍历所有词（替代逐位指针推进，避免 O(N^2) 与跨行跳词）
+    for (final m in wordPattern.allMatches(_text)) {
+      final w = m.group(0)!;
+      if (!_importedWordsLower.contains(w.toLowerCase())) { continue; }
+      // 直接从原文本 m.end 处匹配中文注解，避免创建 O(N) 子串
+      if (_parenChineseRegex.matchAsPrefix(_text, m.end) == null) continue;
+      // 向前回溯合并短语：跳过空白连字符，取前面一段连续字母作为前一词
+      int phraseStart = m.start;
+      while (phraseStart > 0) {
+        int p = phraseStart;
+        while (p > 0 && isSep(_text.codeUnitAt(p - 1))) p--;
+        int q = p;
+        while (q > 0 && isAsciiLetter(_text.codeUnitAt(q - 1))) q--;
+        if (q == p) break; // 前方不是单词，停止回溯
+        final pw = _text.substring(q, p);
+        if (!_importedWordsLower.contains(pw.toLowerCase())) break;
+        phraseStart = q;
+      }
+      annotatedPhrases.add(widget.text.substring(phraseStart, m.end).trim());
+    }
+    _annotatedCount = annotatedPhrases.length;
 
     // 寮傛鑾峰彇真题词频锛堜笉闃诲鍒嗘瀽涓绘祦绋嬶級
     _loadRealFreq();
@@ -1567,6 +2246,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
       'totalWords': _words.length,
       'categoryCounts': Map<String, int>.from(_categoryCounts),
       'text': widget.text,
+      'annotatedCount': _annotatedCount,
     };
   }
 
@@ -1625,16 +2305,25 @@ class _AnalysisPageState extends State<_AnalysisPage> {
           if (_filter == '其他' && (_categoryCounts['其他'] ?? 0) > 0)
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-              child: Align(
-                alignment: Alignment.centerRight,
-                child: TextButton.icon(
-                  onPressed: () => setState(() {
-                    _batchMode = !_batchMode;
-                    if (!_batchMode) _selectedOthers.clear();
-                  }),
-                  icon: Icon(_batchMode ? Icons.close : Icons.checklist, size: 18),
-                  label: Text(_batchMode ? '退出批量归类' : '批量归类'),
-                ),
+              child: Row(
+                children: [
+                  TextButton.icon(
+                    onPressed: () => setState(() {
+                      _batchMode = !_batchMode;
+                      if (!_batchMode) _selectedOthers.clear();
+                    }),
+                    icon: Icon(_batchMode ? Icons.close : Icons.checklist, size: 18),
+                    label: Text(_batchMode ? '退出批量归类' : '批量归类'),
+                  ),
+                  if (!_batchMode) ...[
+                    const SizedBox(width: 8),
+                    TextButton.icon(
+                      onPressed: _startClassifyBatch,
+                      icon: const Icon(Icons.play_arrow, size: 18),
+                      label: const Text('连续筛选'),
+                    ),
+                  ],
+                ],
               ),
             ),
           // 筛选单词列表（填充可用空间）
@@ -1703,10 +2392,20 @@ class _AnalysisPageState extends State<_AnalysisPage> {
                             ? PopupMenuButton<String>(
                                 icon: const Icon(Icons.more_vert, size: 18),
                                 onSelected: (cat) async {
+                                  if (cat == '修改') {
+                                    await _showEditDetectedWordDialog(aw.word);
+                                    return;
+                                  }
                                   switch (cat) {
                                     case '拓展词': await _showBaseWordDialog(aw.word); break;
-                                    case '超纲词': widget.vocab.addChaoGangWord(aw.word); break;
-                                    case '专有词': widget.vocab.addExtraWord(aw.word); break;
+                                    case '超标词':
+                                      widget.vocab.addChaoGangWord(aw.word);
+                                      widget.wordSyncService.markChanged(aw.word);
+                                      break;
+                                    case '专有词':
+                                      widget.vocab.addExtraWord(aw.word);
+                                      widget.wordSyncService.markChanged(aw.word);
+                                      break;
                                   }
                                   widget.onSaveConfig();
                                   _analyze();
@@ -1714,8 +2413,11 @@ class _AnalysisPageState extends State<_AnalysisPage> {
                                 },
                                 itemBuilder: (_) => [
                                   const PopupMenuItem(value: '拓展词', child: Text('设为拓展词')),
-                                  const PopupMenuItem(value: '超纲词', child: Text('设为超纲词')),
+                                  if (aw.category == '其他') ...[
+                                  const PopupMenuItem(value: '拓展词', child: Text('设为拓展词')),
+                                  const PopupMenuItem(value: '超标词', child: Text('设为超标词')),
                                   const PopupMenuItem(value: '专有词', child: Text('设为专有词')),
+                                  ],
                                 ],
                               )
                             : null,
@@ -1723,7 +2425,6 @@ class _AnalysisPageState extends State<_AnalysisPage> {
                     },
                   ),
           ),
-          // 批量归类操作条
           if (_batchMode && _selectedOthers.isNotEmpty)
             Container(
               decoration: BoxDecoration(
@@ -1737,7 +2438,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
                     child: Text('已选 ${_selectedOthers.length} 个', style: const TextStyle(fontSize: 13, color: Colors.black87)),
                   ),
                   Expanded(child: TextButton(onPressed: _batchExtendDialog, child: const Text('拓展词', style: TextStyle(fontSize: 13)))),
-                  Expanded(child: TextButton(onPressed: _batchSetChaoGang, child: const Text('超纲词', style: TextStyle(fontSize: 13)))),
+                  Expanded(child: TextButton(onPressed: _batchSetChaoGang, child: const Text('超标词', style: TextStyle(fontSize: 13)))),
                   Expanded(child: TextButton(onPressed: _batchSetExtra, child: const Text('专有词', style: TextStyle(fontSize: 13)))),
                 ],
               ),
@@ -1755,7 +2456,6 @@ class _AnalysisPageState extends State<_AnalysisPage> {
     final controller = TextEditingController(text: word);
     final lowerWord = word.toLowerCase();
 
-    // 鍙傝€冪數鑴戠増閫愬瓧姣嶅尮閰嶉€昏緫
     final allStandard = widget.vocab.standardWordsLowerKeySet.toList();
     List<String> matches = _getBaseWordCandidates(lowerWord, allStandard);
 
@@ -1795,6 +2495,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
                         final lower = q.trim().toLowerCase();
                         if (matches.length == 1 && matches.first.toLowerCase() == lower) {
                           widget.vocab.addExtendWord(word, baseWord: matches.first);
+                          widget.wordSyncService.markChanged(word);
                           Navigator.of(dialogContext).pop();
                         }
                       },
@@ -1810,6 +2511,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
                           return InkWell(
                             onTap: () {
                               widget.vocab.addExtendWord(word, baseWord: w);
+                              widget.wordSyncService.markChanged(word);
                               Navigator.of(dialogContext).pop();
                             },
                             child: Padding(
@@ -1889,6 +2591,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
                             onTap: () {
                               for (final word in words) {
                                 widget.vocab.addExtendWord(word, baseWord: w);
+                                widget.wordSyncService.markChanged(word);
                               }
                               Navigator.of(dialogContext).pop();
                             },
@@ -1945,8 +2648,183 @@ class _AnalysisPageState extends State<_AnalysisPage> {
   }
 
 
-  /// 鐢熸垚甯︽爣娉ㄧ殑鍏ㄦ枃锛氭寜浠庡乏鍒板彸鎵弿鍘熸枃锛屽凡璇嗗埆鍗曡瘝鐢ㄥ搴旀爣璁板寘瑁广€?
-  /// 课标词嶆棤鏍囪锛屾嫇灞曡瘝鐢{}锛岃秴绾茶瘝鐢<>锛屼笓鏈夎瘝鐢()銆?
+  /// 连续筛选：单一弹窗含输入框+候选词+按钮；分类计数实时更新，时间戳精确到秒。
+  Future<void> _startClassifyBatch() async {
+    while (true) {
+      final others = _words.where((w) => w.category == '其他').toList();
+      if (others.isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('所有待筛选单词已处理完毕')),
+          );
+        }
+        break;
+      }
+
+      final word = others.first.word;
+      final remaining = others.length;
+      final allStandard = widget.vocab.standardWordsLowerKeySet.toList();
+      final lowerWord = word.toLowerCase();
+
+      final result = await showDialog<_DialogResult>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogCtx) {
+          final controller = TextEditingController(text: word);
+          List<String> matches = _getBaseWordCandidates(lowerWord, allStandard);
+
+          return StatefulBuilder(
+            builder: (ctx, setDialogState) {
+              void tryAutoComplete() {
+                final input = controller.text.trim().toLowerCase();
+                for (final m in matches) {
+                  if (m.toLowerCase() == input) {
+                    widget.vocab.addExtendWord(word, baseWord: m);
+                    widget.wordSyncService.markChanged(word);
+                    Navigator.of(dialogCtx).pop(_DialogResult(action: '拓展词', baseWord: m));
+                    return;
+                  }
+                }
+              }
+
+              return AlertDialog(
+                title: Text('将 "$word" 筛选归类'),
+                content: SizedBox(
+                  width: double.maxFinite,
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      Expanded(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text('剩余 $remaining 个待处理', style: TextStyle(color: Colors.grey[600], fontSize: 13)),
+                            const SizedBox(height: 8),
+                            TextField(
+                              controller: controller,
+                              decoration: const InputDecoration(
+                                hintText: '输入课标词搜索',
+                                prefixIcon: Icon(Icons.search, size: 20),
+                                border: OutlineInputBorder(),
+                                isDense: true,
+                                filled: true,
+                                fillColor: Color(0xFFFFF8E1),
+                                contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                              ),
+                              onChanged: (q) {
+                                final lower = q.trim().toLowerCase();
+                                setDialogState(() {
+                                  matches = lower.isEmpty
+                                      ? _getBaseWordCandidates(lowerWord, allStandard)
+                                      : _getBaseWordCandidates(lower, allStandard);
+                                });
+                                tryAutoComplete();
+                              },
+                              onSubmitted: (_) => tryAutoComplete(),
+                            ),
+                            const SizedBox(height: 8),
+                            Flexible(
+                              child: ConstrainedBox(
+                                constraints: const BoxConstraints(maxHeight: 200),
+                                child: ListView.builder(
+                                  shrinkWrap: true,
+                                  itemCount: matches.length,
+                                  itemBuilder: (_, i) {
+                                    final w = matches[i];
+                                    return InkWell(
+                                      onTap: () {
+                                        widget.vocab.addExtendWord(word, baseWord: w);
+                                        widget.wordSyncService.markChanged(word);
+                                        Navigator.of(dialogCtx).pop(_DialogResult(action: '拓展词', baseWord: w));
+                                      },
+                                      child: Padding(
+                                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                        child: Text(w, style: const TextStyle(fontSize: 15)),
+                                      ),
+                                    );
+                                  },
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Flexible(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            FittedBox(
+                              fit: BoxFit.scaleDown,
+                              child: ElevatedButton(
+                                onPressed: () => Navigator.of(dialogCtx).pop(_DialogResult(action: '专有词')),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: Colors.grey[700],
+                                  foregroundColor: Colors.white,
+                                  minimumSize: const Size(80, 36),
+                                ),
+                                child: const Text('专有词', style: TextStyle(fontSize: 14)),
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            FittedBox(
+                              fit: BoxFit.scaleDown,
+                              child: ElevatedButton(
+                                onPressed: () => Navigator.of(dialogCtx).pop(_DialogResult(action: '超标词')),
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: AppTheme.orange,
+                                  foregroundColor: Colors.white,
+                                  minimumSize: const Size(80, 36),
+                                ),
+                                child: const Text('超标词', style: TextStyle(fontSize: 14)),
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            FittedBox(
+                              fit: BoxFit.scaleDown,
+                              child: TextButton(
+                                onPressed: () => Navigator.of(dialogCtx).pop(null),
+                                child: const Text('退出'),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      );
+
+      if (result == null) break;
+
+      if (result.action != '拓展词') {
+        if (result.action == '超标词') {
+          widget.vocab.addChaoGangWord(word);
+          widget.wordSyncService.markChanged(word);
+        } else if (result.action == '专有词') {
+          widget.vocab.addExtraWord(word);
+          widget.wordSyncService.markChanged(word);
+        }
+      }
+
+      // 分类计数实时更新 + 时间戳精确到秒
+      final now = DateTime.now();
+      _lastClassificationTime = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')} ${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}';
+
+      widget.onSaveConfig();
+      _analyze();
+    }
+
+    if (mounted) setState(() {});
+  }
+
+
   String _buildAnnotatedText() {
     final catByLower = <String, String>{};
     for (final w in _words) {
@@ -1965,7 +2843,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
         buffer.write(word);
       } else if (cat == '拓展词') {
         buffer.write('{$word}');
-      } else if (cat == '超纲词') {
+      } else if (cat == '超标词') {
         buffer.write('<$word>');
       } else if (cat == '专有词') {
         buffer.write('($word)');
@@ -2012,6 +2890,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
       final stamp = '${ts.year}${ts.month.toString().padLeft(2, '0')}${ts.day.toString().padLeft(2, '0')}'
           '_${ts.hour.toString().padLeft(2, '0')}${ts.minute.toString().padLeft(2, '0')}${ts.second.toString().padLeft(2, '0')}';
 
+      final totalRawCount = _words.fold<int>(0, (sum, w) => sum + w.frequency);
       if (choice == 'txt') {
         final path = '${exportDir.path}/analysis_$stamp.txt';
         final buffer = StringBuffer();
@@ -2019,18 +2898,19 @@ class _AnalysisPageState extends State<_AnalysisPage> {
         buffer.writeln('分析时间: ${ts.year}-${ts.month.toString().padLeft(2, '0')}-${ts.day.toString().padLeft(2, '0')} ${ts.hour.toString().padLeft(2, '0')}:${ts.minute.toString().padLeft(2, '0')}');
         buffer.writeln('文件名: ${widget.fileName}');
         final cc = _categoryCounts;
-        buffer.writeln('总词数： ${_words.length} | 课标词： ${cc['课标词'] ?? 0} | 拓展词： ${cc['拓展词'] ?? 0} | 超纲词： ${cc['超纲词'] ?? 0} | 专有词： ${cc['专有词'] ?? 0} | 其他: ${cc['其他'] ?? 0}');
+        buffer.writeln('全套题词数： $totalRawCount | 去重总词数： ${_words.length} | 课标词： ${cc['课标词'] ?? 0} | 拓展词： ${cc['拓展词'] ?? 0} | 超标词： ${cc['超标词'] ?? 0} | 专有词： ${cc['专有词'] ?? 0} | 其他: ${cc['其他'] ?? 0} | 汉语标注词: $_annotatedCount');
         buffer.writeln('');
         buffer.writeln('=' * 64);
         buffer.writeln('【标注说明】');
         buffer.writeln('[课标词]：单词本身（无标记）');
         buffer.writeln('{拓展词}：用花括号标记');
-        buffer.writeln('<超纲词>：用尖括号标记');
+        buffer.writeln('<超标词>：用尖括号标记');
         buffer.writeln('(专有词)：用圆括号标记');
         buffer.writeln('=' * 64);
         buffer.writeln('');
         buffer.writeln(_buildAnnotatedText());
         buffer.writeln('');
+        buffer.writeln(buildExtendTableText(_buildExtendSections()));
         await File(path).writeAsString(buffer.toString());
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('已导出至: $path')));
@@ -2051,16 +2931,46 @@ class _AnalysisPageState extends State<_AnalysisPage> {
 
   /// 鐢熸垚 DOCX 鏂囨。锛氬惈带标注全文囷紙鎸夊垎绫荤潃鑹诧級+ 鍒嗙被璇嶆眹琛ㄣ€?
   /// DOCX 鏈川鏄?ZIP 鍖咃紝鍐呭惈 OOXML銆傝繖閲岀敤 archive 鍖呮墜鍐欐渶灏忓彲鐢ㄦ枃妗ｃ€?
+  /// 构建拓展词按题型分组的明细（导出表格用）」
+  List<ExtendSection> _buildExtendSections() {
+    final extendWords = _words
+        .where((w) => w.category == '拓展词')
+        .map((w) => w.word)
+        .toList();
+    return buildExtendSections(
+      text: _text,
+      extendWords: extendWords,
+      baseWordOf: (w) {
+        final b = widget.vocab.extendReverseIndex[w.toLowerCase()];
+        if (b == null) return '';
+        final ms = widget.vocab.standardWordsLower[b];
+        return (ms != null && ms.isNotEmpty) ? ms.first : b;
+      },
+      meaningOf: (w, base) {
+        final own = widget.vocab.lookup(w)['def'] ?? '';
+        if (own.isNotEmpty) return own;
+        if (base.isNotEmpty) {
+          final bm = widget.vocab.lookup(base)['def'] ?? '';
+          if (bm.isNotEmpty) return bm;
+        }
+        return '';
+      },
+    );
+  }
+
   Future<void> _exportDocx(String path) async {
     final bodyParts = <String>[];
     bodyParts.add(_docxParagraph('ESW 文本检测导出', heading: 1));
     bodyParts.add(_docxParagraph('文件名: ${widget.fileName}'));
     final cc = _categoryCounts;
-    bodyParts.add(_docxParagraph('总词数: ${_words.length} | 课标词: ${cc['课标词'] ?? 0} | 拓展词: ${cc['拓展词'] ?? 0} | 超纲词: ${cc['超纲词'] ?? 0} | 专有词: ${cc['专有词'] ?? 0} | 其他: ${cc['其他'] ?? 0}'));
+    final docxTotalRawCount = _words.fold<int>(0, (sum, w) => sum + w.frequency);
+    bodyParts.add(_docxParagraph('全套题词数: $docxTotalRawCount | 去重总词数: ${_words.length} | 课标词: ${cc['课标词'] ?? 0} | 拓展词: ${cc['拓展词'] ?? 0} | 超标词: ${cc['超标词'] ?? 0} | 专有词: ${cc['专有词'] ?? 0} | 其他: ${cc['其他'] ?? 0} | 汉语标注词: $_annotatedCount'));
     bodyParts.add(_docxParagraph('【标注说明】', heading: 2));
-    bodyParts.add(_docxParagraph('课标词：黑色（无标记）；拓展词：绿色；超纲词：红色；专有词：灰色'));
+    bodyParts.add(_docxParagraph('课标词：黑色（无标记）；拓展词：绿色；超标词：红色；专有词：灰色'));
     bodyParts.add(_docxParagraph('带标注全文', heading: 2));
     bodyParts.add(_docxAnnotatedParagraph());
+    bodyParts.add(_docxParagraph('拓展词明细（按题型）', heading: 2));
+    bodyParts.add(buildExtendTableXml(_buildExtendSections()));
 
     final documentXml = '''
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -2117,7 +3027,7 @@ ${bodyParts.join('\n')}
     String colorOf(String cat) {
       switch (cat) {
         case '拓展词': return '2E7D32';
-        case '超纲词': return 'C62828';
+        case '超标词': return 'C62828';
         case '专有词': return '616161';
         default: return '000000';
       }
@@ -2137,7 +3047,7 @@ ${bodyParts.join('\n')}
       if (cat == null || cat == '课标词' || cat == '其他') {
         runs.add(_docxRun(word, '000000'));
       } else {
-        runs.add(_docxRun(word, colorOf(cat)));
+        runs.add(_docxRun(word, colorOf(cat), highlight: cat == '超标词' ? 'yellow' : null));
       }
       lastEnd = m.end;
     }
@@ -2147,21 +3057,81 @@ ${bodyParts.join('\n')}
   }
 
   /// 鐢熸垚鍗曚釜 DOCX run锛堝甫棰滆壊锛夈€?
-  String _docxRun(String text, String color) {
+  String _docxRun(String text, String color, {String? highlight}) {
     final escaped = text
         .replaceAll('&', '&amp;')
         .replaceAll('<', '&lt;')
         .replaceAll('>', '&gt;');
-    return '<w:r><w:rPr><w:color w:val="$color"/></w:rPr><w:t xml:space="preserve">$escaped</w:t></w:r>';
+    final hl = highlight != null ? '<w:highlight w:val="$highlight"/>' : '';
+    return '<w:r><w:rPr><w:color w:val="$color"/>$hl</w:rPr>'
+           '<w:t xml:space="preserve">$escaped</w:t></w:r>';
   }
 
   Color _chipColor(String cat) {
     switch (cat) {
       case '课标词': return AppTheme.primaryBlue;
       case '拓展词': return AppTheme.green;
-      case '超纲词': return AppTheme.red;
+      case '超标词': return AppTheme.red;
       case '专有词': return AppTheme.grey;
       default: return AppTheme.orange;
+    }
+  }
+
+  /// 修改真题文档文本中查到的单词：将 _text 中所有该词替换为新拼写并重新检测
+  /// （对齐Windows 版“编辑语料文本后保存重检”语义，不修改词库分类集合）」
+  Future<void> _showEditDetectedWordDialog(String oldWord) async {
+    final controller = TextEditingController(text: oldWord);
+    final newWord = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('修改该词'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: '新拼写（将替换真题文本中所有该词）',
+            border: OutlineInputBorder(),
+            isDense: true,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, controller.text.trim()),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (newWord == null || newWord.isEmpty || newWord == oldWord) return;
+    if (!RegExp(r'^[a-zA-Z]+$').hasMatch(newWord)) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('$newWord 不是合法的英文单词')),
+      );
+      return;
+    }
+    final replaced = _text.replaceAllMapped(
+      RegExp('\\b${RegExp.escape(oldWord)}\\b', caseSensitive: false),
+      (_) => newWord,
+    );
+    if (replaced == _text) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('文本中未找到 $oldWord')),
+      );
+      return;
+    }
+    setState(() => _text = replaced);
+    _analyze();
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已将真题文本中 $oldWord 改为 $newWord')),
+      );
     }
   }
 
@@ -2172,6 +3142,14 @@ ${bodyParts.join('\n')}
         keyword: keyword,
         words: _words,
         chipColor: _chipColor,
+        onLookupWord: (word) {
+          Navigator.of(context).pop();
+          widget.onWordTap?.call(word);
+        },
+        onTextChanged: (t) {
+          _text = t;
+          _analyze();
+        },
       ),
     ));
   }
@@ -2183,12 +3161,16 @@ class _SourcePopupViewer extends StatefulWidget {
   final String keyword;
   final List<_AnalyzedWord> words;
   final Color Function(String category) chipColor;
+  final void Function(String word) onLookupWord;
+  final void Function(String text) onTextChanged;
 
   const _SourcePopupViewer({
     required this.text,
     required this.keyword,
     required this.words,
     required this.chipColor,
+    required this.onLookupWord,
+    required this.onTextChanged,
   });
 
   @override
@@ -2206,10 +3188,13 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
   late final String _lowerKey;
   late final int _targetLine;
   GlobalKey? _targetKey;
+  SelectedContent? _selectedContent;
+  late String _text;
 
   @override
   void initState() {
     super.initState();
+    _text = widget.text;
     _lowerKey = widget.keyword.toLowerCase();
     _lines = widget.text.split('\n');
 
@@ -2218,21 +3203,20 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
       _catByLower.putIfAbsent(w.word.toLowerCase(), () => w.category);
     }
 
-    int target = -1;
-    for (int i = 0; i < _lines.length; i++) {
-      for (final m in _wordRegex.allMatches(_lines[i].toLowerCase())) {
-        if (m.group(0) == _lowerKey) {
-          target = i;
-          break;
-        }
-      }
-      if (target != -1) break;
-    }
-    _targetLine = target;
+    _targetLine = _locateTargetLine();
 
     if (_targetLine != -1) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _positionToTarget());
     }
+  }
+
+  int _locateTargetLine() {
+    for (int i = 0; i < _lines.length; i++) {
+      for (final m in _wordRegex.allMatches(_lines[i].toLowerCase())) {
+        if (m.group(0) == _lowerKey) return i;
+      }
+    }
+    return -1;
   }
 
   @override
@@ -2291,15 +3275,133 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
     }
 
     if (spans.isEmpty) {
-      return SelectableText(line, style: const TextStyle(fontSize: _fontSize, color: Colors.black87));
+      return Text(line, style: const TextStyle(fontSize: _fontSize, color: Colors.black87));
     }
 
-    return SelectableText.rich(
+    return Text.rich(
       TextSpan(
         style: const TextStyle(fontSize: _fontSize, color: Colors.black87),
         children: spans,
       ),
     );
+  }
+
+  /// 自定义长按菜单：复制 / 修改 / 查词
+  Widget _buildWordContextMenu(BuildContext context, SelectableRegionState state) {
+    final word = _selectedContent?.plainText.trim() ?? '';
+    final isWord = RegExp(r"^[a-zA-Z]+(?:['’\-][a-zA-Z]+)*$").hasMatch(word);
+    if (!isWord) {
+      return AdaptiveTextSelectionToolbar.buttonItems(
+        anchors: state.contextMenuAnchors,
+        buttonItems: [
+          ContextMenuButtonItem(
+            label: '复制',
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: word));
+              state.hideToolbar();
+            },
+          ),
+        ],
+      );
+    }
+    return AdaptiveTextSelectionToolbar.buttonItems(
+      anchors: state.contextMenuAnchors,
+      buttonItems: [
+        ContextMenuButtonItem(
+          label: '复制',
+          onPressed: () {
+            Clipboard.setData(ClipboardData(text: word));
+            state.hideToolbar();
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('已复制 $word')),
+            );
+          },
+        ),
+        ContextMenuButtonItem(
+          label: '修改',
+          onPressed: () {
+            state.hideToolbar();
+            _editWord(word);
+          },
+        ),
+        ContextMenuButtonItem(
+          label: '查词',
+          onPressed: () {
+            state.hideToolbar();
+            Navigator.of(context).pop();
+            widget.onLookupWord(word);
+          },
+        ),
+      ],
+    );
+  }
+
+  Future<void> _editWord(String oldWord) async {
+    final controller = TextEditingController(text: oldWord);
+    final newWord = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('编辑此词'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: '新拼写（将替换原文中所有该词）',
+            border: OutlineInputBorder(),
+            isDense: true,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, controller.text.trim()),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (newWord == null || newWord.isEmpty || newWord == oldWord) return;
+    if (!RegExp(r'^[a-zA-Z]+$').hasMatch(newWord)) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('$newWord 不是合法的英文单词')),
+        );
+      }
+      return;
+    }
+    final replaced = _text.replaceAllMapped(
+      RegExp('\\b${RegExp.escape(oldWord)}\\b', caseSensitive: false),
+      (_) => newWord,
+    );
+    if (replaced == _text) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('文本中未找到 $oldWord')),
+        );
+      }
+      return;
+    }
+    setState(() {
+      _text = replaced;
+      _lines
+        ..clear()
+        ..addAll(_text.split('\n'));
+      _catByLower.clear();
+      for (final w in widget.words) {
+        _catByLower.putIfAbsent(w.word.toLowerCase(), () => w.category);
+      }
+      _targetLine = _locateTargetLine();
+    });
+    widget.onTextChanged(_text);
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已将原文中 $oldWord 改为 $newWord')),
+      );
+    }
   }
 
   @override
@@ -2315,6 +3417,9 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
       body: SingleChildScrollView(
         controller: _scrollCtrl,
         padding: const EdgeInsets.all(16),
+        child: SelectionArea(
+          onSelectionChanged: (content) => _selectedContent = content,
+          contextMenuBuilder: _buildWordContextMenu,
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: List.generate(_lines.length, (i) => Padding(
@@ -2324,7 +3429,8 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
           )),
         ),
       ),
-    );
+    ),
+  );
   }
 }
 
@@ -2343,6 +3449,13 @@ class _ScoredWord {
   final int lcp;
   _ScoredWord(this.word, this.score, [this.pos = 0, this.lcp = 0]);
 }
+
+class _DialogResult {
+  final String action; // '拓展词' | '超标词' | '专有词'
+  final String? baseWord;
+  _DialogResult({required this.action, this.baseWord});
+}
+
   /// 计算两字符串的最长公共前缀长度
   int _lcpLength(String a, String b) {
     final len = a.length < b.length ? a.length : b.length;
@@ -2392,7 +3505,6 @@ const _knownSuffixes = {
             seen.add(sw);
             continue;
           }
-          // 课标词比目标词长太多 → 不可能派生自它
           if (swLower.length > lower.length && lcp < lower.length * 0.7) {
             continue;
           }
@@ -2428,7 +3540,7 @@ const _knownSuffixes = {
           } else {
             final maxLen = lower.length > swLower.length ? lower.length : swLower.length;
 
-            // 完整子串匹配（整个标准词出现在目标词中）→ 复合词拆分，放宽覆盖率
+            // 完整子串匹配（整个标准词出现在目标词中）→ 复合词拆分，放宽覆盖
             if (lcp == swLower.length) {
               int score = 3000 + lcp * 200;
               if (_knownPrefixes.contains(skipped)) {
@@ -2462,12 +3574,11 @@ const _knownSuffixes = {
       final sw = scored[i];
       final candStem = porterStem(sw.word);
       if (inputStem == candStem) {
-        // 词干完全一致（如 running→run 匹配标准词 run）
         scored[i] = _ScoredWord(sw.word, sw.score + 7000, sw.pos, sw.lcp);
       } else if (inputStem.length >= 4 && candStem.length >= 4) {
         final stemLcp = _lcpLength(inputStem, candStem);
         if (stemLcp >= 4) {
-          // 词干部分重合（如 happiness→happi 与 happen→happen 有公共前缀）
+          // 词干部分重合（如 happiness → happy 与 happen → happen 有公共前缀）
           scored[i] = _ScoredWord(sw.word, sw.score + stemLcp * 200, sw.pos, sw.lcp);
         }
       }
@@ -2549,8 +3660,8 @@ Future<Directory> _downloadDir() async {
     final ext = await getExternalStorageDirectory();
     if (ext != null) {
       // ext.path 褰㈠ /storage/emulated/0/Android/data/com.exam.esw/files
-      // 闇€寰€涓婁袱绾у埌 /storage/emulated/0锛屽啀杩涘叆绯荤粺 Download 鐩綍
-      final download = Directory('${ext.path}/../../Download');
+      // 闇€寰€涓婁袱绾у基/storage/emulated/0锛屽啀杩涘叆绯荤粺 Download 鐩綍
+final download = Directory('${ext.path}/../../Download');
       if (!await download.exists()) {
         await download.create(recursive: true);
       }
@@ -2640,29 +3751,34 @@ class _HelpPage extends StatelessWidget {
   Widget build(BuildContext context) {
     final items = [
       _HelpItem(
+        icon: Icons.description,
+        title: '文档导入',
+        content: '点击「文档导入」按钮，选择 TXT/DOCX/PDF 等格式文件，系统自动提取英文文本、分词并分析各词类覆盖占比。',
+      ),
+      _HelpItem(
         icon: Icons.search,
-        title: '词频查询',
-        content: '输入英文单词，自动显示释义、课标分类、历年真题词频和例句。输入后 1 秒自动搜索，长按例句关键词可复制、全选或跳转到真题原文。',
+        title: '单词搜索',
+        content: '在搜索框输入单词后回车，即可查看课标释义、词性、真题频次及历年分布，同时展示真题例句。支持历史搜索记录快速回查。',
       ),
       _HelpItem(
-        icon: Icons.assignment,
-        title: '真题检测',
-        content: '导入 txt 或 docx 格式的英语真题文档，自动提取其中的单词并按词频排序。点击单词可查看真题原文标注，关键词自动高亮定位。',
+        icon: Icons.category,
+        title: '词库分类',
+        content: '单词按课标要求分为「课标词」「拓展词」「超标词」「专有词」四类，可手动调整分类，自动记忆跨平台导入的分类选择。',
       ),
       _HelpItem(
-        icon: Icons.library_books,
-        title: '词库积累',
-        content: '按学段分类展示课标词库（初中课标词、高中课标词、必修课标词、选修课标词等），支持搜索筛选。电脑版与手机版词库可导出导入互通。',
+        icon: Icons.save_alt,
+        title: '导出结果',
+        content: '点击「导出结果」按钮，将当前分析结果导出为 Word 文档（.docx），不同词类以不同颜色高亮标注并附带分类统计汇总表。',
       ),
       _HelpItem(
-        icon: Icons.backup,
-        title: '数据备份',
-        content: '在设置页面可将词库数据导出为备份文件，也可从备份文件导入恢复。方便在更换设备或重装 App 后快速恢复数据。',
+        icon: Icons.sync,
+        title: '同步词库',
+        content: '点击「同步词库」可将本地积累的分类词库上传至坚果云云端，也可从云端拉取他人共享的词库，实现多人协作共享。',
       ),
       _HelpItem(
-        icon: Icons.wifi,
-        title: '联网释义',
-        content: '部分功能需要联网。查词时优先使用内置词库，未收录的单词会自动联网获取释义，无网络时使用离线翻译。',
+        icon: Icons.system_update,
+        title: '检查更新',
+        content: '点击「检查更新」，自动检测最新版本，支持跳转 GitHub Releases 或蓝奏云（密码 52pj）下载更新。',
       ),
     ];
 
@@ -2683,6 +3799,7 @@ class _HelpPage extends StatelessWidget {
             margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
             elevation: 1,
+            color: const Color(0xFFFFF8E1),
             child: Padding(
               padding: const EdgeInsets.all(16),
               child: Row(
@@ -2694,8 +3811,11 @@ class _HelpPage extends StatelessWidget {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(item.title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                        const SizedBox(height: 6),
+                        Text(
+                          item.title,
+                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                        ),
+                        const SizedBox(height: 4),
                         Text(
                           item.content,
                           style: TextStyle(fontSize: 14, color: Colors.grey.shade700, height: 1.5),
@@ -2718,8 +3838,12 @@ class _VocabTabPage extends StatefulWidget {
   final VoidCallback onSaveConfig;
   final Future<void> Function(String word, VoidCallback onAdded) showBaseWordDialog;
   final ValueChanged<String>? onWordTap;
+  final VoidCallback onSyncVocab;
+  final VoidCallback onCheckUpdate;
+  final bool syncing;
+  final WordSyncService wordSyncService;
 
-  const _VocabTabPage({required this.vocab, required this.onSaveConfig, required this.showBaseWordDialog, this.onWordTap});
+  const _VocabTabPage({required this.vocab, required this.onSaveConfig, required this.showBaseWordDialog, this.onWordTap, required this.onSyncVocab, required this.onCheckUpdate, required this.syncing, required this.wordSyncService});
 
   @override
   State<_VocabTabPage> createState() => _VocabTabPageState();
@@ -2727,9 +3851,17 @@ class _VocabTabPage extends StatefulWidget {
 
 class _VocabTabPageState extends State<_VocabTabPage> {
   final TextEditingController _searchCtrl = TextEditingController();
+  final FocusNode _searchFocus = FocusNode();
+
+  @override
+  void initState() {
+    super.initState();
+    _searchFocus.addListener(() => setState(() {}));
+  }
 
   @override
   void dispose() {
+    _searchFocus.dispose();
     _searchCtrl.dispose();
     super.dispose();
   }
@@ -2744,7 +3876,7 @@ class _VocabTabPageState extends State<_VocabTabPage> {
       map[w] = '拓展词';
     }
     for (final w in widget.vocab.manualChaoGangWords) {
-      map[w] = '超纲词';
+      map[w] = '超标词';
     }
     for (final w in widget.vocab.manualExtraWords) {
       map[w] = '专有词';
@@ -2756,7 +3888,7 @@ class _VocabTabPageState extends State<_VocabTabPage> {
     switch (cat) {
       case '课标词': return AppTheme.primaryBlue;
       case '拓展词': return AppTheme.green;
-      case '超纲词': return AppTheme.red;
+      case '超标词': return AppTheme.red;
       case '专有词': return AppTheme.grey;
       default: return AppTheme.orange;
     }
@@ -2770,6 +3902,7 @@ class _VocabTabPageState extends State<_VocabTabPage> {
         vocab: widget.vocab,
         onSaveConfig: widget.onSaveConfig,
         showBaseWordDialog: widget.showBaseWordDialog,
+        wordSyncService: widget.wordSyncService,
         onWordTap: widget.onWordTap,
       ),
     ));
@@ -2859,9 +3992,10 @@ class _VocabTabPageState extends State<_VocabTabPage> {
                   // 鎼滅储妗?
                   TextField(
                     controller: _searchCtrl,
+                    focusNode: _searchFocus,
                     textAlign: TextAlign.center,
                     decoration: InputDecoration(
-                      hintText: '搜索已积累的词库单词...',
+                      hintText: _searchFocus.hasFocus ? null : '搜索已积累的词库单词...',
                       prefixIcon: const Icon(Icons.search, size: 20),
                       suffixIcon: IconButton(
                         icon: const Icon(Icons.clear, size: 18),
@@ -2879,7 +4013,7 @@ class _VocabTabPageState extends State<_VocabTabPage> {
                     onChanged: (_) => setState(() {}),
                   ),
                   const SizedBox(height: 12),
-                  // 瀵煎叆瀵煎嚭鎸夐挳
+                  // 导入导出按钮
                   Row(
                     children: [
                       Expanded(
@@ -2920,8 +4054,8 @@ class _VocabTabPageState extends State<_VocabTabPage> {
                     Row(
                       children: [
                         Expanded(child: _StatCard(
-                          label: '超纲词', count: totalChaoGang, color: AppTheme.red,
-                          onTap: () => _openWordList('超纲词'),
+                          label: '超标词', count: totalChaoGang, color: AppTheme.red,
+                          onTap: () => _openWordList('超标词'),
                         )),
                         const SizedBox(width: 8),
                         Expanded(child: _StatCard(
@@ -2973,14 +4107,52 @@ class _VocabTabPageState extends State<_VocabTabPage> {
               padding: const EdgeInsets.only(bottom: 16, top: 8),
               child: Column(
                 children: [
-                  TextButton(
-                    onPressed: () => Navigator.of(context).push(
-                      MaterialPageRoute(builder: (_) => const _HelpPage()),
-                    ),
-                    child: const Text('使用说明'),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      TextButton(
+                        onPressed: () => Navigator.of(context).push(
+                          MaterialPageRoute(builder: (_) => const _HelpPage()),
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.description, size: 18),
+                            SizedBox(width: 4),
+                            Text('使用说明'),
+                          ],
+                        ),
+                      ),
+                      const Text('  '),
+                      TextButton(
+                        onPressed: widget.syncing ? null : widget.onSyncVocab,
+                        child: widget.syncing
+                            ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                            : const Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(Icons.sync, size: 18),
+                                  SizedBox(width: 4),
+                                  Text('同步词库'),
+                                ],
+                              ),
+                      ),
+                      const Text('  '),
+                      TextButton(
+                        onPressed: widget.onCheckUpdate,
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.system_update, size: 18),
+                            SizedBox(width: 4),
+                            Text('检查更新'),
+                          ],
+                        ),
+                      ),
+                    ],
                   ),
-                  Text('V 1.3.6', style: TextStyle(color: Colors.grey, fontSize: phoneScale.fontSize(context, 12))),
-                  SizedBox(height: phoneScale.spacing(context, 4)),
+                  Text('V 1.4.9', style: TextStyle(color: Colors.grey, fontSize: 12)),
+                  SizedBox(height: 4),
                   GestureDetector(
                     onTap: () async {
                       final uri = Uri.parse('https://github.com/beenhow/ESW');
@@ -3010,12 +4182,14 @@ class _WordListPage extends StatefulWidget {
   final VoidCallback onSaveConfig;
   final Future<void> Function(String word, VoidCallback onAdded) showBaseWordDialog;
   final ValueChanged<String>? onWordTap;
+  final WordSyncService wordSyncService;
 
   const _WordListPage({
     required this.category,
     required this.vocab,
     required this.onSaveConfig,
     required this.showBaseWordDialog,
+    required this.wordSyncService,
     this.onWordTap,
   });
 
@@ -3025,6 +4199,7 @@ class _WordListPage extends StatefulWidget {
 
 class _WordListPageState extends State<_WordListPage> {
   late List<String> _words;
+  final Set<String> _selected = {};
 
   @override
   void initState() {
@@ -3040,7 +4215,7 @@ class _WordListPageState extends State<_WordListPage> {
       case '拓展词':
         _words = List.from(widget.vocab.extendWords);
         break;
-      case '超纲词':
+      case '超标词':
         _words = List.from(widget.vocab.manualChaoGangWords);
         break;
       case '专有词':
@@ -3049,83 +4224,211 @@ class _WordListPageState extends State<_WordListPage> {
       default:
         _words = [];
     }
-    // 鍊掑簭锛氭渶鏂版坊鍔犵殑鍦ㄦ渶鍓嶉潰
-    _words = _words.reversed.toList();
+    // 非课标词保持倒序（最新添加的在最前面）；课标词按词库原始顺序正序显示
+    if (widget.category != '课标词') {
+      _words = _words.reversed.toList();
+    }
   }
 
   Color _colorFor(String cat) {
     switch (cat) {
       case '课标词': return AppTheme.primaryBlue;
       case '拓展词': return AppTheme.green;
-      case '超纲词': return AppTheme.red;
+      case '超标词': return AppTheme.red;
       case '专有词': return AppTheme.grey;
       default: return AppTheme.orange;
     }
   }
 
-  Future<void> _convertTo(String word, String target) async {
-    final vocab = widget.vocab;
-    // 鍏堜粠鍘熺被鍒Щ闄?
-    switch (widget.category) {
-      case '拓展词':
-        vocab.extendWords.removeWhere((e) => e.toLowerCase() == word.toLowerCase());
-        vocab.extendBaseMap.remove(word);
-        vocab.extendReverseIndex.remove(word.toLowerCase());
-        break;
-      case '超纲词':
-        vocab.manualChaoGangWords.removeWhere((e) => e.toLowerCase() == word.toLowerCase());
-        break;
-      case '专有词':
-        vocab.manualExtraWords.removeWhere((e) => e.toLowerCase() == word.toLowerCase());
-        break;
-    }
-    // 鍔犲叆鐩爣绫诲埆
-    if (target == '拓展词') {
-      await widget.showBaseWordDialog(word, () {});
-    } else if (target == '超纲词') {
-      vocab.addChaoGangWord(word);
-    } else if (target == '专有词') {
-      vocab.addExtraWord(word);
+  /// 批量转为目标分类（接入 markChanged 同步本地变更）
+  void _applyBatchReclassify(String target) {
+    final words = _selected.toList();
+    if (words.isEmpty) return;
+    for (final w in words) {
+      widget.vocab.reclassifyWord(w, target);
+      widget.wordSyncService.markChanged(w);
     }
     widget.onSaveConfig();
-    setState(_load);
+    setState(() {
+      _selected.clear();
+      _load();
+    });
   }
 
-  Future<void> _editBase(String word) async {
-    await widget.showBaseWordDialog(word, () {});
+  /// 从三个手动词库列表中彻底移除该词（删除前清理）
+  void _removeFromLists(String word) {
+    final lower = word.toLowerCase();
+    widget.vocab.extendWords.removeWhere((e) => e.toLowerCase() == lower);
+    widget.vocab.extendBaseMap.remove(word);
+    widget.vocab.extendReverseIndex.remove(lower);
+    widget.vocab.manualChaoGangWords.removeWhere((e) => e.toLowerCase() == lower);
+    widget.vocab.manualExtraWords.removeWhere((e) => e.toLowerCase() == lower);
+  }
+
+  /// 批量删除所选单词（接入 markDeleted 删除墓碑，同步传播到云端）
+  /// 大范围删除保护：删除超过 10 个 → 确认；超过 50 个 → 先自动备份云端再确认；取消无副作用
+  Future<bool> _applyBatchDelete() async {
+    final words = _selected.toList();
+    if (words.isEmpty) return false;
+    if (words.length > 10) {
+      final total = widget.vocab.extendWords.length +
+          widget.vocab.manualChaoGangWords.length +
+          widget.vocab.manualExtraWords.length;
+      final backedUp = words.length > 50
+          ? await widget.wordSyncService.backupRemoteState()
+          : false;
+      if (!mounted) return false;
+      final confirmed = await _confirmLargeDelete(
+        context,
+        words.length,
+        total,
+        backedUp,
+      );
+      if (!confirmed) return false; // 取消：无副作用，不写墓碑
+    }
+    if (!mounted) return false;
+    for (final w in words) {
+      _removeFromLists(w);
+      widget.wordSyncService.markDeleted(w);
+    }
     widget.onSaveConfig();
-    setState(_load);
+    setState(() {
+      _selected.clear();
+      _load();
+    });
+    return true;
+  }
+
+  /// 删除确认弹窗：删除单词超过 10 个时提示用户确认，
+  /// 超过 50 个时云端已自动备份全部词库。
+  /// 返回 true=确认执行，false=取消（无副作用）。
+  Future<bool> _confirmLargeDelete(
+    BuildContext context,
+    int delCount,
+    int total,
+    bool backedUp,
+  ) async {
+    final backupMsg = delCount > 50
+        ? (backedUp
+            ? '已自动在云端备份全部词库。'
+            : '警告：云端备份失败，请确认网络正常后再操作！')
+        : '';
+    final res = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除确认'),
+        content: Text(
+          '本次操作将删除 $delCount 个单词（词库当前共 $total 个）。\n\n$backupMsg\n\n确认要继续执行该删除操作吗？',
+          textAlign: TextAlign.left,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('确认删除'),
+          ),
+        ],
+      ),
+    );
+    return res ?? false;
+  }
+
+  void _toggleWord(String w, bool? v) {
+    setState(() {
+      if (v == true) {
+        _selected.add(w);
+      } else {
+        _selected.remove(w);
+      }
+    });
+  }
+
+  void _toggleAll(bool? v) {
+    setState(() {
+      if (v == true) {
+        _selected.addAll(_words);
+      } else {
+        _selected.clear();
+      }
+    });
+  }
+
+  /// 按当前词库动态生成可转换的目标词库（不含自身词库）
+  List<String> get _batchTargets {
+    return switch (widget.category) {
+      '拓展词' => const ['超标词', '专有词'],
+      '超标词' => const ['拓展词', '专有词'],
+      '专有词' => const ['拓展词', '超标词'],
+      _ => const <String>[],
+    };
+  }
+
+  void _doCancelSelect() {
+    setState(() {
+      _selected.clear();
+    });
   }
 
   @override
   Widget build(BuildContext context) {
     final color = _colorFor(widget.category);
+    final bool editable = widget.category != '课标词';
     return Scaffold(
       backgroundColor: const Color(0xFFFFF8E1),
       appBar: AppBar(
-        title: Text('${widget.category}（${_words.length}个）', style: const TextStyle(fontSize: 16)),
+        title: Text(
+          _selected.isEmpty
+              ? '${widget.category}（共${_words.length}个）'
+              : '${widget.category}（已选${_selected.length}个）',
+          style: const TextStyle(fontSize: 16),
+        ),
+        centerTitle: true,
         backgroundColor: const Color(0xFFFFF8E1),
         leading: IconButton(
           icon: const Icon(Icons.arrow_back),
           onPressed: () => Navigator.of(context).pop(),
         ),
+        actions: editable
+            ? [
+                const SizedBox(width: 4),
+                const Text('全选', style: TextStyle(fontSize: 13)),
+                Checkbox(
+                  value: _words.isNotEmpty && _selected.length == _words.length,
+                  activeColor: color,
+                  onChanged: _toggleAll,
+                ),
+              ]
+            : null,
       ),
-      body: _words.isEmpty
-          ? Center(child: Text('鏆傛棤${widget.category}', style: TextStyle(color: Colors.grey.shade500)))
-          : ListView.separated(
+      body: Column(
+        children: [
+          Expanded(
+            child: _words.isEmpty
+                ? Center(child: Text('暂无${widget.category}', style: TextStyle(color: Colors.grey.shade500)))
+                : ListView.separated(
               padding: const EdgeInsets.all(12),
               itemCount: _words.length,
               separatorBuilder: (_, __) => const Divider(height: 1),
               itemBuilder: (_, i) {
                 final w = _words[i];
                 return ListTile(
-                  leading: CircleAvatar(
-                    radius: 16,
-                    backgroundColor: color.withValues(alpha: 0.15),
-                    child: Text('${i + 1}', style: TextStyle(fontSize: 12, color: color, fontWeight: FontWeight.bold)),
-                  ),
+                  leading: editable
+                      ? Checkbox(
+                          value: _selected.contains(w),
+                          activeColor: color,
+                          onChanged: (v) => _toggleWord(w, v),
+                        )
+                      : CircleAvatar(
+                          radius: 16,
+                          backgroundColor: color.withValues(alpha: 0.15),
+                          child: Text('${i + 1}', style: TextStyle(fontSize: 12, color: color, fontWeight: FontWeight.bold)),
+                        ),
                   title: Text(w, style: const TextStyle(fontWeight: FontWeight.w500)),
-                  trailing: _buildActions(w),
+                  trailing: editable ? null : const Text('仅查看', style: TextStyle(fontSize: 12, color: AppTheme.textSecondary)),
                   dense: true,
                   onTap: widget.onWordTap == null
                       ? null
@@ -3136,60 +4439,54 @@ class _WordListPageState extends State<_WordListPage> {
                 );
               },
             ),
-    );
-  }
-
-  Widget _buildActions(String word) {
-    final buttons = <Widget>[];
-    switch (widget.category) {
-      case '拓展词':
-        buttons.add(_opBtn(Icons.edit, AppTheme.green, '修改关联', () => _editBase(word)));
-        buttons.add(_opBtn(Icons.flag, AppTheme.red, '转超纲', () => _confirmConvert(word, '超纲词')));
-        buttons.add(_opBtn(Icons.star, AppTheme.grey, '转专有', () => _confirmConvert(word, '专有词')));
-        break;
-      case '超纲词':
-        buttons.add(_opBtn(Icons.add, AppTheme.green, '转拓展', () => _confirmConvert(word, '拓展词')));
-        buttons.add(_opBtn(Icons.star, AppTheme.grey, '转专有', () => _confirmConvert(word, '专有词')));
-        break;
-      case '专有词':
-        buttons.add(_opBtn(Icons.add, AppTheme.green, '转拓展', () => _confirmConvert(word, '拓展词')));
-        buttons.add(_opBtn(Icons.flag, AppTheme.red, '转超纲', () => _confirmConvert(word, '超纲词')));
-        break;
-      case '课标词':
-      default:
-        // 课标词嶄粎鏌ョ湅
-        break;
-    }
-    if (buttons.isEmpty) {
-      return const Text('仅查看', style: TextStyle(fontSize: 12, color: AppTheme.textSecondary));
-    }
-    return Row(mainAxisSize: MainAxisSize.min, children: buttons);
-  }
-
-  Widget _opBtn(IconData icon, Color color, String tooltip, VoidCallback onTap) {
-    return IconButton(
-      icon: Icon(icon, size: 18, color: color),
-      tooltip: tooltip,
-      onPressed: onTap,
-      visualDensity: VisualDensity.compact,
-    );
-  }
-
-  Future<void> _confirmConvert(String word, String target) async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('确认转换'),
-        content: Text('将"$word" 从 ${widget.category} 转为 $target？'),
-        actions: [
-          TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('取消')),
-          TextButton(onPressed: () => Navigator.of(ctx).pop(true), child: const Text('确认')),
+          ),
+          if (_selected.isNotEmpty)
+            SafeArea(
+              child: Container(
+                color: const Color(0xFFFFF8E1),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                child: Row(
+                  children: [
+                    for (final t in _batchTargets) ...[
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () => _applyBatchReclassify(t),
+                          child: FittedBox(
+                            fit: BoxFit.scaleDown,
+                            child: Text('转为$t', style: const TextStyle(fontSize: 13)),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                    ],
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: () {
+                          _applyBatchDelete();
+                        },
+                        child: const FittedBox(
+                          fit: BoxFit.scaleDown,
+                          child: Text('删除所选单词', style: TextStyle(fontSize: 13)),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: TextButton(
+                        onPressed: _doCancelSelect,
+                        child: const FittedBox(
+                          fit: BoxFit.scaleDown,
+                          child: Text('取消选择', style: TextStyle(fontSize: 13)),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
         ],
       ),
     );
-    if (ok == true) {
-      await _convertTo(word, target);
-    }
   }
 }
 
@@ -3197,8 +4494,7 @@ class _WordListPageState extends State<_WordListPage> {
 /// 鍙亶鍘嗘枃浠朵竴娆★紝浣跨敤鑱斿悎姝ｅ垯涓€娆℃€у尮閰嶆墍鏈夊崟璇嶏紝閬垮厤閫愪釜鍗曡瘝閲嶅鎵弿銆?
 /// 浣跨敤 readAsString锛堝紓姝ワ級+ 姣?10 涓枃浠惰鍑轰簨浠跺惊鐜紝閬垮厤闃诲 UI 绾跨▼銆?
 /// 鍔犺浇 corpus 鍏ㄩ噺璇嶉绱㈠紩銆?
-/// 棣栨璋冪敤鏃舵壂鎻?corpus 鐩綍涓嬫墍鏈'.txt锛屾寜鍗曡瘝锛堥暱搴?=3锛夌粺璁″嚭鐜版鏁板苟鍐欏叆
-/// corpus_index.json锛涘悗缁皟鐢ㄧ洿鎺ヨ鍐呭瓨 Map锛屾绉掔骇鍝嶅簲锛屽交搴曡В鍐抽€愭枃浠舵壂鎻忚浆鍦堥棶棰樸€?
+/// 棣栨璋冪敤鏃舵壂鎻?corpus 鐩綍涓嬫墍鏂.txt锛屾寜鍗曡瘝锛堥暱搴?=3锛夌粺璁″嚭鐜版鏁板苟鍐欏取/// corpus_index.json锛涘悗缁皟鐢ㄧ洿鎺ヨ鍐呭瓧Map锛屾绉掔骇鍝嶅簲锛屽交搴曡В鍐抽€愭枃浠舵壂鎻忚浆鍦堥棶棰樸€
 Future<Map<String, int>> _loadCorpusIndex(String corpusPath) async {
   final indexFile = File('$corpusPath/corpus_index.json');
   if (indexFile.existsSync()) {
@@ -3248,7 +4544,6 @@ Future<Map<String, int>> _loadCorpusIndex(String corpusPath) async {
   return index;
 }
 
-/// 红色虚线绘制器（用于卡片内分隔线）
 class _DottedLinePainter extends CustomPainter {
   final Color color;
   _DottedLinePainter({this.color = const Color(0xFFB20000)});
