@@ -46,7 +46,7 @@ android {
         val variant = this
         variant.outputs.all {
             val output = this as com.android.build.gradle.internal.api.BaseVariantOutputImpl
-            output.outputFileName = "ESW1.4.8.apk"
+            output.outputFileName = "ESW1.5.2.apk"
         }
     }
 }

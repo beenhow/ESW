@@ -17,7 +17,7 @@ import 'shared/vocab_service.dart';
 import 'shared/word_sync_service.dart';
 import 'shared/doc_extractor.dart';
 import 'shared/export_extra_table.dart';
-import 'porter_stemmer.dart';
+import 'shared/base_word_candidates.dart';
 import 'dictionary_service.dart';
 
 /// 涓婃瀵煎嚭璺緞锛堟ā鍧楃骇璁板繂锛岄伩鍏嶆瘡娆￠噸鏂伴€夋嫨锛?
@@ -493,7 +493,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
       }
       final json = jsonDecode(resp.body) as Map<String, dynamic>;
       final tagName = (json['tag_name'] as String?)?.replaceFirst('v', '') ?? '0.0.0';
-      if (_compareVersions(tagName, '1.4.9') <= 0) {
+      if (_compareVersions(tagName, '1.5.2') <= 0) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('已是最新版本')),
@@ -509,7 +509,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Text('当前版本: 1.4.9'),
+              Text('当前版本: 1.5.2'),
               Text('最新版本: $tagName'),
               const SizedBox(height: 12),
               const Text('请选择下载入口：'),
@@ -869,6 +869,31 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
         );
       }
       return;
+    }
+
+    // 导入文档前：若未同步筛选词库（extendBaseMap 为空），提醒先同步词库，确保拓展词能映射到课标词
+    if (mounted && _vocab.extendBaseMap.isEmpty) {
+      final goSync = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('词库未同步'),
+          content: const Text('当前未检测到已同步的筛选词库，导入文档后拓展词将无法映射到课标词，导出结果可能不完整。建议先「同步词库」再导入检测。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('仍然导入'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('去同步'),
+            ),
+          ],
+        ),
+      );
+      if (goSync == true) {
+        await _syncVocab();
+        return;
+      }
     }
 
     if (mounted) {
@@ -1828,18 +1853,20 @@ class _ExamPaperViewerState extends State<_ExamPaperViewer> {
   /// 避免逐词拆分导致大量 span 造成卡顿；点击命中由 GestureDetector 统一处理」
   List<TextSpan> _buildSpans() {
     if (_content.isEmpty) return const [];
-    final wordRe = RegExp(r"[a-zA-Z]+(?:['“][a-zA-Z]+)*");
+    final keyword = widget.keyword;
+    if (keyword.isEmpty) return [TextSpan(text: _content)];
+    // 直接定位目标关键词（预编译局部正则），避免逐词扫描全文导致长文档卡顿
+    final pattern = RegExp(r'\b' + RegExp.escape(keyword) + r'\b', caseSensitive: false);
+    final matches = pattern.allMatches(_content).toList();
+    if (matches.isEmpty) return [TextSpan(text: _content)];
     final spans = <TextSpan>[];
-    final keyword = widget.keyword.toLowerCase();
     var cursor = 0;
-    for (final m in wordRe.allMatches(_content)) {
-      final word = m.group(0)!;
-      if (word.toLowerCase() != keyword) continue;
+    for (final m in matches) {
       if (m.start > cursor) {
         spans.add(TextSpan(text: _content.substring(cursor, m.start)));
-    }
+      }
       spans.add(TextSpan(
-        text: word,
+        text: m.group(0)!,
         style: const TextStyle(
           backgroundColor: Color(0x66FFEB3B),
           fontWeight: FontWeight.bold,
@@ -1848,7 +1875,6 @@ class _ExamPaperViewerState extends State<_ExamPaperViewer> {
       ));
       cursor = m.end;
     }
-    if (spans.isEmpty) return [TextSpan(text: _content)];
     if (cursor < _content.length) {
       spans.add(TextSpan(text: _content.substring(cursor)));
     }
@@ -2199,7 +2225,6 @@ class _AnalysisPageState extends State<_AnalysisPage> {
       annotatedPhrases.add(widget.text.substring(phraseStart, m.end).trim());
     }
     _annotatedCount = annotatedPhrases.length;
-
     // 寮傛鑾峰彇真题词频锛堜笉闃诲鍒嗘瀽涓绘祦绋嬶級
     _loadRealFreq();
     _rebuildFiltered();
@@ -2412,7 +2437,6 @@ class _AnalysisPageState extends State<_AnalysisPage> {
                                   if (mounted) setState(() {});
                                 },
                                 itemBuilder: (_) => [
-                                  const PopupMenuItem(value: '拓展词', child: Text('设为拓展词')),
                                   if (aw.category == '其他') ...[
                                   const PopupMenuItem(value: '拓展词', child: Text('设为拓展词')),
                                   const PopupMenuItem(value: '超标词', child: Text('设为超标词')),
@@ -2941,19 +2965,17 @@ class _AnalysisPageState extends State<_AnalysisPage> {
       text: _text,
       extendWords: extendWords,
       baseWordOf: (w) {
+        // 优先取用户筛选拓展词时手动关联的课标词（extendBaseMap），保证导出列表课标词列非空
+        final linked = widget.vocab.extendBaseMap[w] ?? widget.vocab.extendBaseMap[w.toLowerCase()];
+        if (linked != null && linked.isNotEmpty) return linked;
         final b = widget.vocab.extendReverseIndex[w.toLowerCase()];
-        if (b == null) return '';
+        if (b == null) {
+          // 词本身是课标词（如 discussing 还原后的 discuss）时直接返回
+          final ms2 = widget.vocab.standardWordsLower[w.toLowerCase()];
+          return (ms2 != null && ms2.isNotEmpty) ? ms2.first : '';
+        }
         final ms = widget.vocab.standardWordsLower[b];
         return (ms != null && ms.isNotEmpty) ? ms.first : b;
-      },
-      meaningOf: (w, base) {
-        final own = widget.vocab.lookup(w)['def'] ?? '';
-        if (own.isNotEmpty) return own;
-        if (base.isNotEmpty) {
-          final bm = widget.vocab.lookup(base)['def'] ?? '';
-          if (bm.isNotEmpty) return bm;
-        }
-        return '';
       },
     );
   }
@@ -3442,28 +3464,11 @@ class _AnalyzedWord {
   _AnalyzedWord({required this.word, required this.frequency, required this.category});
 }
 
-class _ScoredWord {
-  final String word;
-  final int score;
-  final int pos;
-  final int lcp;
-  _ScoredWord(this.word, this.score, [this.pos = 0, this.lcp = 0]);
-}
-
 class _DialogResult {
   final String action; // '拓展词' | '超标词' | '专有词'
   final String? baseWord;
   _DialogResult({required this.action, this.baseWord});
 }
-
-  /// 计算两字符串的最长公共前缀长度
-  int _lcpLength(String a, String b) {
-    final len = a.length < b.length ? a.length : b.length;
-    for (int i = 0; i < len; i++) {
-      if (a[i] != b[i]) return i;
-    }
-    return len;
-  }
 
 const _knownPrefixes = {
     'anti', 'un', 're', 'dis', 'pre', 'mis', 'over', 'under', 'out', 'up',
@@ -3474,130 +3479,9 @@ const _knownPrefixes = {
     'per', 'a', 'ab', 'ad', 'be', 'com', 'con', 'ob', 'se',
   };
 
-const _knownSuffixes = {
-    'ing', 'ed', 's', 'es', 'er', 'est', 'ly', 'tion', 'sion', 'ment',
-    'ness', 'ful', 'less', 'able', 'ible', 'al', 'ive', 'ous', 'ize', 'ise',
-    'en', 'ship', 'hood', 'ist', 'ism', 'ity', 'ify', 'ate', 'age', 'ance',
-    'ence', 'ant', 'ent', 'ic', 'ish', 'ty', 'ure', 'ward', 'wise', 'y',
-    'or', 'ee', 'ian',
-  };
-
-  /// 候选词匹配：对目标词的每个起始位置，计算与课标词的最长公共前缀。
-  /// 词缀感知：known prefix 使词干候选大幅提权；known suffix 使根词候选加分。
+  /// 候选词匹配：双端统一逻辑（见 shared/base_word_candidates.dart）
   List<String> _getBaseWordCandidates(String word, List<String> allStandardWords) {
-    final lower = word.toLowerCase();
-    final scored = <_ScoredWord>[];
-    final seen = <String>{};
-
-    for (int pos = 0; pos < lower.length; pos++) {
-      final suffix = lower.substring(pos);
-      for (final sw in allStandardWords) {
-        final swLower = sw.toLowerCase();
-        if (seen.contains(sw)) continue;
-
-        final lcp = _lcpLength(suffix, swLower);
-        if (lcp < 3) continue;
-
-        if (pos == 0) {
-          // 完全匹配
-          if (swLower == lower) {
-            scored.add(_ScoredWord(sw, 10000, pos, lcp));
-            seen.add(sw);
-            continue;
-          }
-          if (swLower.length > lower.length && lcp < lower.length * 0.7) {
-            continue;
-          }
-
-          if (lcp < 4) {
-            // lcp=3 → 覆盖率门槛 40%
-            if (lcp.toDouble() / lower.length < 0.4) continue;
-          } else {
-            // lcp≥4 → 若仅为部分匹配（非完整覆盖标准词），需覆盖率≥45%
-            if (lcp < swLower.length && lcp.toDouble() / lower.length < 0.45) continue;
-          }
-
-          int score = lcp * 200;
-          // 剩余部分像后缀（pacing → pac + ing → pace）
-          final remainder = lower.substring(lcp);
-          if (_knownSuffixes.contains(remainder)) {
-            score += 300;
-          }
-          // 课标词几乎被 LCP 完全覆盖 → 更像词根
-          if (swLower.length - lcp <= 2) {
-            score += 200;
-          }
-          scored.add(_ScoredWord(sw, score, pos, lcp));
-        } else {
-          final skipped = lower.substring(0, pos);
-
-          if (lcp < 4) {
-            // lcp=3 在非首位 → 前段必须是 known prefix 且覆盖率≥50%
-            if (!_knownPrefixes.contains(skipped)) continue;
-            final maxLen = lower.length > swLower.length ? lower.length : swLower.length;
-            if (lcp.toDouble() / maxLen < 0.5) continue;
-            scored.add(_ScoredWord(sw, 5000 + lcp * 200, pos, lcp));
-          } else {
-            final maxLen = lower.length > swLower.length ? lower.length : swLower.length;
-
-            // 完整子串匹配（整个标准词出现在目标词中）→ 复合词拆分，放宽覆盖
-            if (lcp == swLower.length) {
-              int score = 3000 + lcp * 200;
-              if (_knownPrefixes.contains(skipped)) {
-                score += 5000;
-              }
-              scored.add(_ScoredWord(sw, score, pos, lcp));
-              seen.add(sw);
-              continue;
-            }
-
-            // 跳过的部分过短且不是已知前缀 → 不合理的匹配（如 sprinkler → princess，跳过 "s"）
-            if (pos < 2 && !_knownPrefixes.contains(skipped)) continue;
-
-            if (lcp.toDouble() / maxLen < 0.4) continue;
-            int score = lcp * 100 - pos * 5;
-            if (_knownPrefixes.contains(skipped)) {
-              score += 5000;
-            }
-            scored.add(_ScoredWord(sw, score, pos, lcp));
-          }
-        }
-        seen.add(sw);
-      }
-    }
-
-    scored.sort((a, b) => b.score.compareTo(a.score));
-
-    // 词干匹配提权：Porter Stemmer 识别词干相同的候选词
-    final inputStem = porterStem(word);
-    for (int i = 0; i < scored.length; i++) {
-      final sw = scored[i];
-      final candStem = porterStem(sw.word);
-      if (inputStem == candStem) {
-        scored[i] = _ScoredWord(sw.word, sw.score + 7000, sw.pos, sw.lcp);
-      } else if (inputStem.length >= 4 && candStem.length >= 4) {
-        final stemLcp = _lcpLength(inputStem, candStem);
-        if (stemLcp >= 4) {
-          // 词干部分重合（如 happiness → happy 与 happen → happen 有公共前缀）
-          scored[i] = _ScoredWord(sw.word, sw.score + stemLcp * 200, sw.pos, sw.lcp);
-        }
-      }
-    }
-    scored.sort((a, b) => b.score.compareTo(a.score));
-
-    // 主导候选词抑制：若首位候选词覆盖率≥75%，过滤同位置弱匹配
-    if (scored.isNotEmpty) {
-      final top = scored.first;
-      if (top.pos == 0 && top.lcp > 0) {
-        final coverage = top.lcp.toDouble() / lower.length;
-        if (coverage >= 0.75) {
-          scored.removeWhere((s) =>
-              s.pos == 0 && s.lcp < top.lcp && s.lcp.toDouble() / lower.length < 0.5);
-        }
-      }
-    }
-
-    return scored.map((s) => s.word).take(30).toList();
+    return baseWordCandidates(word, allStandardWords);
   }
 
 
@@ -4151,7 +4035,7 @@ class _VocabTabPageState extends State<_VocabTabPage> {
                       ),
                     ],
                   ),
-                  Text('V 1.4.9', style: TextStyle(color: Colors.grey, fontSize: 12)),
+                  Text('V 1.5.2', style: TextStyle(color: Colors.grey, fontSize: 12)),
                   SizedBox(height: 4),
                   GestureDetector(
                     onTap: () async {

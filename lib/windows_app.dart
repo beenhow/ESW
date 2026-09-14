@@ -38,6 +38,7 @@ import 'dictionary_service.dart';
 import 'shared/word_sync_service.dart';
 import 'shared/doc_extractor.dart';
 import 'shared/export_extra_table.dart';
+import 'shared/base_word_candidates.dart';
 
 typedef _GetDroppedFileC = Pointer<Utf8> Function();
 
@@ -109,9 +110,9 @@ class _MainWindowState extends State<MainWindow> {
 
   String _activeFilter = '真题词';
 
-  final List<String> _filters = ['真题词', '课标词', '拓展词', '超标词', '专有词'];
+  final List<String> _filters = ['真题词', '课标词', '拓展词', '超标词', '专有词', '未筛选'];
 
-  final Map<String, int> _filterCounts = {'真题词': 0, '课标词': 0, '拓展词': 0, '超标词': 0, '专有词': 0};
+  final Map<String, int> _filterCounts = {'真题词': 0, '课标词': 0, '拓展词': 0, '超标词': 0, '专有词': 0, '未筛选': 0};
 
   static final Map<String, Color> _filterColors = {
 
@@ -124,6 +125,8 @@ class _MainWindowState extends State<MainWindow> {
     '超标词': AppTheme.red,
 
     '专有词': AppTheme.grey,
+
+    '未筛选': AppTheme.purple,
 
   };
 
@@ -243,7 +246,7 @@ class _MainWindowState extends State<MainWindow> {
 
   final Map<String, int> _importedFilterCounts = {
 
-    '真题词': 0, '课标词': 0, '拓展词': 0, '超标词': 0, '专有词': 0,
+    '真题词': 0, '课标词': 0, '拓展词': 0, '超标词': 0, '专有词': 0, '未筛选': 0,
 
   };
 
@@ -260,6 +263,85 @@ class _MainWindowState extends State<MainWindow> {
   int _savedImportedTotalWords = 0;
 
   final Map<String, int> _savedImportedFilterCounts = {};
+
+  // ======== 文件文本缓存（LRU，避免重复解析 docx/pdf/txt） ========
+
+  /// 语料/导入文件纯文本缓存：key=绝对路径，value=解析结果+文件签名
+  final Map<String, _CachedFileText> _fileTextCache = {};
+  /// LRU 顺序（尾部为最近使用）
+  final List<String> _fileTextCacheOrder = [];
+  /// 缓存总字节上限，超限后淘汰最久未使用的条目（控制内存占用）
+  static const int _fileTextCacheMaxBytes = 80 * 1024 * 1024;
+  /// 缓存条目上限
+  static const int _fileTextCacheMaxEntries = 64;
+
+  /// 命中返回文本，未命中返回 null（缓存的是纯文本，比每次解析出的 XML/压缩中间结构省内存）
+  String? _readCachedFileText(String path) {
+    final cached = _fileTextCache[path];
+    if (cached != null) {
+      try {
+        final stat = FileStat.statSync(path);
+        if (stat.modified.millisecondsSinceEpoch == cached.modified &&
+            stat.size == cached.size) {
+          _touchCache(path);
+          return cached.text;
+        }
+      } catch (_) {}
+      // 文件已变化，丢弃旧缓存
+      _fileTextCache.remove(path);
+      _fileTextCacheOrder.remove(path);
+    }
+    return null;
+  }
+
+  void _cacheFileText(String path, String text) {
+    if (path.isEmpty) return;
+    try {
+      final stat = FileStat.statSync(path);
+      _fileTextCache[path] = _CachedFileText(
+        text: text,
+        modified: stat.modified.millisecondsSinceEpoch,
+        size: stat.size,
+      );
+    } catch (_) {
+      _fileTextCache[path] = _CachedFileText(text: text, modified: 0, size: 0);
+    }
+    _touchCache(path);
+    // 容量控制：总字节或条目超限时，淘汰最久未使用的条目
+    var total = _fileTextCache.values
+        .fold<int>(0, (s, c) => s + c.text.length);
+    while ((total > _fileTextCacheMaxBytes ||
+            _fileTextCacheOrder.length > _fileTextCacheMaxEntries) &&
+        _fileTextCacheOrder.isNotEmpty) {
+      final oldest = _fileTextCacheOrder.removeAt(0);
+      final removed = _fileTextCache.remove(oldest);
+      if (removed != null) total -= removed.text.length;
+    }
+  }
+
+  void _touchCache(String path) {
+    _fileTextCacheOrder.remove(path);
+    _fileTextCacheOrder.add(path);
+  }
+
+  /// 读取任意文件纯文本并走缓存（docx/pdf/doc/txt 统一异步入口）
+  Future<String> _readFileTextCached(String filePath) async {
+    final hit = _readCachedFileText(filePath);
+    if (hit != null) return hit;
+    final ext = filePath.toLowerCase();
+    String content;
+    if (ext.endsWith('.docx')) {
+      content = _readDocxContent(filePath);
+    } else if (ext.endsWith('.pdf')) {
+      content = await _readPdfContent(filePath);
+    } else if (ext.endsWith('.doc')) {
+      content = extractDocText(File(filePath).readAsBytesSync());
+    } else {
+      content = File(filePath).readAsStringSync();
+    }
+    _cacheFileText(filePath, content);
+    return content;
+  }
 
   // ======== 性能优化常量 ========
 
@@ -1119,29 +1201,35 @@ class _MainWindowState extends State<MainWindow> {
 
     final fileName = result.files.single.name;
 
+    // 导入文档前：若未同步筛选词库（extendBaseMap 为空），提醒先同步词库，确保拓展词能映射到课标词
+    if (_extendBaseMap.isEmpty) {
+      if (!mounted) return;
+      final goSync = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('词库未同步'),
+          content: const Text('当前未检测到已同步的筛选词库，导入文档后拓展词将无法映射到课标词，导出结果可能不完整。建议先「同步词库」再导入检测。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text('仍然导入'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text('去同步'),
+            ),
+          ],
+        ),
+      );
+      if (goSync == true) {
+        await _syncVocab();
+        return;
+      }
+    }
+
     try {
 
-      final ext = filePath.toLowerCase();
-
-      String content;
-
-      if (ext.endsWith('.docx')) {
-
-        content = _readDocxContent(filePath);
-
-      } else if (ext.endsWith('.pdf')) {
-
-        content = await _readPdfContent(filePath);
-
-      } else if (ext.endsWith('.doc')) {
-
-        content = extractDocText(File(filePath).readAsBytesSync());
-
-      } else {
-
-        content = File(filePath).readAsStringSync();
-
-      }
+      final content = await _readFileTextCached(filePath);
 
       _searchController.text = content;
 
@@ -1199,25 +1287,7 @@ class _MainWindowState extends State<MainWindow> {
 
     try {
 
-      String content;
-
-      if (ext.endsWith('.docx')) {
-
-        content = _readDocxContent(filePath);
-
-      } else if (ext.endsWith('.pdf')) {
-
-        content = await _readPdfContent(filePath);
-
-      } else if (ext.endsWith('.doc')) {
-
-        content = extractDocText(File(filePath).readAsBytesSync());
-
-      } else {
-
-        content = File(filePath).readAsStringSync();
-
-      }
+      final content = await _readFileTextCached(filePath);
 
       _searchController.text = content;
 
@@ -1405,15 +1475,11 @@ class _MainWindowState extends State<MainWindow> {
 
     final yearFreq = <int, int>{};
 
-    final pattern = RegExp(
+    // 关键词已是小写，改用大小写敏感正则 + 文本统一小写一次，显著快于 caseSensitive:false
+    // （英文小写转换不改变字符长度，匹配位置与原文一一对应）
+    final pattern = RegExp('\\b${RegExp.escape(word)}\\b');
 
-      '\\b${RegExp.escape(word)}\\b',
-
-      caseSensitive: false,
-
-    );
-
-    // 并行读取所有选中文件
+    // 并行读取所有选中文件（走缓存，重复查词不再重复解析 docx/pdf）
 
     final selectedFiles = _corpusFiles.where((f) => f.isSelected).toList();
 
@@ -1421,11 +1487,7 @@ class _MainWindowState extends State<MainWindow> {
 
       try {
 
-        final text = cf.path.toLowerCase().endsWith('.docx')
-
-            ? _readDocxContent(cf.path)
-
-            : await File(cf.path).readAsString();
+        final text = await _readFileTextCached(cf.path);
 
         return (cf, text);
 
@@ -1443,7 +1505,7 @@ class _MainWindowState extends State<MainWindow> {
 
       final (cf, text) = entry;
 
-      final matches = pattern.allMatches(text);
+      final matches = pattern.allMatches(text.toLowerCase());
 
       for (final m in matches) {
 
@@ -1509,7 +1571,7 @@ class _MainWindowState extends State<MainWindow> {
 
           before: before,
 
-          keyword: m.group(0)!,
+          keyword: text.substring(m.start, m.end),
 
           after: after,
 
@@ -1605,7 +1667,7 @@ class _MainWindowState extends State<MainWindow> {
 
         _filterCounts['超标词'] = 1;
 
-      } else if (filter != '未筛选') {
+      } else {
 
         _filterCounts[filter] = 1;
 
@@ -1743,21 +1805,8 @@ class _MainWindowState extends State<MainWindow> {
 
           }
 
-          // 如果缺失 base map 映射，用标准词列表补充
-
-          if (!_extendBaseMap.containsKey(iw.word)) {
-
-            final suggestions = _findBestSyllabusMatch(iw.word);
-
-            if (suggestions.isNotEmpty) {
-
-              _extendBaseMap[iw.word] = suggestions.first;
-
-              _extendReverseIndex[iw.word.toLowerCase()] = suggestions.first.toLowerCase();
-
-            }
-
-          }
+          // 不自动补映射：拓展词↔课标词关联完全来自用户筛选词库（esw_config.json 的 extendBaseMap），
+          // 未同步词库时由检测流程提示用户先同步，避免错误识别
 
           break;
 
@@ -1857,15 +1906,7 @@ class _MainWindowState extends State<MainWindow> {
 
       try {
 
-        if (cf.path.toLowerCase().endsWith('.docx')) {
-
-          return _readDocxContent(cf.path);
-
-        }
-
-        final t = await File(cf.path).readAsString();
-
-        return t;
+        return await _readFileTextCached(cf.path);
 
       } catch (_) {
 
@@ -1923,7 +1964,8 @@ class _MainWindowState extends State<MainWindow> {
 
       } else {
 
-        cat = '专有词';
+        // 既非课标词、也不在语料中，且无分类记忆 → 放入"未筛选"待用户手动归类
+        cat = '未筛选';
 
       }
 
@@ -1948,6 +1990,8 @@ class _MainWindowState extends State<MainWindow> {
       '超标词': 0,
 
       '专有词': 0,
+
+      '未筛选': 0,
 
     };
 
@@ -2664,19 +2708,17 @@ class _MainWindowState extends State<MainWindow> {
       text: originalText,
       extendWords: extendWords,
       baseWordOf: (w) {
+        // 优先取用户筛选拓展词时手动关联的课标词（extendBaseMap），保证导出列表课标词列非空
+        final linked = _extendBaseMap[w] ?? _extendBaseMap[w.toLowerCase()];
+        if (linked != null && linked.isNotEmpty) return linked;
         final b = _extendReverseIndex[w.toLowerCase()];
-        if (b == null) return '';
+        if (b == null) {
+          // 词本身是课标词（如 discussing 还原后的 discuss）时直接返回
+          final ms2 = _standardWordsLower[w.toLowerCase()];
+          return (ms2 != null && ms2.isNotEmpty) ? ms2.first : '';
+        }
         final ms = _standardWordsLower[b];
         return (ms != null && ms.isNotEmpty) ? ms.first : b;
-      },
-      meaningOf: (w, base) {
-        final own = _standardWords[w]?['def'] ?? '';
-        if (own.isNotEmpty) return own;
-        if (base.isNotEmpty) {
-          final bm = _standardWords[base]?['def'] ?? '';
-          if (bm.isNotEmpty) return bm;
-        }
-        return '';
       },
     );
   }
@@ -2701,10 +2743,10 @@ class _MainWindowState extends State<MainWindow> {
         '全套题词数: $totalRaw | 去重总词数: ${_importedWords.length} '
         '| 课标词: ${cc['课标词'] ?? 0} | 拓展词: ${cc['拓展词'] ?? 0} '
         '| 超标词: ${cc['超标词'] ?? 0} | 专有词: ${cc['专有词'] ?? 0} '
-        '| 真题词: ${cc['真题词'] ?? 0} | 其他: ${cc['其他'] ?? 0}'));
+        '| 真题词: ${cc['真题词'] ?? 0} | 未筛选: ${cc['未筛选'] ?? 0} | 其他: ${cc['其他'] ?? 0}'));
     bodyParts.add(_docxParagraph('【标注说明】', bold: true));
     bodyParts.add(_docxParagraph(
-        '课标词：黑色（无标记）；拓展词：绿色；超标词：红色；专有词：灰色'));
+        '课标词：黑色（无标记）；拓展词：绿色；超标词：红色；专有词：灰色；未筛选：黑色'));
     bodyParts.add(_docxParagraph('带标注全文', bold: true));
     bodyParts.add(_docxAnnotatedParagraph(originalText, wordCatMap));
     bodyParts.add(_docxParagraph('拓展词明细（按题型）', bold: true));
@@ -2734,9 +2776,16 @@ ${bodyParts.join('\n')}
 </Relationships>''';
 
     final archive = Archive();
-    archive.addFile(ArchiveFile.string('[Content_Types].xml', contentTypes));
-    archive.addFile(ArchiveFile.string('_rels/.rels', rels));
-    archive.addFile(ArchiveFile.string('word/document.xml', documentXml));
+    // 注意：必须用 ArchiveFile(name, 字节长度, 字节) 构造，保证 zip 中记录
+    // 的 uncompressed size 是 UTF-8 字节数。用 ArchiveFile.string 会按字符数
+    // 记大小，中文内容会导致大小不符，部分阅读器按错误大小截断 document.xml
+    // 而出现乱码/内容异常。
+    archive.addFile(ArchiveFile(
+        '[Content_Types].xml', utf8.encode(contentTypes).length, utf8.encode(contentTypes)));
+    archive.addFile(ArchiveFile(
+        '_rels/.rels', utf8.encode(rels).length, utf8.encode(rels)));
+    archive.addFile(ArchiveFile(
+        'word/document.xml', utf8.encode(documentXml).length, utf8.encode(documentXml)));
 
     final encoder = ZipEncoder();
     final bytes = encoder.encode(archive);
@@ -2785,7 +2834,7 @@ ${bodyParts.join('\n')}
         if (plain.isNotEmpty) {
           runs.add(_docxRun(plain, '000000'));
         }
-        if (cat == null || cat == '课标词' || cat == '真题词' || cat == '其他') {
+        if (cat == null || cat == '课标词' || cat == '真题词' || cat == '未筛选' || cat == '其他') {
           runs.add(_docxRun(word, '000000'));
         } else {
           runs.add(_docxRun(word, colorOf(cat),
@@ -2860,6 +2909,8 @@ ${bodyParts.join('\n')}
         newCat = '拓展词';
       } else if (_manualChaoGangWords.contains(iw.word) && iw.category != '超标词') {
         newCat = '超标词';
+      } else if (_manualExtraWords.contains(iw.word) && iw.category != '专有词') {
+        newCat = '专有词';
       }
       if (newCat != null) {
         oldCounts[iw.category] = (oldCounts[iw.category] ?? 1) - 1;
@@ -3072,16 +3123,6 @@ ${bodyParts.join('\n')}
             .where((iw) => iw.category == _importedActiveFilter)
             .toList();
       }
-      // 专有词优先显示未筛选分类的单词，已标记专有词排在末尾
-      if (_importedActiveFilter == '专有词') {
-        _cachedFilteredImportedWords.sort((a, b) {
-          final aManual = _manualExtraWords.any((e) => e.toLowerCase() == a.word.toLowerCase());
-          final bManual = _manualExtraWords.any((e) => e.toLowerCase() == b.word.toLowerCase());
-          if (aManual && !bManual) return 1;
-          if (!aManual && bManual) return -1;
-          return 0;
-        });
-      }
       _cachedImportedFilter = _importedActiveFilter;
       _cachedImportedWordsRef = _importedWords;
     }
@@ -3128,7 +3169,7 @@ ${bodyParts.join('\n')}
         final color = _filterColors[iw.category]!;
         final isChaoGang = iw.category == '超标词';
         final isExtraCorpus = iw.category == '专有词';
-        final isUnmarkedZhenti = iw.category == '真题词'; // 未标记的真题词
+        final isUnmarkedZhenti = iw.category == '真题词' || iw.category == '未筛选'; // 未标记的真题词 / 待筛选词
 
         return Container(
           margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
@@ -3208,7 +3249,10 @@ ${bodyParts.join('\n')}
                       InkWell(
                         onTap: () {
                           _manualExtraWords.remove(iw.word);
-                          _reclassifyImportedWord(iw, '专有词');
+                          _classificationMemory.remove(iw.word.toLowerCase());
+                          // 移出专有词后：在语料中归真题词，否则回到未筛选待用户重新归类
+                          final newCat = iw.isInCorpus ? '真题词' : '未筛选';
+                          _reclassifyImportedWord(iw, newCat);
                           setState(() {
                             if ((_filterCounts['专有词'] ?? 0) > 0) {
                               _filterCounts['专有词'] = (_filterCounts['专有词'] ?? 0) - 1;
@@ -3245,9 +3289,10 @@ ${bodyParts.join('\n')}
                     InkWell(
                       onTap: () {
                         _manualChaoGangWords.remove(iw.word);
+                        _classificationMemory.remove(iw.word.toLowerCase());
                         final newCat = _manualExtraWords.contains(iw.word)
                             ? '专有词'
-                            : (iw.isInCorpus ? '真题词' : '专有词');
+                            : (iw.isInCorpus ? '真题词' : '未筛选');
                         _reclassifyImportedWord(iw, newCat);
                         setState(() {
                           if ((_filterCounts['超标词'] ?? 0) > 0) {
@@ -3369,7 +3414,16 @@ ${bodyParts.join('\n')}
 
     switch (action) {
       case '拓展词':
-        if (selectedBases.isEmpty) break;
+        if (selectedBases.isEmpty) {
+          // 未选择关联课标词时归类不生效：明确提示用户，避免"点了筛选却没归类"的困惑
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                  content: Text('归类拓展词失败：请先在下方搜索框选择关联的课标词')),
+            );
+          }
+          break;
+        }
         setState(() {
           final alreadyExisted = _extendWords.any((e) => e.toLowerCase() == iw.word.toLowerCase());
           _extendWords.removeWhere((e) => e.toLowerCase() == iw.word.toLowerCase());
@@ -3408,14 +3462,20 @@ ${bodyParts.join('\n')}
         break;
     }
 
-    // 专有词筛选模式：自动进入下一个专有词
-    if (_importedActiveFilter == '专有词') {
+    // 未筛选筛选模式：自动进入下一个未筛选单词，直至全部筛完
+    if (_importedActiveFilter == '未筛选') {
       for (final next in _importedWords) {
-        if (next.category == '专有词' && !cancelled.contains(next.word)) {
+        if (next.category == '未筛选' && !cancelled.contains(next.word)) {
           await _startClassifyBatch(next, cancelled: cancelled);
           return;
         }
       }
+      // 未筛选词已全部处理完毕，停止连排并标记当前文件已处理
+      if (_importedFilePath != null) {
+        _processedFilePaths.add(_importedFilePath!);
+        _saveConfig();
+      }
+      return;
     }
 
     // 查找下一个未标记且未被跳过的真题词
@@ -4038,19 +4098,9 @@ ${bodyParts.join('\n')}
 
                     optionsBuilder: (TextEditingValue value) {
 
-                      if (value.text.isEmpty) return const Iterable.empty();
-
-                      final lower = value.text.toLowerCase();
-
-                      final bucket = _wordsByFirstChar[lower[0]];
-
-                      if (bucket == null) return const Iterable.empty();
-
-                      final matches = bucket.where((k) => k.toLowerCase().startsWith(lower)).toList();
-
-                      matches.sort();
-
-                      return matches.take(10);
+                      // 双端统一候选：输入相关候选 + 空输入自动跳原词拆词候选
+                      final all = _wordsByFirstChar.values.expand((e) => e).toList();
+                      return baseWordCandidates(value.text, all, targetWord: word);
 
                     },
 
@@ -4219,6 +4269,9 @@ ${bodyParts.join('\n')}
         _activeFilter = '拓展词';
 
       });
+
+      // 同步写入分类记忆，保证再次导入同一文件时能正确复用"拓展词"归类
+      _classificationMemory[word.toLowerCase()] = '拓展词';
 
       _saveConfig();
 
@@ -6450,7 +6503,7 @@ ${bodyParts.join('\n')}
 
   void _checkUpdate() async {
 
-    const currentVersion = '1.4.9';
+    const currentVersion = '1.5.2';
 
     try {
 
@@ -6704,11 +6757,27 @@ class ResultRow {
 
 // ==================== 高亮控制器（TextField readOnly + 关键词高亮） ====================
 
+/// 文件纯文本缓存条目（绑定文件修改时间与大小做失效校验）
+class _CachedFileText {
+  final String text;
+  final int modified;
+  final int size;
+  const _CachedFileText({
+    required this.text,
+    required this.modified,
+    required this.size,
+  });
+}
+
 class _HighlightController extends TextEditingController {
 
   final String _keyword;
 
   _HighlightController(String text, this._keyword) : super(text: text);
+
+  /// 懒缓存正则实例：关键词不变时避免每次重建/编译 RegExp
+  RegExp? _cachedRegex;
+  String? _cachedKeyword;
 
   @override
 
@@ -6724,13 +6793,15 @@ class _HighlightController extends TextEditingController {
 
     final spans = <TextSpan>[];
 
-    final regex = RegExp(
-
-      '\\b${RegExp.escape(_keyword)}\\b',
-
-      caseSensitive: false,
-
-    );
+    var regex = _cachedRegex;
+    if (regex == null || _cachedKeyword != _keyword) {
+      regex = RegExp(
+        '\\b${RegExp.escape(_keyword)}\\b',
+        caseSensitive: false,
+      );
+      _cachedRegex = regex;
+      _cachedKeyword = _keyword;
+    }
 
     final text = this.text;
 

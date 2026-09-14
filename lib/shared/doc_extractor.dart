@@ -38,7 +38,7 @@ String _extractDocTextInner(List<int> bytes) {
 
     // 2) UTF-16LE 启发式
     final h16 = _scanUtf16(wd);
-    if (h16.isNotEmpty && _looksLikeText(h16, 25)) return h16;
+    if (h16.isNotEmpty && _looksLikeText(h16, 40)) return h16;
 
     // 3) cp1252 启发式（要求较高可读比例以过滤格式噪音）
     final h8 = _scanCp1252(wd);
@@ -92,26 +92,70 @@ String _scanUtf16(Uint8List wd) {
   final buf = StringBuffer();
   final runs = <String>[];
   var cur = StringBuffer();
-  var i = 0;
+  // 跳过 FIB 头：FIB 是流前部数百字节的结构数据，其字节对极易落入 CJK
+  // 区间，若从流开头扫描，会在正文前拼出一串无意义的“汉字”乱码。
+  // fcMin（FIB 偏移 0x18）是正文最小文件偏移，用它对齐到正文起点。
+  var i = _bodyStartOffset(wd);
   while (i + 1 < wd.length) {
     final c = wd[i] | (wd[i + 1] << 8);
+    if (c == 0x13 || c == 0x14) {
+      // 字段开始/分隔符（0x13/0x14）：跳过整个字段区（代码+结果）直到字段结束符 0x15。
+      // 字段结果常为二进制缓存（如页码域），按 UTF-16 读取会产生"伔J倀J"类乱码。
+      if (cur.isNotEmpty) {
+        if (cur.length >= 8) runs.add(cur.toString());
+        cur = StringBuffer();
+      }
+      var j = i;
+      var found = false;
+      while (j + 1 < wd.length) {
+        if (wd[j] == 0x15 && wd[j + 1] == 0x00) {
+          found = true;
+          break;
+        }
+        j += 2;
+      }
+      i = (found ? j + 2 : i + 2);
+      continue;
+    }
+    if (c == 0x0000) {
+      // 连续 NUL（≥8 对）判定为正文结束：WPS 文档页脚/页码域后常有大段
+      // 0x00 填充，其后的错位字节若继续扫描会产生"伔J倀J儀J帀J愀"类乱码。
+      var n = 0;
+      var j = i;
+      while (j + 1 < wd.length && wd[j] == 0 && wd[j + 1] == 0) {
+        n++;
+        j += 2;
+      }
+      if (n >= 8) break;
+      i = j;
+      continue;
+    }
     if (_isPrintableCode(c)) {
       cur.writeCharCode(c);
       i += 2;
     } else {
       if (cur.isNotEmpty) {
-        if (cur.length >= 4) runs.add(cur.toString());
+        if (cur.length >= 8) runs.add(cur.toString());
         cur = StringBuffer();
       }
       i += 2;
     }
   }
-  if (cur.isNotEmpty && cur.length >= 4) runs.add(cur.toString());
+  if (cur.isNotEmpty && cur.length >= 8) runs.add(cur.toString());
   for (final r in runs) {
     buf.write(r);
     buf.write('\n');
   }
   return buf.toString();
+}
+
+/// 计算 UTF-16 启发式扫描的起始字节偏移（跳过 FIB 结构头）。
+int _bodyStartOffset(Uint8List wd) {
+  if (wd.length >= 0x1C) {
+    final fcMin = _u32(wd, 0x18); // FIB FibBase 内 fcMin
+    if (fcMin > 0 && fcMin < wd.length) return fcMin & ~1;
+  }
+  return (wd.length ~/ 8) & ~1; // 保守回退：跳过流前 1/8
 }
 
 // ---------------------------------------------------------------------------
@@ -126,7 +170,7 @@ String _scanCp1252(Uint8List wd) {
       cur.writeCharCode(b);
     } else {
       if (cur.isNotEmpty) {
-        if (cur.length >= 4) {
+        if (cur.length >= 8) {
           buf.write(cur.toString());
           buf.write('\n');
         }
@@ -134,7 +178,7 @@ String _scanCp1252(Uint8List wd) {
       }
     }
   }
-  if (cur.isNotEmpty && cur.length >= 4) {
+  if (cur.isNotEmpty && cur.length >= 8) {
     buf.write(cur.toString());
     buf.write('\n');
   }
