@@ -4472,7 +4472,8 @@
     "pos": "",
     "def": "vt.讨论；论述，辩论",
     "extensions": [
-      "discussed"
+      "discussed",
+      "discussing"
     ]
   },
   "discussion": {
@@ -17503,5 +17504,14 @@
     "category": "初中",
     "pos": "",
     "def": "n. 中医"
+  },
+  "effective": {
+    "category": "高中",
+    "pos": "adj.",
+    "def": "有效的；生效的",
+    "extensions": [
+      "effectiveness",
+      "effectively"
+    ]
   }
 }

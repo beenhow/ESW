@@ -25,11 +25,16 @@ static HWND g_flutterHwnd = nullptr;
 // Original child window WndProc (restored in OnDestroy)
 static WNDPROC g_originalChildProc = nullptr;
 
-// Debug: write timestamped message to file
+// Debug: write timestamped message to file (%TEMP%\esw_drop_debug.txt)
+// Note: an older build hardcoded C:\Users\Administrator\Desktop\drop_debug.txt and
+// skipped null checks; fopen fails for non-Administrator users so FILE* was NULL and
+// fprintf crashed -> root cause of the Win10 2-second crash.
 static void DropDebug(const char* msg) {
+  char tmp[MAX_PATH] = {};
+  if (GetTempPathA(MAX_PATH, tmp) == 0) return;
+  std::string logPath = std::string(tmp) + "esw_drop_debug.txt";
   FILE* f = nullptr;
-  fopen_s(&f, "C:\\Users\\Administrator\\Desktop\\drop_debug.txt", "a");
-  if (f) {
+  if (fopen_s(&f, logPath.c_str(), "a") == 0 && f != nullptr) {
     SYSTEMTIME st;
     GetLocalTime(&st);
     fprintf(f, "%02d:%02d:%02d.%03d  %s\n",
@@ -47,20 +52,14 @@ static LRESULT CALLBACK ChildWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
       char buf[256];
       snprintf(buf, sizeof(buf), "ChildWndProc: WM_DROPFILES received, %u file(s)", count);
       DropDebug(buf);
-      FILE* f2 = nullptr;
-      fopen_s(&f2, "C:\\Users\\Administrator\\Desktop\\drop_debug.txt", "a");
-      if (f2) {
-        for (UINT i = 0; i < count; i++) {
+              for (UINT i = 0; i < count; i++) {
           wchar_t wbuf[MAX_PATH];
           DragQueryFileW(hDrop, i, wbuf, MAX_PATH);
-          fprintf(f2, "  [%u] %S\n", i, wbuf);
           std::lock_guard<std::mutex> lock(g_dropMutex);
           char nbuf[MAX_PATH];
           WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, nbuf, sizeof(nbuf), nullptr, nullptr);
           g_droppedFiles.push(nbuf);
         }
-        fclose(f2);
-      }
     }
     DragFinish(hDrop);
     return 0;
@@ -89,10 +88,20 @@ bool FlutterWindow::OnCreate() {
 
   RECT frame = GetClientArea();
 
+  // Guard: client area may be 0 when DPI is abnormal or the window is not yet
+  // laid out; fall back to a default size to avoid a crash from initializing
+  // FlutterViewController with a zero size (rare on Win10 high-DPI).
+  int width = frame.right - frame.left;
+  int height = frame.bottom - frame.top;
+  if (width <= 0 || height <= 0) {
+    width = 1280;
+    height = 720;
+  }
+
   // The size here must match the window dimensions to avoid unnecessary surface
   // creation / destruction in the startup path.
   flutter_controller_ = std::make_unique<flutter::FlutterViewController>(
-      frame.right - frame.left, frame.bottom - frame.top, project_);
+      width, height, project_);
   // Ensure that basic setup of the controller was successful.
   if (!flutter_controller_->engine() || !flutter_controller_->view()) {
     return false;
@@ -123,7 +132,7 @@ bool FlutterWindow::OnCreate() {
     ChangeWindowMessageFilterEx(flutterHwnd, WM_DROPFILES, MSGFLT_ALLOW, nullptr);
     ChangeWindowMessageFilterEx(flutterHwnd, WM_COPYGLOBALDATA, MSGFLT_ALLOW, nullptr);
 
-    // Direct WndProc hook (not SetWindowSubclass — more reliable with Flutter engine)
+    // Direct WndProc hook (not SetWindowSubclass - more reliable with Flutter engine)
     g_originalChildProc = reinterpret_cast<WNDPROC>(
         SetWindowLongPtr(flutterHwnd, GWLP_WNDPROC,
                          reinterpret_cast<LONG_PTR>(ChildWndProc)));
@@ -167,20 +176,14 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
       snprintf(buf, sizeof(buf),
                "ParentHandler: WM_DROPFILES received, %u file(s)", count);
       DropDebug(buf);
-      FILE* f2 = nullptr;
-      fopen_s(&f2, "C:\\Users\\Administrator\\Desktop\\drop_debug.txt", "a");
-      if (f2) {
-        for (UINT i = 0; i < count; i++) {
+              for (UINT i = 0; i < count; i++) {
           wchar_t wbuf[MAX_PATH];
           DragQueryFileW(hDrop, i, wbuf, MAX_PATH);
-          fprintf(f2, "  [%u] %S\n", i, wbuf);
           std::lock_guard<std::mutex> lock(g_dropMutex);
           char nbuf[MAX_PATH];
           WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, nbuf, sizeof(nbuf), nullptr, nullptr);
           g_droppedFiles.push(nbuf);
         }
-        fclose(f2);
-      }
     }
     DragFinish(hDrop);
     return 0;
