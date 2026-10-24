@@ -13,6 +13,7 @@ analyzer:
   exclude:
     - legacy_unused_dart/**
     - temp/**
+    - ESW_backup_20261014/**
 
 linter:
   # The lint rules applied to this project can be customized in the

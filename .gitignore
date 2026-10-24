@@ -23,3 +23,47 @@ debug_build.log
 # APK
 ESW.apk
 assets/ecdict.db
+
+# Release / build artifacts (not source)
+*.zip
+*.apk
+*.exe
+*.msix
+*.log
+$log
+analyze*.txt
+*.bak
+*.bak_*
+*.current_backup
+*.debug_backup
+**/.kotlin/
+assets/*.db
+assets/*.db-shm
+assets/*.db-wal
+
+# scratch / local debug artifacts
+*.db
+temp_*
+build_*.txt
+cmake_out.txt
+da_out.txt
+*_log.txt
+*.err
+*.fixed
+*.fixed2
+*.rebuilt
+*.repaired
+*.pre_glass*
+*.bak4
+legacy_unused_dart/
+release/
+release_pkg/
+output/
+temp/
+
+# large local data / web build output
+scripts/*_state*.json
+scripts/shared_vocab_current.json
+ESW网页版.html
+scripts/.gh_token
+scripts/out.txt

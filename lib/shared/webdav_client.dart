@@ -5,6 +5,32 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
+/// 没有任何可用的 WebDAV 凭据（用户目录、%LOCALAPPDATA%、exe 同目录与内置资产全部缺失）。
+class WebDavConfigException implements Exception {
+  final String message;
+  const WebDavConfigException([this.message = '未找到可用的 WebDAV 同步账号配置']);
+  @override
+  String toString() => message;
+}
+
+/// 凭据被服务端拒绝（401/403）：账号或应用密码无效。
+class WebDavAuthException implements Exception {
+  final String message;
+  const WebDavAuthException([this.message = 'WebDAV 鉴权失败（401/403）']);
+  @override
+  String toString() => message;
+}
+
+/// WebDAV 其它 HTTP 错误。
+class WebDavHttpException implements Exception {
+  final int statusCode;
+  final String message;
+  WebDavHttpException(this.statusCode, [String? detail])
+      : message = detail ?? 'WebDAV 请求失败: HTTP $statusCode';
+  @override
+  String toString() => message;
+}
+
 /// 坚果云 WebDAV 同步配置。
 ///
 /// 配置文件位于应用支持目录下 esw_sync_config.json，结构：
@@ -20,10 +46,16 @@ class WebDavConfig {
   final String username;
   final String password;
 
+  /// 凭据来源（仅用于日志与诊断提示）：
+  /// user=用户目录覆盖文件；localappdata=%LOCALAPPDATA%\ESW 同目录；
+  /// portable=exe 同目录（便携版/旧包迁移）；bundled=随包内置资产。
+  final String source;
+
   const WebDavConfig({
     required this.baseUrl,
     required this.username,
     required this.password,
+    this.source = 'unknown',
   });
 
   bool get isValid =>
@@ -34,37 +66,88 @@ class WebDavConfig {
     return '${dir.path}${Platform.pathSeparator}esw_sync_config.json';
   }
 
-  /// 读取配置。
-  /// 优先读应用支持目录下的 esw_sync_config.json（用户可自行覆盖）；
-  /// 不存在时回退到打包内置的 assets/esw_sync_config.json（开箱即用）。
-  /// 两者均缺失或字段无效时返回 null（调用方静默跳过同步）。
-  static Future<WebDavConfig?> load() async {
-    // 1) 支持目录优先：用户覆盖配置
+  /// 凭据文件的候选路径（按优先级）。
+  ///
+  /// 换电脑场景下多给一层兜底：除用户目录外，还认 %LOCALAPPDATA%\ESW 与
+  /// exe 同目录的 esw_sync_config.json，用户把老机器上的这个文件拷过来即可生效。
+  static Future<List<MapEntry<String, String>>> fileCandidates() async {
+    final sep = Platform.pathSeparator;
+    final out = <MapEntry<String, String>>[];
     try {
-      final path = await configPath();
-      final f = File(path);
-      if (await f.exists()) {
-        final data = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
-        return _fromMap(data);
-      }
-    } catch (_) {
-      // 支持目录读取失败 → 继续尝试内置资产
+      out.add(MapEntry('user', await configPath()));
+    } catch (_) {}
+    final local = Platform.environment['LOCALAPPDATA'];
+    if (local != null && local.isNotEmpty) {
+      out.add(MapEntry('localappdata', '$local${sep}ESW${sep}esw_sync_config.json'));
     }
-    // 2) 内置资产兜底：随包分发的默认配置
+    try {
+      final exeDir = File(Platform.resolvedExecutable).parent.path;
+      out.add(MapEntry('portable', '$exeDir${sep}esw_sync_config.json'));
+    } catch (_) {}
+    return out;
+  }
+
+  /// 读取配置。
+  /// 顺序：用户目录（可手动覆盖）→ %LOCALAPPDATA%\ESW → exe 同目录
+  /// → 打包内置的 assets/esw_sync_config.json（开箱即用兜底）。
+  /// 某一层文件存在但字段无效时继续往下找；全部不可用才返回 null。
+  static Future<WebDavConfig?> load() async {
+    for (final cand in await fileCandidates()) {
+      try {
+        final f = File(cand.value);
+        if (!await f.exists()) continue;
+        final data = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+        final cfg = _fromMap(data, cand.key);
+        if (cfg.isValid) return cfg;
+      } catch (_) {
+        // 单层读取/解析失败 → 继续下一层
+      }
+    }
     try {
       final raw = await rootBundle.loadString('assets/esw_sync_config.json');
       final data = jsonDecode(raw) as Map<String, dynamic>;
-      return _fromMap(data);
+      final cfg = _fromMap(data, 'bundled');
+      if (cfg.isValid) return cfg;
     } catch (_) {
-      return null;
+      // 内置资产缺失（例如发布包被剥离 assets）→ 无凭据
+    }
+    return null;
+  }
+
+  /// 保存到用户目录（手动填写入口），返回是否写入成功。
+  Future<bool> save() async {
+    try {
+      final path = await configPath();
+      final f = File(path);
+      await f.parent.create(recursive: true);
+      await f.writeAsString(jsonEncode(toMap()), flush: true);
+      return true;
+    } catch (_) {
+      return false;
     }
   }
 
-  static WebDavConfig? _fromMap(Map<String, dynamic> data) {
+  Map<String, dynamic> toMap() => <String, dynamic>{
+        'baseUrl': baseUrl,
+        'username': username,
+        'password': password,
+      };
+
+  WebDavConfig copyWith({String? baseUrl, String? username, String? password}) {
+    return WebDavConfig(
+      baseUrl: baseUrl ?? this.baseUrl,
+      username: username ?? this.username,
+      password: password ?? this.password,
+      source: source,
+    );
+  }
+
+  static WebDavConfig _fromMap(Map<String, dynamic> data, String source) {
     return WebDavConfig(
       baseUrl: (data['baseUrl'] as String? ?? '').replaceAll(RegExp(r'/+$'), ''),
       username: data['username'] as String? ?? '',
       password: data['password'] as String? ?? '',
+      source: source,
     );
   }
 }
@@ -106,11 +189,22 @@ class WebDavClient {
           )
           .timeout(const Duration(seconds: 30));
       if (resp.statusCode == 404) return null;
-      if (resp.statusCode != 200) {
-        throw Exception('WebDAV GET $relativePath 失败: ${resp.statusCode}');
+      if (resp.statusCode == 401 || resp.statusCode == 403) {
+        // 一定要抛出可识别的鉴权异常：否则上层只能笼统记成"离线"，
+        // 换机后账号被拒会被误当成"已是最新"。
+        throw WebDavAuthException(
+            '坚果云拒绝访问（HTTP ${resp.statusCode}）：同步账号或应用密码无效');
       }
-      // 大 JSON 解析移到 isolate，避免阻塞 UI
-      return await Isolate.run(() => jsonDecode(utf8.decode(resp.bodyBytes)) as Map<String, dynamic>);
+      if (resp.statusCode != 200) {
+        throw WebDavHttpException(
+            resp.statusCode, 'WebDAV GET $relativePath 失败: HTTP ${resp.statusCode}');
+      }
+      // 大 JSON 解析移到 isolate，避免阻塞 UI。
+      // 必须先提取纯字节再进闭包：闭包若捕获整个 resp（http.Response），
+      // 其内部 Future/Stream/Timer（dart:async/_AsyncCompleter、
+      // dart:isolate/_Timer）会被连带发送，触发 "object is unsendable"。
+      final bytes = resp.bodyBytes;
+      return await Isolate.run(() => jsonDecode(utf8.decode(bytes)) as Map<String, dynamic>);
     } catch (_) {
       rethrow;
     }
@@ -146,9 +240,55 @@ class WebDavClient {
             )
             .timeout(const Duration(seconds: 60));
       }
+      if (resp.statusCode == 401 || resp.statusCode == 403) {
+        throw WebDavAuthException(
+            '坚果云拒绝写入（HTTP ${resp.statusCode}）：同步账号或应用密码无效');
+      }
       return resp.statusCode == 200 || resp.statusCode == 201 || resp.statusCode == 204;
+    } on WebDavAuthException {
+      rethrow;
     } catch (_) {
       return false;
+    }
+  }
+
+  /// 连通性 / 鉴权自检（PROPFIND 根目录 Depth:0）。
+  ///
+  /// 返回 {ok, status, dirMissing, message}：
+  /// - ok=true 表示账号密码被服务端接受（目录不存在也算账号可用，首次上传会自动建目录）；
+  /// - ok=false 时 message 给出可读原因（401 → 账号或应用密码错误）。
+  Future<Map<String, dynamic>> probe() async {
+    try {
+      final req = http.Request('PROPFIND', _uri(''))
+        ..headers['Authorization'] = _authorization
+        ..headers['Depth'] = '0'
+        ..headers['Content-Type'] = 'application/xml';
+      final resp =
+          await http.Client().send(req).timeout(const Duration(seconds: 20));
+      await resp.stream.drain<void>();
+      final code = resp.statusCode;
+      if (code == 401 || code == 403) {
+        return {
+          'ok': false,
+          'status': code,
+          'kind': 'auth',
+          'message': '鉴权失败（HTTP $code）：同步账号或应用密码无效',
+        };
+      }
+      if (code == 207 || code == 200) {
+        return {'ok': true, 'status': code, 'dirMissing': false, 'message': '连接正常，账号可用'};
+      }
+      if (code == 404 || code == 409) {
+        return {
+          'ok': true,
+          'status': code,
+          'dirMissing': true,
+          'message': '账号可用，云端同步目录尚不存在（首次上传会自动创建）',
+        };
+      }
+      return {'ok': false, 'status': code, 'kind': 'http', 'message': '服务端返回 HTTP $code'};
+    } catch (e) {
+      return {'ok': false, 'status': 0, 'kind': 'network', 'message': '网络不可用：$e'};
     }
   }
 

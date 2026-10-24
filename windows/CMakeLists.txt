@@ -4,7 +4,7 @@ project(ESW LANGUAGES CXX)
 
 # The name of the executable created for the application. Change this to change
 # the on-disk name of your application.
-set(BINARY_NAME "ESW1.5.3")
+set(BINARY_NAME "ESW1.5.8")
 
 # Explicitly opt in to modern CMake behaviors to avoid warnings with recent
 # versions of CMake.
@@ -112,5 +112,29 @@ install(FILES "${AOT_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../tesseract"
   DESTINATION "${CMAKE_INSTALL_PREFIX}"
   COMPONENT Runtime)
+
+# App-local deployment of the VC++ runtime (vcruntime140 / vcruntime140_1 / msvcp140).
+# The exe and bundled native plugins (pdfrx / pdfium, sqlite3) link against these
+# DLLs; copying them next to the exe avoids 0xc0000135 / 0xc000007b startup crashes
+# on machines without the VC++ 2015-2022 Redistributable installed.
+#
+# IMPORTANT: resolve the 64-bit System32 through Sysnative when the CMake
+# install script runs as a 32-bit process, otherwise WOW64 redirects
+# C:/Windows/System32 to SysWOW64 and we would deploy the x86 VC runtime
+# next to a x64 exe (causing 0xc000007b instead of fixing it).
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  install(CODE "
+    set(_sys32 \"\$ENV{SystemRoot}/Sysnative\")
+    if(NOT EXISTS \"\${_sys32}\")
+      set(_sys32 \"\$ENV{SystemRoot}/System32\")
+    endif()
+    foreach(_dll \"vcruntime140.dll\" \"vcruntime140_1.dll\" \"msvcp140.dll\")
+      if(EXISTS \"\${_sys32}/\${_dll}\")
+        file(COPY \"\${_sys32}/\${_dll}\" DESTINATION \"${CMAKE_INSTALL_PREFIX}\")
+      endif()
+    endforeach()
+    " COMPONENT Runtime)
+endif()
+
 
 

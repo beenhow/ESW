@@ -14,7 +14,7 @@
 /// 使用方式：
 ///   import 'porter_stemmer.dart';
 ///   final stem = porterStem('running'); // 'run'
-library porter_stemmer;
+library;
 
 /// 对外暴露的唯一入口函数。
 ///

@@ -4,28 +4,60 @@ import 'package:file_picker/file_picker.dart';
 import 'dart:io';
 import 'dart:convert';
 import 'dart:async';
+import 'dart:isolate' show Isolate;
 import 'dart:typed_data';
-import 'package:flutter/services.dart' show rootBundle, Clipboard, ClipboardData;
+import 'package:flutter/services.dart'
+    show Clipboard, ClipboardData;
 import 'package:flutter/gestures.dart';
 import 'package:archive/archive.dart';
 import 'package:xml/xml.dart';
+import 'package:pdfrx/pdfrx.dart';
+import 'package:fast_gbk/fast_gbk.dart' show gbk;
 import 'package:path_provider/path_provider.dart';
 import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 import 'theme/app_theme.dart';
+import 'theme/esw_tokens.dart';
+import 'widgets/esw_widgets.dart';
+import 'pages/search_page.dart';
+import 'pages/detect_page.dart';
+import 'pages/word_bank_page.dart';
 import 'shared/vocab_service.dart';
 import 'shared/word_sync_service.dart';
 import 'shared/doc_extractor.dart';
 import 'shared/export_extra_table.dart';
 import 'shared/base_word_candidates.dart';
+import 'shared/inplace_docx_annotator.dart';
+import 'shared/app_snack_bar.dart';
+import 'shared/export_progress_overlay.dart';
 import 'dictionary_service.dart';
 
-/// 涓婃瀵煎嚭璺緞锛堟ā鍧楃骇璁板繂锛岄伩鍏嶆瘡娆￠噸鏂伴€夋嫨锛?
+/// 生成导出文件名：ESW + 原文件名(去扩展名) + 检测结果 + 时间戳防重后缀。
+/// 源文件场景取 widget.fileName；为空（粘贴文本）时用「文本检测」兜底；
+/// 过滤 Windows 非法字符（\ / : * ? " < > | 及首尾空格）。
+String _exportBaseName(String rawFileName, String stamp) {
+  var name = rawFileName.trim();
+  if (name.isEmpty) name = '文本检测';
+  final dot = name.lastIndexOf('.');
+  if (dot > 0) name = name.substring(0, dot);
+  name = name.replaceAll(RegExp(r'[\\/:*?"<>|]'), '').trim();
+  if (name.isEmpty) name = '文本检测';
+  return 'ESW$name检测结果_$stamp';
+}
+
+/// 应用文档目录缓存：启动路径多处获取同一目录，跨插件通道 await 有固定开销，缓存一次复用。
+String? _cachedAppDocDir;
+Future<String> _appDocDir() async {
+  final c = _cachedAppDocDir;
+  if (c != null) return c;
+  final dir = await getApplicationDocumentsDirectory();
+  _cachedAppDocDir = dir.path;
+  return dir.path;
+}
+
+/// 上次导出路径（模块级记忆，避免每次重新选择）
 String? _lastExportPath;
 String? _lastVocabExportPath;
-
-final RegExp _controlCharRegex = RegExp(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]');
-final RegExp _whitespaceRegex = RegExp(r'\s+');
 
 class AndroidEswApp extends StatefulWidget {
   const AndroidEswApp({super.key});
@@ -38,12 +70,32 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
   int _currentIndex = 0;
   final VocabService _vocab = VocabService();
 
-  /// 文本检测嬪巻鍙茶褰?
+  /// 文本检测历史记录
   final List<_DetectHistory> _detectHistory = [];
 
   /// corpus 词频索引缓存（O(1) 查表，替代 getWordFrequency 全量扫描）
-  Map<String, int>? _corpusIndex;
-  bool _corpusIndexLoading = false;
+
+  /// 已导入真题文件数（-1 表示尚未统计完成）
+  int _corpusFileCount = -1;
+
+  /// 已导入教材文件数（-1 表示尚未统计完成）
+  int _textbookFileCount = -1;
+
+  /// 按年份统计的真题语料词库命中单词数（{年份: 命中次数}）。
+  /// null 表示尚未统计完成 / 加载中；空 Map 表示无年份数据。
+  Map<int, int>? _yearHitCounts;
+
+  /// 按教材文件统计的教材语料词库命中单词数（{教材名(去扩展名): 命中次数}）。
+  /// null 表示尚未统计完成 / 加载中；空 Map 表示无教材数据。
+  Map<String, int>? _textbookHitCounts;
+
+  /// 按年份统计的真题语料命中明细（{年份: [单词 + 词性/分类]}），
+  /// 供检测页点击年份格展开查看。与 _yearHitCounts 同批统计。
+  Map<int, List<CorpusHitWord>>? _yearHitWords;
+
+  /// 按教材文件统计的教材语料命中明细（{教材名(去扩展名): [单词 + 词性/分类]}），
+  /// 供检测页点击教材格展开查看。
+  Map<String, List<CorpusHitWord>>? _textbookHitWords;
   bool _syncing = false;
   final WordSyncService _wordSyncService = WordSyncService();
   String _userId = '';
@@ -71,18 +123,114 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
   }
 
   Future<void> _initApp() async {
-    // 三项初始化相互独立，并行执行以缩短首屏等待
+    // 各项初始化相互独立，并行执行以缩短首屏等待
     await Future.wait([
       _vocab.loadStandardWords(),
-      _extractCorpus(),
       _loadConfig(),
+      _refreshCorpusCount(),
+      _refreshTextbookCount(),
     ]);
     if (mounted) setState(() {});
+    _maybePromptSync();
+    // 后台统计按年份命中单词数（不阻塞首屏，检测页显示"加载中…"直至完成）
+    _refreshYearHitCounts();
+  }
+
+  /// 启动同步词库提示：首帧后弹窗提醒"词库可能不是最新"，用户可选择
+  /// "去同步"（直接触发 _syncVocab）或"暂不"。
+  Future<void> _maybePromptSync() async {
+    if (!mounted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      final goSync = await showDialog<bool>(
+        context: context,
+        builder: (dctx) => AlertDialog(
+          title: const Text('同步词库'),
+          content: const Text('词库可能不是最新，请前往词库页同步。'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dctx, false),
+              child: const Text('暂不'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dctx, true),
+              child: const Text('去同步'),
+            ),
+          ],
+        ),
+      );
+      if (goSync == true && mounted) {
+        await _syncVocab();
+      }
+    });
+  }
+
+  /// 应用文档目录/corpus 下是否已有真题 txt（真题语料可用）。
+  Future<bool> _hasRealCorpus() async {
+    try {
+      final p = await _corpusDirPath();
+      final d = Directory(p);
+      if (!await d.exists()) return false;
+      await for (final e in d.list()) {
+        if (e is File && e.path.toLowerCase().endsWith('.txt')) return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  /// 弹窗引导用户导入真题或教材（词库同步完成/导出高频前调用）。
+  /// 返回 true 表示已具备真题语料，false 表示用户未导入/取消。
+  /// 未导入时明确提示"无法完成真题单词检测"。
+  Future<bool> _promptCorpusImport() async {
+    if (await _hasRealCorpus()) return true;
+    if (!mounted) return false;
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (dctx) => AlertDialog(
+        title: const Text('需要真题/教材语料'),
+        content: const Text(
+          '真题单词检测需要真题或教材语料支撑。请先导入真题或教材；'
+          '若不导入，将无法完成真题单词检测。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dctx, 'textbook'),
+            child: const Text('导入教材'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dctx, 'exam'),
+            child: const Text('导入真题'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dctx, 'later'),
+            child: const Text('暂不'),
+          ),
+        ],
+      ),
+    );
+    if (choice == 'exam') {
+      await _importCorpus();
+    } else if (choice == 'textbook') {
+      await _importTextbook();
+    }
+    if (await _hasRealCorpus()) return true;
+    if (mounted) {
+      showAppSnackBar(context, '无法完成真题单词检测：请先导入真题或教材语料', type: AppSnackBarType.error);
+    }
+    return false;
+  }
+
+  /// 词库同步完成后提示导入真题/教材（未导入则提示无法完成真题单词检测）。
+  Future<void> _maybePromptCorpusImport() async {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      await _promptCorpusImport();
+    });
   }
 
   Future<String> _getConfigPath() async {
-    final dir = await getApplicationDocumentsDirectory();
-    return '${dir.path}/esw_android_config.json';
+    final dir = await _appDocDir();
+    return '$dir/esw_android_config.json';
   }
 
   Future<void> _loadConfig() async {
@@ -219,13 +367,12 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
       if (mounted) {
         setState(() {});
         final msg = remoteChanges.isEmpty ? '同步完成 (已是最新)' : '同步完成 (已处理${remoteChanges.length}条云端变更)';
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+        showAppSnackBar(context, msg, type: AppSnackBarType.success);
+        _maybePromptCorpusImport();
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('同步失败: $e'), duration: const Duration(seconds: 4)),
-        );
+        showAppSnackBar(context, '同步失败: $e', type: AppSnackBarType.error, duration: const Duration(seconds: 4));
       }
     } finally {
       if (mounted) setState(() => _syncing = false);
@@ -381,7 +528,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                             });
                           }
                         },
-                        child: Text('全部拒绝（${rejectCount()}）', style: const TextStyle(fontSize: 12)),
+                        child: Text('全部拒绝（${rejectCount()}）', style: EswText.bodySmall),
                       ),
                     ],
                   ),
@@ -401,7 +548,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                             (ch['reason'] as String?) == 'remote_deleted'
                                 ? '云端已删除'
                                 : '${ch['old_category'] ?? '无'} → ${ch['new_category'] ?? ''}',
-                            style: const TextStyle(fontSize: 12),
+                            style: EswText.bodySmall,
                           ),
                           value: isAccepted,
                           onChanged: (v) {
@@ -423,7 +570,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                         TextButton(
                           onPressed: () async {
                             final ok = await confirmAction('接收更新', '将应用云端更新到本地，确认执行？');
-                            if (ok) {
+                            if (ok && ctx.mounted) {
                               Navigator.pop(ctx, buildDecisions('accept'));
                             }
                           },
@@ -432,7 +579,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                         TextButton(
                           onPressed: () async {
                             final ok = await confirmAction('拒绝更新', '将拒绝云端更新，保留本地状态，确认执行？');
-                            if (ok) {
+                            if (ok && ctx.mounted) {
                               Navigator.pop(ctx, buildDecisions('reject'));
                             }
                           },
@@ -443,7 +590,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                         TextButton(
                           onPressed: () async {
                             final ok = await confirmAction('上传本地', '将自动拒绝云端更新，把本地所选单词全部上传覆盖云端，确认执行？');
-                            if (ok) {
+                            if (ok && ctx.mounted) {
                               // 一步到位：全部标记为拒绝云端更新（accepted=false），
                               // 随后 buildDecisions('upload_local') 即收集全部单词作为上传决策
                               setDialogState(() {
@@ -484,24 +631,20 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
         headers: const {'Accept': 'application/vnd.github.v3+json'},
       );
       if (resp.statusCode != 200) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('检查更新失败(${resp.statusCode})')),
-          );
+        if (context.mounted) {
+          showAppSnackBar(context, '检查更新失败(${resp.statusCode})', type: AppSnackBarType.error);
         }
         return;
       }
       final json = jsonDecode(resp.body) as Map<String, dynamic>;
       final tagName = (json['tag_name'] as String?)?.replaceFirst('v', '') ?? '0.0.0';
-      if (_compareVersions(tagName, '1.5.2') <= 0) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('已是最新版本')),
-          );
+      if (_compareVersions(tagName, '1.5.8') <= 0) {
+        if (context.mounted) {
+          showAppSnackBar(context, '已是最新版本', type: AppSnackBarType.success);
         }
         return;
       }
-      if (!mounted) return;
+      if (!context.mounted) return;
       showDialog(
         context: context,
         builder: (ctx) => AlertDialog(
@@ -509,7 +652,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Text('当前版本: 1.5.2'),
+              Text('当前版本: V1.5.8'),
               Text('最新版本: $tagName'),
               const SizedBox(height: 12),
               const Text('请选择下载入口：'),
@@ -545,7 +688,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                 ],
               ),
               const SizedBox(height: 4),
-              const Text('(密码 52pj)', style: TextStyle(fontSize: 11, color: Colors.grey)),
+              Text('(密码 52pj)', style: EswText.caption.copyWith(color: EswColors.textSecondary)),
             ],
           ),
           actions: [
@@ -554,10 +697,8 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
         ),
       );
     } catch (_) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('检查更新失败，请检查网络')),
-        );
+      if (context.mounted) {
+        showAppSnackBar(context, '检查更新失败，请检查网络', type: AppSnackBarType.error);
       }
     }
   }
@@ -573,36 +714,143 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     return 0;
   }
 
-  Future<void> _extractCorpus() async {
-    try {
-      final dir = await getApplicationDocumentsDirectory();
-      final corpusDir = Directory('${dir.path}/corpus');
-      final marker = File('${corpusDir.path}/.extracted');
-      if (await marker.exists()) return;
-      final bytes = await rootBundle.load('assets/corpus.zip');
-      final buffer = bytes.buffer.asUint8List(bytes.offsetInBytes, bytes.lengthInBytes);
-      final archive = ZipDecoder().decodeBytes(buffer);
-      if (!await corpusDir.exists()) {
-        await corpusDir.create(recursive: true);
-      }
-      for (final file in archive) {
-        final filePath = '${corpusDir.path}/${file.name}';
-        if (file.isFile) {
-          final out = File(filePath);
-          await out.create(recursive: true);
-          await out.writeAsBytes(file.content as Uint8List);
-        } else {
-          await Directory(filePath).create(recursive: true);
-        }
-      }
-      await marker.create(recursive: true);
-    } catch (_) {}
+  /// 返回真题语料目录路径（应用文档目录下的 corpus 子目录）。
+  Future<String> _corpusDirPath() async {
+    final dir = await _appDocDir();
+    return '$dir/corpus';
   }
 
-  /// 杩斿洖宸茶В鍘嬬殑鐪熼璇枡鐩綍璺緞锛堜笌 _extractCorpus 淇濇寔涓€鑷达級銆?
-  Future<String> _corpusDirPath() async {
-    final dir = await getApplicationDocumentsDirectory();
-    return '${dir.path}/corpus';
+  /// 统计 corpus 目录下已导入的真题 txt 文件数并刷新界面。
+  Future<void> _refreshCorpusCount() async {
+    int count = 0;
+    try {
+      final corpusPath = await _corpusDirPath();
+      final dir = Directory(corpusPath);
+      if (await dir.exists()) {
+        count = await dir
+            .list()
+            .where((e) => e is File && e.path.toLowerCase().endsWith('.txt'))
+            .length;
+      }
+    } catch (_) {}
+    if (mounted) setState(() => _corpusFileCount = count);
+  }
+
+  /// 按年份统计真题语料中词库命中单词数与命中明细（年份从文件名 4 位前缀提取，
+  /// 对齐高考例句年份提取逻辑），并按教材文件统计教材语料命中数与明细，
+  /// 结果供检测页"已导入语料"年份框 / 教材格展示与点击展开。
+  /// null 表示尚未完成 / 加载中；空 Map 表示无对应数据。
+  Future<void> _refreshYearHitCounts() async {
+    // 词库索引：{小写单词: {'pos': 词性, 'cat': 分类}}，供后台 isolate 查表，
+    // 一次性带出单词 + 词性/分类明细。分类优先级：专有 > 超标 > 拓展 > 课标
+    // （与词库页手动分类口径一致，后面的写入覆盖前面的）。
+    final vocabInfo = <String, Map<String, String>>{};
+    for (final entry in _vocab.standardWords.entries) {
+      final cat = entry.value['category'] ?? '';
+      vocabInfo[entry.key.toLowerCase()] = {
+        'pos': entry.value['pos'] ?? '',
+        'cat': cat.isEmpty ? '课标词' : cat,
+      };
+    }
+    for (final w in _vocab.extendWords) {
+      vocabInfo[w.toLowerCase()] = {'pos': '', 'cat': '拓展词'};
+    }
+    for (final w in _vocab.manualChaoGangWords) {
+      vocabInfo[w.toLowerCase()] = {'pos': '', 'cat': '超标词'};
+    }
+    for (final w in _vocab.manualExtraWords) {
+      vocabInfo[w.toLowerCase()] = {'pos': '', 'cat': '专有词'};
+    }
+    final corpusPath = await _corpusDirPath();
+    final textbookPath = await _textbookDirPath();
+    Map<int, int> yearCounts = const <int, int>{};
+    Map<String, int> textbookCounts = const <String, int>{};
+    Map<int, List<CorpusHitWord>> yearWords = const <int, List<CorpusHitWord>>{};
+    Map<String, List<CorpusHitWord>> textbookWords =
+        const <String, List<CorpusHitWord>>{};
+    try {
+      final results = await Future.wait([
+        Isolate.run(
+          () =>
+              _scanYearHitCountsWorker({'dirPath': corpusPath, 'vocab': vocabInfo}),
+        ),
+        Isolate.run(
+          () => _scanTextbookHitCountsWorker({
+            'dirPath': textbookPath,
+            'vocab': vocabInfo,
+          }),
+        ),
+      ]);
+      final yearRaw = results[0];
+      final textbookRaw = results[1];
+      yearCounts = yearRaw['counts'].cast<int, int>();
+      textbookCounts = textbookRaw['counts'].cast<String, int>();
+      yearWords = _decodeYearHitWords(yearRaw['words'] as Map);
+      textbookWords = _decodeTextbookHitWords(textbookRaw['words'] as Map);
+    } catch (_) {
+      yearCounts = const <int, int>{};
+      textbookCounts = const <String, int>{};
+      yearWords = const <int, List<CorpusHitWord>>{};
+      textbookWords = const <String, List<CorpusHitWord>>{};
+    }
+    if (!mounted) return;
+    setState(() {
+      _yearHitCounts = yearCounts;
+      _textbookHitCounts = textbookCounts;
+      _yearHitWords = yearWords;
+      _textbookHitWords = textbookWords;
+    });
+  }
+
+  /// 将 isolate 返回的年份命中明细（{年份: [{w,p,c}]}）还原为强类型列表。
+  static Map<int, List<CorpusHitWord>> _decodeYearHitWords(Map raw) {
+    final out = <int, List<CorpusHitWord>>{};
+    raw.forEach((key, value) {
+      out[key as int] = _decodeHitWordList(value as List);
+    });
+    return out;
+  }
+
+  /// 将 isolate 返回的教材命中明细（{教材名: [{w,p,c}]}）还原为强类型列表。
+  static Map<String, List<CorpusHitWord>> _decodeTextbookHitWords(Map raw) {
+    final out = <String, List<CorpusHitWord>>{};
+    raw.forEach((key, value) {
+      out[key as String] = _decodeHitWordList(value as List);
+    });
+    return out;
+  }
+
+  static List<CorpusHitWord> _decodeHitWordList(List raw) {
+    return [
+      for (final e in raw)
+        CorpusHitWord(
+          word: (e as Map)['w'] as String? ?? '',
+          pos: e['p'] as String? ?? '',
+          category: e['c'] as String? ?? '',
+        ),
+    ];
+  }
+
+  /// 返回教材语料目录路径（应用文档目录下的 textbook 子目录）。
+  Future<String> _textbookDirPath() async {
+    final dir = await _appDocDir();
+    return '$dir/textbook';
+  }
+
+  /// 统计 textbook 目录下已导入的教材 txt 文件数并刷新界面。
+  Future<void> _refreshTextbookCount() async {
+    int count = 0;
+    try {
+      final tbPath = await _textbookDirPath();
+      final dir = Directory(tbPath);
+      if (await dir.exists()) {
+        count = await dir
+            .list()
+            .where((e) => e is File && e.path.toLowerCase().endsWith('.txt'))
+            .length;
+      }
+    } catch (_) {}
+    if (mounted) setState(() => _textbookFileCount = count);
   }
 
   static String jsonEncode(Map<String, dynamic> data) {
@@ -616,7 +864,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFFFF8E1),
+      backgroundColor: EswColors.page,
       body: IndexedStack(
         index: _currentIndex,
         children: [
@@ -625,27 +873,34 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
           _buildVocabTab(),
         ],
       ),
-      bottomNavigationBar: NavigationBar(
-        backgroundColor: const Color(0xFFFFF8E1),
-        selectedIndex: _currentIndex,
-        onDestinationSelected: (i) => setState(() => _currentIndex = i),
-        destinations: const [
-          NavigationDestination(icon: Icon(Icons.search_outlined), selectedIcon: Icon(Icons.search), label: '查词'),
-          NavigationDestination(icon: Icon(Icons.file_open_outlined), selectedIcon: Icon(Icons.file_open), label: '检测'),
-          NavigationDestination(icon: Icon(Icons.book_outlined), selectedIcon: Icon(Icons.book), label: '词库'),
+      bottomNavigationBar: EswBottomNav(
+        currentIndex: _currentIndex,
+        onChanged: (i) => setState(() => _currentIndex = i),
+        labels: const ['查词', '检测', '词库'],
+        icons: const [
+          Icons.search_rounded,
+          Icons.description_outlined,
+          Icons.bookmark_border_rounded,
+        ],
+        selectedIcons: const [
+          Icons.search_rounded,
+          Icons.description_outlined,
+          Icons.bookmark_border_rounded,
         ],
       ),
     );
   }
 
-  // ====== Tab 1: 词库姒傝 ======
+  // ====== Tab 1: 词库概览 ======
   Widget _buildVocabTab() {
-    return _VocabTabPage(
+    return WordBankPage(
       vocab: _vocab,
       onSaveConfig: _saveConfig,
       showBaseWordDialog: _showBaseWordDialog,
       onSyncVocab: _syncVocab,
       onCheckUpdate: () => _checkUpdate(context),
+      onImportCorpus: _importCorpus,
+      onImportTextbook: _importTextbook,
       syncing: _syncing,
       wordSyncService: _wordSyncService,
       onWordTap: (word) {
@@ -656,141 +911,74 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     );
   }
 
-  // ====== Tab 2: 文本检测?======
+  // ====== Tab 2: 文本检测 ======
   Widget _buildImportTab() {
-    return SafeArea(
-      child: CustomScrollView(
-        slivers: [
-          const SliverAppBar(
-            backgroundColor: Color(0xFFFFF8E1),
-            title: Text('文本检测', style: TextStyle(fontWeight: FontWeight.bold)),
-            centerTitle: true,
-            pinned: true,
-          ),
-          SliverPadding(
-            padding: const EdgeInsets.all(16),
-            sliver: SliverToBoxAdapter(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Card(
-                    elevation: 0,
-                    color: const Color(0xFFFFF8E1),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                    child: Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          Center(
-                            child: Column(children: [
-                              Text('真题库文件数：', style: const TextStyle(fontSize: 15, color: AppTheme.primaryBlue)),
-                              Text('2005-2026，共计271套', style: const TextStyle(fontSize: 15, color: AppTheme.primaryBlue, fontWeight: FontWeight.w500)),
-                            ]),
-                          ),
-                          const SizedBox(height: 8),
-                          Text('检测文本后将自动与真题库和词库对比',
-                            textAlign: TextAlign.center,
-                            style: Theme.of(context).textTheme.bodySmall?.copyWith(color: AppTheme.textSecondary)),
-                        ],
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  OutlinedButton.icon(
-                    onPressed: _importFile,
-                    icon: const Icon(Icons.file_open),
-                    label: const Text('选择文件检测'),
-                    style: OutlinedButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(vertical: 16),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: _pasteCtrl,
-                    focusNode: _pasteFocus,
-                    maxLines: 8,
-                    minLines: 4,
-                    textAlign: TextAlign.center,
-                    decoration: InputDecoration(
-                      hintText: _pasteFocus.hasFocus ? null : '粘贴文本到这里',
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                      filled: true,
-                      fillColor: const Color(0xFFFFF8E1),
-                      alignLabelWithHint: true,
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  ElevatedButton.icon(
-                    onPressed: () {
-                      final text = _pasteCtrl.text.trim();
-                      if (text.isEmpty) {
-                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先粘贴文本')));
-                        return;
-                      }
-                      _showAnalysisResult(text, '粘贴文本');
-                    },
-                    icon: const Icon(Icons.analytics_outlined),
-                    label: const Text('开始分析'),
-                    style: const ButtonStyle(
-                      backgroundColor: WidgetStatePropertyAll(Color(0xFFFFF8E1)),
-                      padding: WidgetStatePropertyAll(EdgeInsets.symmetric(vertical: 14)),
-                    ),
-                  ),
-                  const SizedBox(height: 24),
-                  Text('支持格式: .txt / .docx', textAlign: TextAlign.center,
-                    style: TextStyle(fontSize: 12, color: Colors.grey.shade500)),
-                  const SizedBox(height: 28),
-                  // 检测历史记录?
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Center(child: Text('最近检测', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600))),
-                      ),
-                      if (_detectHistory.isNotEmpty)
-                        IconButton(
-                          icon: const Icon(Icons.delete_sweep, size: 20),
-                          tooltip: '清空历史',
-                          onPressed: () {
-                            setState(() => _detectHistory.clear());
-                          },
-                        ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  if (_detectHistory.isEmpty)
-                    Text('暂无检测记录', style: TextStyle(fontSize: 13, color: Colors.grey.shade500))
-                  else
-                    ..._detectHistory.map((h) {
-                      final summary = h.categoryCounts.entries
-                          .where((e) => e.value > 0)
-                          .map((e) => '${e.key}${e.value}')
-                          .join(' / ');
-                      final annotatedPart = h.annotatedCount > 0 ? ' · 标注词${h.annotatedCount}' : '';
-                      return Card(
-                        elevation: 0,
-                        color: const Color(0xFFFFF8E1),
-                        margin: const EdgeInsets.only(bottom: 6),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                        child: ListTile(
-                          leading: const Icon(Icons.history, size: 20, color: AppTheme.textSecondary),
-                          title: Text(h.fileName, style: const TextStyle(fontWeight: FontWeight.w500, fontSize: 14)),
-                          subtitle: Text(
-                            '${_formatTime(h.time)} · ${h.totalWords}词${summary.isNotEmpty ? ' · $summary' : ''}$annotatedPart',
-                            style: const TextStyle(fontSize: 12, color: AppTheme.textSecondary),
-                          ),
-                          trailing: const Icon(Icons.chevron_right, size: 18),
-                          onTap: () => _showAnalysisResult(h.text, h.fileName),
-                          dense: true,
-                        ),
-                      );
-                    }),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
+    return DetectPage(
+      corpusCount: _corpusFileCount < 0 ? null : _corpusFileCount,
+      textbookCount: _textbookFileCount < 0 ? null : _textbookFileCount,
+      yearHits: _yearHitCounts,
+      textbookHits: _textbookHitCounts,
+      yearHitWords: _yearHitWords,
+      textbookHitWords: _textbookHitWords,
+      categoryCounts: [
+        _vocab.standardWords.length,
+        _vocab.extendWords.length,
+        _vocab.manualChaoGangWords.length,
+        _vocab.manualExtraWords.length,
+      ],
+      onImportCorpus: _importCorpus,
+      onImportTextbook: _importTextbook,
+      onImportFile: _importFile,
+      pasteController: _pasteCtrl,
+      pasteFocus: _pasteFocus,
+      onAnalyze: (text) {
+        final t = text.trim();
+        if (t.isEmpty) {
+          showAppSnackBar(context, '请先粘贴文本', type: AppSnackBarType.info);
+          return;
+        }
+        _showAnalysisResult(t, '粘贴文本');
+      },
+      history: _detectHistory.map((h) {
+        final summary = h.categoryCounts.entries
+            .where((e) => e.value > 0)
+            .map((e) => '${e.key}${e.value}')
+            .join(' / ');
+        final annotatedPart = h.annotatedCount > 0 ? ' · 标注词${h.annotatedCount}' : '';
+        return DetectHistoryItem(
+          fileName: h.fileName,
+          subtitle:
+              '${_formatTime(h.time)} · ${h.totalWords}词${summary.isNotEmpty ? ' · $summary' : ''}$annotatedPart',
+          onTap: () async {
+            final src = h.sourcePath;
+            if (src == null || src.isEmpty) {
+              showAppSnackBar(context, '该历史项未保留原文（粘贴/已清理），请重新导入原文件检测', type: AppSnackBarType.info);
+              return;
+            }
+            try {
+              // P6：历史不存全文，重看时按源路径在后台 isolate 内重新提取
+              // 先提取纯数据再进闭包，避免捕获整个 _DetectHistory（自定义类不可发送）
+              final name = h.fileName;
+              final content = await Isolate.run(
+                () => _extractImportContentFromPathWorker(
+                    {'path': src, 'name': name}),
+              );
+              if (content.trim().isEmpty) {
+                if (!mounted) return;
+                showAppSnackBar(context, '原文件内容为空或不可读，请重新导入', type: AppSnackBarType.error);
+                return;
+              }
+              _showAnalysisResult(content, h.fileName, sourcePath: src);
+            } catch (e) {
+              if (!mounted) return;
+              showAppSnackBar(context, '重看失败（原文件可能已移动或删除）：$e', type: AppSnackBarType.error);
+            }
+          },
+        );
+      }).toList(),
+      onClearHistory: () {
+        setState(() => _detectHistory.clear());
+      },
     );
   }
 
@@ -799,74 +987,268 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     return '${t.year}-${pad(t.month)}-${pad(t.day)} ${pad(t.hour)}:${pad(t.minute)}';
   }
 
-  /// 瑙ｆ瀽 DOCX 鏂囦欢涓虹函鏂囨湰锛欴OCX 鏈川鏄?ZIP 鍖咃紝鍐呭惈 word/document.xml銆?
-  Future<String> _readDocxContent(String filePath) async {
-    final bytes = await File(filePath).readAsBytes();
-    final archive = ZipDecoder().decodeBytes(bytes);
-    for (final f in archive) {
-      if (f.name == 'word/document.xml') {
-        final content = utf8.decode(f.content as List<int>);
-        final document = XmlDocument.parse(content);
-        final paragraphs = document.findAllElements('w:p');
-        final lines = paragraphs.map((p) {
-          final texts = p.findAllElements('w:t');
-          return texts.map((t) => t.innerText).join('');
-        }).where((line) => line.trim().isNotEmpty);
-        return lines.join('\n');
+  /// 按路径读取 PDF 并提取纯文本（Android 端 PDF 解析，主 isolate 执行）。
+  /// pdfrx 的文本层提取不依赖渲染引擎，仅需 PdfDocument.openData + loadText。
+  Future<String> _readPdfFileByPath(String path) async {
+    final bytes = await File(path).readAsBytes();
+    return _readPdfContentAndroid(bytes);
+  }
+
+  /// 从 PDF bytes 中提取纯文本（Android 端无 OCR 引擎，纯文本层提取）。
+  Future<String> _readPdfContentAndroid(List<int> raw) async {
+    final document =
+        await PdfDocument.openData(Uint8List.fromList(raw));
+    try {
+      final buffer = StringBuffer();
+      bool hasText = false;
+      for (int i = 0; i < document.pages.length; i++) {
+        final pageText = await document.pages[i].loadText();
+        final text = pageText.fullText;
+        if (text.isNotEmpty) {
+          buffer.writeln(text);
+          hasText = true;
+        }
+      }
+      return hasText ? buffer.toString().trim() : '';
+    } finally {
+      document.dispose();
+    }
+  }
+
+  /// 真题导入：多选 txt/doc/docx，转存为 corpus 子目录同名 .txt，
+  /// 并删除 corpus_index.json 触发索引重建。词频统计与例句提取自动基于导入语料。
+  Future<void> _importCorpus() async {
+    // P4：Android 端不再 withData（整文件随选带回会载入 UI 堆），
+    // 仅取 file.path，解析在后台 worker 内按路径读取。
+    final result = await FilePicker.pickFiles(
+      dialogTitle: '选择真题文件',
+      allowMultiple: true,
+      type: FileType.custom,
+      allowedExtensions: ['txt', 'doc', 'docx', 'pdf'],
+    );
+    if (result == null || result.files.isEmpty) return;
+
+    final corpusDir = Directory(await _corpusDirPath());
+    if (!await corpusDir.exists()) {
+      await corpusDir.create(recursive: true);
+    }
+
+    int success = 0;
+    final failed = <String>[];
+    for (final f in result.files) {
+      try {
+        // P4：文件字节在 worker 内按 path 读取并解析，不整文件载入 UI 堆
+        if (f.path == null) throw Exception('无法读取文件内容');
+        // 先提取纯数据再进闭包，避免捕获整个 PlatformFile（含 XFile 等不可发送字段）
+        final p = f.path;
+        final n = f.name;
+        // PDF 依赖 pdfrx（native + async），在主 isolate 解析；其余格式走后台 isolate worker
+        final content = n.toLowerCase().endsWith('.pdf')
+            ? await _readPdfFileByPath(p!)
+            : await Isolate.run(
+                () => _extractImportContentFromPathWorker({'path': p, 'name': n}),
+              );
+        if (content.trim().isEmpty) {
+          failed.add('${f.name}（内容为空）');
+          continue;
+        }
+        // 保留原名去扩展名，如 2023全国卷I.docx → 2023全国卷I.txt
+        final dotIdx = f.name.lastIndexOf('.');
+        final baseName = dotIdx > 0 ? f.name.substring(0, dotIdx) : f.name;
+        final out = File('${corpusDir.path}/$baseName.txt');
+        await out.writeAsString(content);
+        success++;
+      } catch (e) {
+        failed.add('${f.name}（$e）');
       }
     }
-    throw Exception('word/document.xml not found in docx');
+
+    // 触发索引重建：删除旧 corpus_index.json 并清空内存缓存
+    try {
+      final indexFile = File('${corpusDir.path}/corpus_index.json');
+      if (await indexFile.exists()) await indexFile.delete();
+    } catch (_) {}
+
+    await _refreshCorpusCount();
+    // 语料变更后重新统计年份命中单词数（后台，不阻塞提示条）
+    _refreshYearHitCounts();
+    if (!mounted) return;
+    showAppSnackBar(context, success > 0 ? '成功导入 $success 个真题文件' : '导入失败，请检查文件格式：${failed.join('；')}', type: AppSnackBarType.info);
+    if (failed.isNotEmpty) {
+      showAppSnackBar(context, '以下文件导入失败：${failed.join('；')}', type: AppSnackBarType.error);
+    }
+    setState(() {});
+  }
+
+  /// 教材导入：多选 txt/doc/docx，转存为 textbook 子目录同名 .txt，
+  /// 作为教材例句源参与检测与导出（对齐 Windows 版教材导入逻辑）。
+  Future<void> _importTextbook() async {
+    // P4：同 _importCorpus，仅取 path，解析在 worker 内按路径读取。
+    final result = await FilePicker.pickFiles(
+      dialogTitle: '选择教材文件',
+      allowMultiple: true,
+      type: FileType.custom,
+      allowedExtensions: ['txt', 'doc', 'docx', 'pdf'],
+    );
+    if (result == null || result.files.isEmpty) return;
+
+    final tbDir = Directory(await _textbookDirPath());
+    if (!await tbDir.exists()) {
+      await tbDir.create(recursive: true);
+    }
+
+    int success = 0;
+    final failed = <String>[];
+    for (final f in result.files) {
+      try {
+        // P4：文件字节在 worker 内按 path 读取并解析，不整文件载入 UI 堆
+        if (f.path == null) throw Exception('无法读取文件内容');
+        // 先提取纯数据再进闭包，避免捕获整个 PlatformFile（含 XFile 等不可发送字段）
+        final p = f.path;
+        final n = f.name;
+        // PDF 依赖 pdfrx（native + async），在主 isolate 解析；其余格式走后台 isolate worker
+        final content = n.toLowerCase().endsWith('.pdf')
+            ? await _readPdfFileByPath(p!)
+            : await Isolate.run(
+                () => _extractImportContentFromPathWorker({'path': p, 'name': n}),
+              );
+        if (content.trim().isEmpty) {
+          failed.add('${f.name}（内容为空）');
+          continue;
+        }
+        // 保留原名去扩展名，如 人教版必修一.docx → 人教版必修一.txt
+        final dotIdx = f.name.lastIndexOf('.');
+        final baseName = dotIdx > 0 ? f.name.substring(0, dotIdx) : f.name;
+        final out = File('${tbDir.path}/$baseName.txt');
+        await out.writeAsString(content);
+        success++;
+      } catch (e) {
+        failed.add('${f.name}（$e）');
+      }
+    }
+
+    await _refreshTextbookCount();
+    // 教材语料变更后重新统计教材与真题命中单词数（后台，不阻塞提示条）
+    _refreshYearHitCounts();
+    if (!mounted) return;
+    showAppSnackBar(context, success > 0 ? '成功导入 $success 个教材文件' : '导入失败，请检查文件格式：${failed.join('；')}', type: AppSnackBarType.info);
+    if (failed.isNotEmpty) {
+      showAppSnackBar(context, '以下教材文件导入失败：${failed.join('；')}', type: AppSnackBarType.error);
+    }
+    setState(() {});
   }
 
   Future<void> _importFile() async {
+    // P4：同导入流程，仅取 path，字节在 worker 内读取。
     final result = await FilePicker.pickFiles(
       type: FileType.custom,
-      allowedExtensions: ['txt', 'doc', 'docx'],
+      allowedExtensions: ['txt', 'doc', 'docx', 'pdf'],
     );
     if (result == null || result.files.isEmpty) return;
 
     final file = result.files.single;
-    final lowerName = file.name.toLowerCase();
     String content;
 
     try {
-      if (lowerName.endsWith('.doc')) {
-        // 鏃х増 .doc 涓轰簩杩涘埗鏍煎紡锛屾棤娉曠洿鎺ヨВ鏋愶紝灏濊瘯鎻愬彇鍙鏂囨湰娈点€?
-        if (file.bytes != null) {
-          content = extractDocText(file.bytes!);
-        } else if (file.path != null) {
-          final raw = await File(file.path!).readAsBytes();
-          content = extractDocText(raw);
-        } else {
-          throw Exception('无法读取文件内容');
+      final filePath = file.path;
+      if (filePath == null) throw Exception('无法读取文件内容');
+      // 仅取文件大小用于估算/预检，不读取全量字节到 UI 堆
+      final rawLen = await File(filePath).length();
+
+      // 大文件检测前弹窗：按字节量估算文本提取 + 分析的等待时长，避免"无提示卡住"
+      final estSec = _estimateDetectSeconds(rawLen, file.name);
+      final estText =
+          estSec >= 60 ? '约 ${(estSec ~/ 60).toString()} 分钟' : '约 $estSec 秒';
+
+      // 内存能力预检：估算提取字符量并对照「页数/字符 → 内存」模型，
+      // 超出本机安全上限时先弹窗提示可处理页数上限，避免检测中 OOM 闪退无结果。
+      final estChars = _estimateCharsOf(rawLen, file.name);
+      final maxChars = _maxCapableChars();
+      final overCapable = estChars > maxChars;
+      if (overCapable) {
+        final maxPages = (maxChars / 1800).floor(); // 按每页约 1800 字符换算
+        final curPages = (estChars / 1800).ceil();
+        if (mounted) {
+          final goCap = await showDialog<bool>(
+            context: context,
+            builder: (ctx) => AlertDialog(
+              title: const Text('文档超出本机处理能力'),
+              content: Text(
+                '本机最大可处理约 $maxPages 页（约 ${(maxChars / 10000).round()} 万字符），'
+                '当前文档约 $curPages 页（约 ${(estChars / 10000).round()} 万字符），'
+                '继续检测可能因内存不足闪退且无结果。\n\n'
+                '建议：拆分文档（如按年份/单元拆分）或压缩后重试。',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(ctx).pop(false),
+                  child: const Text('取消'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.of(ctx).pop(true),
+                  child: const Text('仍然尝试'),
+                ),
+              ],
+            ),
+          );
+          if (goCap != true) return;
         }
-        if (content.trim().isEmpty) {
-          throw Exception('暂不支持旧版 .doc，请转换专.docx 成.txt');
-        }
-      } else if (lowerName.endsWith('.docx')) {
-        // DOCX 涓?ZIP 鍖咃紝瑙ｅ帇鍚庤В鏋?word/document.xml 鎻愬彇鏂囨湰
-        if (file.path != null) {
-          content = await _readDocxContent(file.path!);
-        } else if (file.bytes != null) {
-          final tmp = File('${(await getTemporaryDirectory()).path}/_import_${DateTime.now().microsecondsSinceEpoch}.docx');
-          await tmp.writeAsBytes(file.bytes!);
-          content = await _readDocxContent(tmp.path);
-          await tmp.delete();
-        } else {
-          throw Exception('无法读取文件内容');
-        }
-      } else if (file.path != null) {
-        content = await File(file.path!).readAsString();
-      } else if (file.bytes != null) {
-        content = utf8.decode(file.bytes!);
-      } else {
-        throw Exception('无法读取文件内容');
       }
+
+      if (mounted) {
+        final go = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('检测大文件'),
+            content: Text(
+              rawLen >= 200 * 1024
+                  ? '该文件较大（${(rawLen / 1024 / 1024).toStringAsFixed(1)} MB），检测需要处理完整文档内容，预计$estText。处理期间界面会保持响应，请耐心等待，不要重复点击。'
+                  : '检测该文件预计需要$estText，是否继续？',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(false),
+                child: const Text('取消'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(ctx).pop(true),
+                child: const Text('继续检测'),
+              ),
+            ],
+          ),
+        );
+        if (go != true) return;
+      }
+
+      // 提取阶段进度提示框（不 await，提取完成后统一关闭）
+      if (!mounted) return;
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => AlertDialog(
+          content: const Row(
+            children: [
+              SizedBox(width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2.5)),
+              SizedBox(width: 16),
+              Expanded(child: Text('正在提取文档文本…', style: TextStyle(fontSize: 14))),
+            ],
+          ),
+        ),
+      );
+      // 先提取纯数据再进闭包，避免捕获整个 PlatformFile（含 XFile 等不可发送字段）
+      final p = filePath;
+      final n = file.name;
+      // PDF 依赖 pdfrx（native + async），在主 isolate 解析；其余格式走后台 isolate worker
+      content = n.toLowerCase().endsWith('.pdf')
+          ? await _readPdfFileByPath(p)
+          : await Isolate.run(
+              () => _extractImportContentFromPathWorker({'path': p, 'name': n}),
+            );
+      if (mounted) Navigator.of(context, rootNavigator: true).pop();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("文件读取失败: $e")),
-        );
+        Navigator.of(context, rootNavigator: true).pop();
+        showAppSnackBar(context, "文件读取失败: $e", type: AppSnackBarType.error);
       }
       return;
     }
@@ -897,15 +1279,65 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     }
 
     if (mounted) {
-      _showAnalysisResult(content, file.name);
+      _showAnalysisResult(content, file.name, sourcePath: file.path);
     }
   }
 
-  Future<void> _showAnalysisResult(String text, String fileName) async {
+  /// 估算单文件检测总耗时（秒）：文本提取 + 分析。
+  /// 提取：按源字节量估算（大 .doc/.docx 提取较慢，留余量）；
+  /// 分析：按预估提取字符量估算（约每 20 万字符 1 秒，保守系数 2）。
+  int _estimateDetectSeconds(int rawBytes, String name) {
+    final ext = name.toLowerCase();
+    final extractPerMbSec =
+        (ext.endsWith('.doc') || ext.endsWith('.docx')) ? 8.0 : 2.0;
+    final mb = rawBytes / 1024 / 1024;
+    final extractSec = mb * extractPerMbSec;
+    // 提取文本量估算：docx/doc 压缩比约 0.5，txt 按 1.0
+    final estimatedChars = rawBytes * (ext.endsWith('.txt') ? 1.0 : 0.5);
+    final analyzeSec = (estimatedChars / 200000) * 2.0;
+    return (extractSec + analyzeSec).ceil().clamp(1, 1800);
+  }
+
+  /// 预估提取文本量（字符）：doc/docx 按字节压缩比 0.35（实测样例
+  /// 3589632 字节 → 806138 字符，压缩比约 0.22，留安全裕量取 0.35），
+  /// txt 按 1.0。
+  int _estimateCharsOf(int rawBytes, String name) {
+    final ext = name.toLowerCase();
+    final ratio = ext.endsWith('.txt') ? 1.0 : 0.35;
+    return (rawBytes * ratio).round();
+  }
+
+  /// 本机安全堆可承载的最大检测字符量（页数/字符 → 内存模型）。
+  ///
+  /// 定量依据（Dart VM 实测，Windows 上对《全国高考英语试题2017-2021.doc》
+  /// 806138 字符逐阶段 RSS 增量）：doc 提取 ~11.5 B/字符、分析 ~1~4 B/字符、
+  /// 标注全文 ~2.4 B/字符、导出明细构建 ~9.8 B/字符、单真题语料索引 ~2.3 B/字符。
+  /// Android 侧还需叠加：后台 isolate 传输副本（文本/词表双份）、Flutter 引擎
+  /// 常驻（约 60~90MB）、页面/词库常驻与 heap 碎片，按实测闪退样本
+  /// （806K 字符在 192MB 级堆闪退）反标定全链路约 124 B/字符（安全系数 ≥2）。
+  ///
+  /// 上限取「AndroidManifest 已开启 largeHeap → 512MB 级堆的 45% 可用」；
+  /// 未生效设备按 192MB 级堆的 40% 兜底。返回字符数。
+  int _maxCapableChars() {
+    const bpc = 124; // 全链路每字符峰值内存（字节）
+    const largeHeapBytes = 512 * 1024 * 1024;
+    const normalHeapBytes = 192 * 1024 * 1024;
+    final safeBytes = (largeHeapBytes * 45 ~/ 100) > (normalHeapBytes * 40 ~/ 100)
+        ? largeHeapBytes * 45 ~/ 100
+        : normalHeapBytes * 40 ~/ 100;
+    return safeBytes ~/ bpc;
+  }
+
+  Future<void> _showAnalysisResult(
+    String text,
+    String fileName, {
+    String? sourcePath,
+  }) async {
     final result = await Navigator.of(context).push<Map<String, dynamic>>(MaterialPageRoute(
       builder: (_) => _AnalysisPage(
         text: text,
         fileName: fileName,
+        sourcePath: sourcePath,
         vocab: _vocab,
         onSaveConfig: _saveConfig,
         wordSyncService: _wordSyncService,
@@ -917,7 +1349,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
         },
       ),
     ));
-    // 杩斿洖鍚庢竻绌鸿緭鍏ユ
+    // 返回后清空输入框
     _pasteCtrl.clear();
     if (result != null && mounted) {
       setState(() {
@@ -926,9 +1358,13 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
           time: DateTime.now(),
           totalWords: result['totalWords'] as int,
           categoryCounts: Map<String, int>.from(result['categoryCounts'] as Map),
-          text: result['text'] as String,
+          sourcePath: result['sourcePath'] as String?,
           annotatedCount: result['annotatedCount'] as int? ?? 0,
         ));
+        // 限制历史条数，避免大文本全文驻留导致内存累积 OOM
+        if (_detectHistory.length > 8) {
+          _detectHistory.removeRange(8, _detectHistory.length);
+        }
       });
     }
   }
@@ -945,7 +1381,6 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
   String _wordCategory = '';
   String? _wordFormDesc;
   Map<String, dynamic>? _lastFreqData;
-  bool _hasFreq = false;
 
   Widget _buildSearchTab() {
     return PopScope(
@@ -959,116 +1394,54 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
           _searchCtrl.clear();
         });
       },
-      child: SafeArea(
-      child: CustomScrollView(
-        slivers: [
-          SliverAppBar(
-            backgroundColor: const Color(0xFFFFF8E1),
-            title: const Text('真题查词', style: TextStyle(fontWeight: FontWeight.bold)),
-            centerTitle: true,
-            pinned: true,
-          ),
-          SliverPadding(
-            padding: const EdgeInsets.all(16),
-            sliver: SliverToBoxAdapter(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  if (_query.isEmpty && _searchResult.isEmpty && _vocab.wordHistory.isEmpty)
-                    const Spacer(flex: 3),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    child: Container(
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(16),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withOpacity(0.06),
-                            blurRadius: 12,
-                            offset: const Offset(0, 2),
-                          ),
-                        ],
-                      ),
-                      child: TextField(
-                        controller: _searchCtrl,
-                        focusNode: _searchFocus,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(fontSize: 16),
-                        decoration: InputDecoration(
-                          hintText: _searchFocus.hasFocus ? null : '输入英文单词',
-                          hintStyle: const TextStyle(color: Colors.grey, fontSize: 15),
-                          prefixIcon: const Padding(
-                            padding: EdgeInsets.only(left: 12, right: 4),
-                            child: Icon(Icons.search, color: Colors.grey, size: 22),
-                          ),
-                          suffixIcon: IconButton(
-                            icon: const Icon(Icons.clear, size: 20),
-                            onPressed: () {
-                              _searchCtrl.clear();
-                              setState(() {
-                                _query = '';
-                                _searchResult = '';
-                                _wordInfo = null;
-                              });
-                            },
-                          ),
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(16),
-                            borderSide: BorderSide.none,
-                          ),
-                          filled: true,
-                          fillColor: const Color(0xFFFFF8E1),
-                          contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-                        ),
-                        onChanged: _onSearchChanged,
-                        onSubmitted: (w) {
-                          _searchDebounce?.cancel();
-                          _lookupWord(w);
-                        },
-                        textInputAction: TextInputAction.search,
-                      ),
-                    ),
-                  ),
-                  if (_query.isEmpty && _searchResult.isEmpty && _vocab.wordHistory.isEmpty)
-                    const Spacer(flex: 5),
-                  if (_searchResult.isNotEmpty) ...[
-                    const SizedBox(height: 24),
-                    _buildWordResult(),
-                  ],
-                  if (_query.isEmpty && _searchResult.isEmpty && _vocab.wordHistory.isNotEmpty) ...[
-                    const SizedBox(height: 24),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Center(child: Text('最近查询', style: Theme.of(context).textTheme.titleSmall?.copyWith(color: AppTheme.textSecondary))),
-                        ),
-                        IconButton(
-                          icon: const Icon(Icons.delete_sweep, size: 20),
-                          tooltip: '清除历史',
-                          onPressed: () {
-                            setState(() {
-                              _vocab.wordHistory.clear();
-                              _saveConfig();
-                            });
-                          },
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    ..._vocab.wordHistory.map((w) => _HistoryTile(word: w, onTap: () {
-                      _searchCtrl.text = w;
-                      _query = w;
-                      _lookupWord(w);
-                    })),
-                  ],
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
+      child: SearchPage(
+        controller: _searchCtrl,
+        focusNode: _searchFocus,
+        onChanged: _onSearchChanged,
+        onSubmitted: (w) {
+          _searchDebounce?.cancel();
+          _lookupWord(w);
+        },
+        resultVisible: _searchResult.isNotEmpty,
+        resultBuilder: (_) => _buildWordResult(),
+        history: _vocab.wordHistory,
+        subtitleOf: _historySubtitle,
+        onClearHistory: () {
+          setState(() {
+            _vocab.wordHistory.clear();
+            _saveConfig();
+          });
+        },
+        onHistoryTap: (w) {
+          _searchCtrl.text = w;
+          _query = w;
+          _lookupWord(w);
+        },
       ),
     );
+  }
+
+  /// 历史词副标题：词义 + 词性（取自离线词典，异步）。无数据时给兜底文案。
+  Future<String> _historySubtitle(String word) async {
+    final info = _vocab.lookup(word);
+    final def = info['def']?.trim() ?? '';
+    final pos = info['pos']?.trim() ?? '';
+    final parts = <String>[];
+    if (def.isNotEmpty) {
+      parts.add(def.split('\n').first.trim());
+    }
+    if (pos.isNotEmpty) {
+      parts.add(pos.split(RegExp(r'\s*/\s*')).first.trim());
+    }
+    if (parts.isEmpty) {
+      final manualCat = _currentManualCategory(word.toLowerCase());
+      if (manualCat != null) {
+        parts.add(manualCat);
+      } else {
+        parts.add('点击查看词义与真题出处');
+      }
+    }
+    return parts.join(' · ');
   }
 
   void _onSearchChanged(String value) {
@@ -1077,28 +1450,6 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     _searchDebounce = Timer(const Duration(seconds: 1), () {
       _lookupWord(value.trim());
     });
-  }
-
-  // 懒加载 corpus 词频索引（仅首次触发扫描，之后 O(1) 查表）
-  Future<bool> _loadCorpusFreq(String word) async {
-    if (_corpusIndex != null) {
-      return (_corpusIndex![word.toLowerCase()] ?? 0) > 0;
-    }
-    if (_corpusIndexLoading) return false;
-    _corpusIndexLoading = true;
-    try {
-      final corpusPath = await _corpusDirPath();
-      final indexFile = File('$corpusPath/corpus_index.json');
-      if (indexFile.existsSync()) {
-        final json = await indexFile.readAsString();
-        final decoded = jsonDecode(json) as Map<String, dynamic>;
-        _corpusIndex = {for (final e in decoded.entries) e.key: (e.value as num).toInt()};
-      }
-    } catch (_) {
-    } finally {
-      _corpusIndexLoading = false;
-    }
-    return (_corpusIndex?[word.toLowerCase()] ?? 0) > 0;
   }
 
   void _lookupWord(String word) {
@@ -1125,19 +1476,11 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
       _wordInfo = info.isNotEmpty ? info : null;
       _wordCategory = cat;
       _wordFormDesc = null;
-      _hasFreq = false;
-    });
-
-    // 查 corpus 词频索引（O(1)，懒加载一次）
-    _loadCorpusFreq(word).then((hasFreq) {
-      if (mounted && _searchResult == word) {
-        setState(() => _hasFreq = hasFreq);
-      }
     });
 
     // 拓展词词形说明
     if (_vocab.isExtend(word)) {
-      final base = _vocab.extendBaseMap[word] ?? _vocab.extendBaseMap[word.toLowerCase()];
+      final base = _vocab.extendBaseMap[word.toLowerCase()] ?? _vocab.extendBaseMap[word];
       if (base != null && base.isNotEmpty) {
         final formDesc = _describeForm(word, base);
         _wordFormDesc = '$base 的$formDesc';
@@ -1180,8 +1523,8 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     });
   }
 
-  /// 寮瑰嚭鍏宠仈课标词嶅璇濇锛岀敤鎴烽€夋嫨鍩虹课标词嶅悗娣诲姞涓烘嫇灞曡瘝銆?
-  /// [onAdded] 鍦ㄦ坊鍔犲畬鎴愬悗锛堟棤璁烘槸鍚﹀叧鑱旓級鍥炶皟銆?
+  /// 弹出关联课标词对话框，用户选择基础课标词后添加为拓展词。
+  /// [onAdded] 在添加完成后（无论是否关联）回调。
   Future<void> _showBaseWordDialog(String word, VoidCallback onAdded) async {
     final controller = TextEditingController();
     final allStandard = _vocab.standardWordsLowerKeySet.toList();
@@ -1281,11 +1624,11 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     final isStandard = _vocab.isStandard(_searchResult);
     final categoryColor = _categoryColor(_wordCategory);
 
-    // 缁熶竴璁＄畻鍒嗙被鏍囩涓庨鑹?
+    // 统一计算分类标签与配色
     String? categoryLabel;
     Color labelColor = categoryColor;
     if (isStandard) {
-      // 课标词嶅垎绫绘爣绛剧粺涓€鍔?课标词?鍚庣紑锛岀敤鍖呭惈鍒ゆ柇瑕嗙洊鎵€鏈夊垎绫诲€?
+      // 课标词分类标签统一加“课标词”后缀，用包含判断覆盖所有分类值
       final cat = _wordCategory;
       if (cat.contains('必修')) {
         categoryLabel = '必修课标词';
@@ -1326,8 +1669,8 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
 
     return Card(
       elevation: 0,
-      color: const Color(0xFFFFF8E1),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      color: AppTheme.surfaceLight,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(AppTheme.radiusLg)),
       child: Padding(
         padding: const EdgeInsets.fromLTRB(18, 16, 18, 16),
         child: Column(
@@ -1341,7 +1684,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                   padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
                   decoration: BoxDecoration(
                     border: Border.all(color: labelColor, width: 1.5),
-                    borderRadius: BorderRadius.circular(4),
+                    borderRadius: BorderRadius.circular(AppTheme.radiusSm),
                   ),
                   child: Text(
                     categoryLabel,
@@ -1357,7 +1700,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                   if (phonetic.isNotEmpty)
                     Text(
                       '[$phonetic]',
-                      style: const TextStyle(fontSize: 15, fontFamily: 'monospace', color: Color(0xFF0066CC)),
+                      style: const TextStyle(fontSize: 15, fontFamily: 'monospace', color: AppTheme.primaryBlue),
                     ),
                   if (phonetic.isNotEmpty && collins > 0)
                     const Text(' - ', style: TextStyle(fontSize: 15)),
@@ -1375,7 +1718,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
               style: const TextStyle(
                 fontSize: 28,
                 fontWeight: FontWeight.bold,
-                color: Color(0xFFB20000),
+                color: AppTheme.red,
               ),
               ),
               ],
@@ -1394,7 +1737,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                             style: const TextStyle(
                               fontStyle: FontStyle.italic,
                               fontWeight: FontWeight.bold,
-                              color: Color(0xFF0000FF),
+                              color: AppTheme.primaryBlue,
                             ),
                           ),
                           TextSpan(text: p['def']),
@@ -1422,7 +1765,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                 padding: const EdgeInsets.only(top: 8),
                 child: Text(
                   _wordFormDesc!,
-                  style: const TextStyle(fontSize: 13, color: Color(0xFF008080)),
+                  style: const TextStyle(fontSize: 13, color: AppTheme.teal),
                   textAlign: TextAlign.center,
                 ),
               ),
@@ -1472,7 +1815,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
       children: List.generate(5, (i) => Icon(
         i < stars ? Icons.star : Icons.star_border,
         size: 14,
-        color: const Color(0xFFFFD700),
+        color: AppTheme.primaryYellow,
       )),
     );
   }
@@ -1535,15 +1878,13 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
       _saveConfig();
       if (mounted) {
         setState(() => _wordCategory = targetCategory);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('已重新归类为：$targetCategory')),
-        );
+        showAppSnackBar(context, '已重新归类为：$targetCategory', type: AppSnackBarType.success);
       }
     }
   }
 
 
-  /// 真题词频鍖哄煙锛氫粠 corpus 鐩綍缁熻褰撳墠鏌ヨ鍗曡瘝鐨勫嚭鐜版鏁颁笌閫愬勾鍒嗗竷銆?
+  /// 真题词频区域：从 corpus 目录统计当前查询单词的出现次数与逐年分布。
   Widget _buildWordFrequency() {
     return FutureBuilder<Map<String, dynamic>?>(
       future: _corpusDirPath().then((p) => _vocab.getWordFrequency(_searchResult, p)),
@@ -1557,7 +1898,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
             child: Center(
               child: Text(
                 '本单词从未在高考真题中出现过',
-                style: TextStyle(fontSize: 12, color: Color(0xFF999999)),
+                style: TextStyle(fontSize: 12, color: AppTheme.textHint),
                 textAlign: TextAlign.center,
               ),
             ),
@@ -1582,7 +1923,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                   decoration: BoxDecoration(
                     color: AppTheme.primaryBlue.withValues(alpha: 0.12),
-                    borderRadius: BorderRadius.circular(12),
+                    borderRadius: BorderRadius.circular(AppTheme.radiusLg),
                   ),
                   child: Text('共 $total 次', style: const TextStyle(fontSize: 12, color: AppTheme.primaryBlue, fontWeight: FontWeight.w600)),
                 ),
@@ -1598,7 +1939,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                 children: sentences.map((s) {
                   final text = s['text'] as String? ?? '';
                   final filePath = s['filePath'] as String? ?? '';
-                  final offset = (s['offset'] as num).toInt() ?? 0;
+                  final offset = ((s['offset'] as num?) ?? 0).toInt();
                   return InkWell(
                     onTap: filePath.isNotEmpty
                         ? () => Navigator.of(context, rootNavigator: true).push(MaterialPageRoute(
@@ -1634,7 +1975,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     );
   }
 
-  /// 灏嗗彞瀛愪腑鍖归厤 [word] 鐨勯儴鍒嗙敤榛勮壊鑳屾櫙 + 鍔犵矖楂樹寒鏄剧ず锛屽叧閿瘝鍙暱鎸夊脊鍑鸿彍鍗曘€?
+  /// 将句子中匹配 [word] 的部分用黄色背景 + 加粗高亮显示，关键词可长按弹出菜单。
   Widget _highlightSentence(String sentence, String word) {
     if (word.isEmpty) {
       return Text(sentence, style: const TextStyle(fontSize: 13, color: AppTheme.textSecondary));
@@ -1678,7 +2019,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     );
   }
 
-  /// 闀挎寜鍏抽敭璇嶅脊鍑虹殑鑿滃崟锛氬鍒?/ 鍏ㄩ€?/ 打开真题銆?
+  /// 长按关键词弹出的菜单：复制 / 全选 / 打开真题。
   void _showWordMenu(BuildContext context, String word, String sentence) {
     showModalBottomSheet(
       context: context,
@@ -1707,7 +2048,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
               title: const Text('打开真题'),
               onTap: () {
                 Navigator.pop(ctx);
-                // 鍦ㄥ綋鍓嶈瘝棰戠粨鏋滀腑鏌ユ壘鍖归厤璇ュ叧閿瘝鐨勭湡棰樻潯鐩苟璺宠测
+                // 在当前词频结果中查找匹配该关键词的真题条目并跳转
                 final data = _lastFreqData;
                 if (data != null) {
                   final byYear = data['byYear'] as Map<String, dynamic>? ?? {};
@@ -1717,7 +2058,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                       final text = s['text'] as String? ?? '';
                       if (text.toLowerCase().contains(word.toLowerCase())) {
                         final filePath = s['filePath'] as String? ?? '';
-                        final offset = (s['offset'] as num).toInt() ?? 0;
+                        final offset = ((s['offset'] as num?) ?? 0).toInt();
                         if (filePath.isNotEmpty) {
                           Navigator.of(context, rootNavigator: true).push(MaterialPageRoute(
                             builder: (_) => _ExamPaperViewer(
@@ -1737,9 +2078,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                     }
                   }
                 }
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('未找到对应真题')),
-                );
+                showAppSnackBar(context, '未找到对应真题', type: AppSnackBarType.error);
               },
             ),
           ],
@@ -1781,9 +2120,49 @@ class _ExamPaperViewerState extends State<_ExamPaperViewer> {
   late final ScrollController _scrollController;
   String _content = '';
   bool _loading = true;
-  int _highlightStart = -1;
-  int _highlightEnd = -1;
   SelectedContent? _selectedContent;
+  // 分块懒加载：全文按固定大小切成块，ListView.builder 只渲染可见块，
+  // 避免整篇文本放单个 Text.rich + SelectionArea 导致的长文档布局/选区开销
+  List<String> _chunks = const [];
+  // 目标关键词所在块的索引（用于打开时定位滚动）
+  int _highlightChunkIndex = 0;
+  // 每块最大字符数；块太小 item 过多、块太大失去懒加载意义
+  static const int _maxChunkChars = 1500;
+
+  /// 按固定大小 + 空格/标点边界切块，保证各块拼接后与原文逐字符一致
+  static List<String> _splitChunks(String text, {int maxChunk = _maxChunkChars}) {
+    final chunks = <String>[];
+    final n = text.length;
+    if (n == 0) return chunks;
+    // 优先在空白/常见标点处断开，避免切在单词中间
+    final boundary = RegExp(r'[\s\u3000，。；：！？、,.!?;:()（）\[\]"\u0027]');
+    var start = 0;
+    while (start < n) {
+      var end = start + maxChunk;
+      if (end >= n) {
+        chunks.add(text.substring(start));
+        break;
+      }
+      // 在 end 附近向前找最近边界，但至少保留一半块长，避免退化
+      final cut = text.lastIndexOf(boundary, end - 1);
+      if (cut > start + maxChunk ~/ 2) {
+        end = cut + 1;
+      }
+      chunks.add(text.substring(start, end));
+      start = end;
+    }
+    return chunks;
+  }
+
+  /// 返回包含指定字符偏移（相对全文）的块索引
+  static int _chunkIndexAt(List<String> chunks, int offset) {
+    var acc = 0;
+    for (var i = 0; i < chunks.length; i++) {
+      acc += chunks[i].length;
+      if (offset < acc) return i;
+    }
+    return chunks.isEmpty ? 0 : chunks.length - 1;
+  }
 
   @override
   void initState() {
@@ -1803,9 +2182,7 @@ class _ExamPaperViewerState extends State<_ExamPaperViewer> {
       final file = File(widget.filePath);
       if (!await file.exists()) {
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('真题文件不存在：\${widget.filePath}')),
-          );
+          showAppSnackBar(context, '真题文件不存在：\${widget.filePath}', type: AppSnackBarType.error);
         }
         _content = '真题文件不存在：\${widget.filePath}';
         if (mounted) setState(() => _loading = false);
@@ -1813,57 +2190,67 @@ class _ExamPaperViewerState extends State<_ExamPaperViewer> {
       }
       final text = await file.readAsString();
       _content = text;
-      // 璁＄畻鍏抽敭璇嶅湪鍘熸枃涓殑瀛楃鑼冨洿
+      // 分块懒加载
+      _chunks = _splitChunks(text);
+      // 计算关键词在原文中的字符范围
       final pattern = RegExp(r'\b' + RegExp.escape(widget.keyword) + r'\b', caseSensitive: false);
       final m = pattern.firstMatch(text);
       if (m != null) {
-        _highlightStart = m.start;
-        _highlightEnd = m.end;
+        _highlightChunkIndex = _chunkIndexAt(_chunks, m.start);
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('读取真题失败：\$e')),
-        );
+        showAppSnackBar(context, '读取真题失败：\$e', type: AppSnackBarType.error);
       }
       _content = '无法读取真题文件：\${widget.filePath}';
     }
     if (mounted) {
       setState(() => _loading = false);
-      // 绛夊緟甯冨眬完成鍚庢粴鍔ㄥ埌鍏抽敭璇嶄綅缃?
+      // 等待布局完成后滚动到关键单词位置
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (_scrollController.hasClients && _highlightStart >= 0) {
-          // 浼扮畻婊氬姩浣嶇疆锛氭寜瀛楃鏁扮矖鐣ユ槧灏勫埌婊氬姩鍋忕В
-          final total = _content.length;
-          final maxScroll = _scrollController.position.maxScrollExtent;
-          final ratio = _highlightStart / total;
-          final target = (ratio * maxScroll).clamp(0.0, maxScroll);
-          _scrollController.animateTo(
-            target,
-            duration: const Duration(milliseconds: 300),
-            curve: Curves.easeInOut,
-          );
-        }
+        _scrollToHighlight();
       });
     }
+  }
+
+  /// 滚动定位到目标关键词所在块（按累计字符权重粗定位，目标块会出现在视口附近）
+  void _scrollToHighlight() {
+    if (!_scrollController.hasClients) return;
+    if (_chunks.isEmpty) return;
+    if (_highlightChunkIndex >= _chunks.length) return;
+    final maxScroll = _scrollController.position.maxScrollExtent;
+    if (maxScroll <= 0) return;
+    // 目标块起始字符占全文比例，映射到滚动偏移
+    var charsBefore = 0;
+    for (var i = 0; i < _highlightChunkIndex; i++) {
+      charsBefore += _chunks[i].length;
+    }
+    final total = _content.length;
+    final ratio = (total == 0) ? 0.0 : (charsBefore / total);
+    final target = (ratio * maxScroll).clamp(0.0, maxScroll);
+    _scrollController.animateTo(
+      target,
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeInOut,
+    );
   }
 
   /// 构建正文 TextSpan：每个英文单词独立可点击，keyword 高亮」
   /// 构建正文 TextSpan：仅 keyword 拆为高亮 span，其余整段保留，
   /// 避免逐词拆分导致大量 span 造成卡顿；点击命中由 GestureDetector 统一处理」
-  List<TextSpan> _buildSpans() {
-    if (_content.isEmpty) return const [];
+  List<TextSpan> _buildChunkSpans(String chunk) {
+    if (chunk.isEmpty) return const [];
     final keyword = widget.keyword;
-    if (keyword.isEmpty) return [TextSpan(text: _content)];
+    if (keyword.isEmpty) return [TextSpan(text: chunk)];
     // 直接定位目标关键词（预编译局部正则），避免逐词扫描全文导致长文档卡顿
     final pattern = RegExp(r'\b' + RegExp.escape(keyword) + r'\b', caseSensitive: false);
-    final matches = pattern.allMatches(_content).toList();
-    if (matches.isEmpty) return [TextSpan(text: _content)];
+    final matches = pattern.allMatches(chunk).toList();
+    if (matches.isEmpty) return [TextSpan(text: chunk)];
     final spans = <TextSpan>[];
     var cursor = 0;
     for (final m in matches) {
       if (m.start > cursor) {
-        spans.add(TextSpan(text: _content.substring(cursor, m.start)));
+        spans.add(TextSpan(text: chunk.substring(cursor, m.start)));
       }
       spans.add(TextSpan(
         text: m.group(0)!,
@@ -1875,8 +2262,8 @@ class _ExamPaperViewerState extends State<_ExamPaperViewer> {
       ));
       cursor = m.end;
     }
-    if (cursor < _content.length) {
-      spans.add(TextSpan(text: _content.substring(cursor)));
+    if (cursor < chunk.length) {
+      spans.add(TextSpan(text: chunk.substring(cursor)));
     }
     return spans;
   }
@@ -1910,9 +2297,7 @@ class _ExamPaperViewerState extends State<_ExamPaperViewer> {
           onPressed: () {
             Clipboard.setData(ClipboardData(text: word));
             state.hideToolbar();
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('已复制 $word')),
-            );
+            showAppSnackBar(context, '已复制 $word', type: AppSnackBarType.success);
           },
         ),
         ContextMenuButtonItem(
@@ -1967,9 +2352,7 @@ class _ExamPaperViewerState extends State<_ExamPaperViewer> {
     if (newWord == null || newWord.isEmpty || newWord == oldWord) return;
     if (!RegExp(r'^[a-zA-Z]+$').hasMatch(newWord)) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$newWord 不是合法的英文单词')),
-      );
+      showAppSnackBar(context, '$newWord 不是合法的英文单词', type: AppSnackBarType.info);
       return;
     }
     final replaced = _content.replaceAllMapped(
@@ -1978,39 +2361,33 @@ class _ExamPaperViewerState extends State<_ExamPaperViewer> {
     );
     if (replaced == _content) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('文本中未找到 $oldWord')),
-      );
+      showAppSnackBar(context, '文本中未找到 $oldWord', type: AppSnackBarType.error);
       return;
     }
     try {
       await File(widget.filePath).writeAsString(replaced);
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('写入真题文件失败 $e')),
-      );
+      showAppSnackBar(context, '写入真题文件失败 $e', type: AppSnackBarType.error);
       return;
     }
     if (!mounted) return;
     setState(() {
       _content = replaced;
-      // 重新定位新词高亮范围
+      // 重建分块并重新定位新词高亮块
+      _chunks = _splitChunks(replaced);
       final pattern = RegExp(r'\b' + RegExp.escape(newWord) + r'\b', caseSensitive: false);
       final m = pattern.firstMatch(_content);
-      _highlightStart = m?.start ?? -1;
-      _highlightEnd = m?.end ?? -1;
+      _highlightChunkIndex = (m != null) ? _chunkIndexAt(_chunks, m.start) : 0;
     });
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('已将真题文件中 $oldWord 改为 $newWord')),
-    );
+    showAppSnackBar(context, '已将真题文件中 $oldWord 改为 $newWord', type: AppSnackBarType.success);
   }
 
   @override
   Widget build(BuildContext context) {
     final name = widget.filePath.split(RegExp(r'[\\/]')).last;
     return Scaffold(
-      backgroundColor: const Color(0xFFFFF8E1),
+      backgroundColor: AppTheme.surfaceLight,
       appBar: AppBar(
         title: Text(name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
         centerTitle: true,
@@ -2019,68 +2396,42 @@ class _ExamPaperViewerState extends State<_ExamPaperViewer> {
           ? const Center(child: CircularProgressIndicator())
           : Scrollbar(
               controller: _scrollController,
-              child: SingleChildScrollView(
+              child: ListView.builder(
                 controller: _scrollController,
                 padding: const EdgeInsets.all(16),
-                child: SelectionArea(
-                  onSelectionChanged: (content) => _selectedContent = content,
-                  contextMenuBuilder: _buildWordContextMenu,
-                  child: Text.rich(
-                    TextSpan(
-                      style: const TextStyle(fontSize: 15, height: 1.6, color: Colors.black87),
-                      children: _buildSpans(),
+                itemCount: _chunks.length,
+                // 懒加载：仅构建可见块，单帧布局/选区开销只与可见块相关
+                itemBuilder: (context, index) {
+                  final chunk = _chunks[index];
+                  return RepaintBoundary(
+                    child: SelectionArea(
+                      onSelectionChanged: (content) => _selectedContent = content,
+                      contextMenuBuilder: _buildWordContextMenu,
+                      child: Padding(
+                        padding: const EdgeInsets.only(bottom: 8),
+                        child: Text.rich(
+                          TextSpan(
+                            style: const TextStyle(fontSize: 15, height: 1.6, color: Colors.black87),
+                            children: _buildChunkSpans(chunk),
+                          ),
+                        ),
+                      ),
                     ),
-                  ),
-                ),
+                  );
+                },
               ),
             ),
     );
   }
 }
 
-/// 缁熻鍗＄墖
-class _StatCard extends StatelessWidget {
-  final String label;
-  final int count;
-  final Color color;
-  final VoidCallback? onTap;
-
-  const _StatCard({required this.label, required this.count, required this.color, this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    final card = Card(
-      elevation: 0,
-      color: color.withValues(alpha: 0.08),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: [
-            Text(label, textAlign: TextAlign.center, style: TextStyle(fontSize: 13, color: color, fontWeight: FontWeight.w600)),
-            const SizedBox(height: 4),
-            Text('$count', textAlign: TextAlign.center, style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold, color: color)),
-          ],
-        ),
-      ),
-    );
-    if (onTap == null) return card;
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(12),
-      child: card,
-    );
-  }
-}
-
-/// 文本检测嬪巻鍙茶褰曢」
+/// 文本检测历史记录项
 class _DetectHistory {
   final String fileName;
   final DateTime time;
   final int totalWords;
   final Map<String, int> categoryCounts;
-  final String text;
+  final String? sourcePath; // P6：不存全文，仅存导入源路径，重看时按需重新提取
   final int annotatedCount;
 
   _DetectHistory({
@@ -2088,45 +2439,22 @@ class _DetectHistory {
     required this.time,
     required this.totalWords,
     required this.categoryCounts,
-    required this.text,
+    required this.sourcePath,
     required this.annotatedCount,
   });
-}
-
-class _HistoryTile extends StatelessWidget {
-  final String word;
-  final VoidCallback onTap;
-
-  const _HistoryTile({required this.word, required this.onTap});
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      elevation: 0,
-      color: const Color(0xFFFFF8E1),
-      margin: const EdgeInsets.only(bottom: 4),
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-      child: ListTile(
-        leading: const Icon(Icons.history, size: 20, color: AppTheme.textSecondary),
-        title: Text(word, style: const TextStyle(fontWeight: FontWeight.w500)),
-        trailing: const Icon(Icons.chevron_right, size: 18),
-        onTap: onTap,
-        dense: true,
-      ),
-    );
-  }
 }
 
 class _AnalysisPage extends StatefulWidget {
   final String text;
   final String fileName;
+  final String? sourcePath; // 导入源文件绝对路径（docx 时可原地标注保留原排版）
   final VocabService vocab;
   final VoidCallback onSaveConfig;
   final ValueChanged<String>? onWordTap;
   final WordSyncService wordSyncService;
   final String userId;
 
-  const _AnalysisPage({required this.text, required this.fileName, required this.vocab, required this.onSaveConfig, this.onWordTap, required this.wordSyncService, required this.userId});
+  const _AnalysisPage({required this.text, required this.fileName, this.sourcePath, required this.vocab, required this.onSaveConfig, this.onWordTap, required this.wordSyncService, required this.userId});
 
   @override
   State<_AnalysisPage> createState() => _AnalysisPageState();
@@ -2140,11 +2468,11 @@ class _AnalysisPageState extends State<_AnalysisPage> {
   List<_AnalyzedWord> _cachedFiltered = [];
   bool _batchMode = false;
   final Set<String> _selectedOthers = {};
-  String _lastClassificationTime = '';
   late String _text;
 
   final Map<String, int?> _realFreq = {};
   bool _freqLoading = false;
+  bool _analyzing = false;
 
   static final RegExp _wordRegex = RegExp(r'\b[a-zA-Z]{2,}\b');
   static final RegExp _digitsOnly = RegExp(r'^\d+$');
@@ -2153,19 +2481,74 @@ class _AnalysisPageState extends State<_AnalysisPage> {
   void initState() {
     super.initState();
     _text = widget.text;
-    _analyze();
+    _analyzing = true;
+    _analyzeInBackground();
+  }
+
+  /// 首屏大文本分析走后台 isolate：避免在 UI isolate 同步执行
+  /// 全量正则遍历 + 分类 + 中文注解回溯导致界面冻结/ANR，同时
+  /// 分析完成后释放 isolate 内的临时大对象，降低 OOM 风险。
+  Future<void> _analyzeInBackground() async {
+    try {
+      final vocab = widget.vocab;
+      final args = <String, dynamic>{
+        'text': _text,
+        'standard': vocab.standardWordsLowerKeySet.toList(),
+        'extend': vocab.extendWordsLowerSet.toList(),
+        'chaogang': vocab.chaoGangLowerSet.toList(),
+        'extra': vocab.extraLowerSet.toList(),
+        'classMem': Map<String, String>.from(vocab.classificationMemory),
+      };
+      final result = await Isolate.run(() => _analyzeTextWorker(args));
+      if (!mounted) return;
+      setState(() {
+        _words = [
+          for (final w in (result['words'] as List))
+            _AnalyzedWord(
+              word: w['word'] as String,
+              frequency: w['frequency'] as int,
+              category: w['category'] as String,
+            ),
+        ];
+        _categoryCounts = Map<String, int>.from(result['categoryCounts'] as Map);
+        _annotatedCount = result['annotatedCount'] as int;
+        _analyzing = false;
+      });
+      _loadRealFreq();
+      _rebuildFiltered();
+    } catch (e) {
+      // 后台分析异常时回退到同步分析，避免功能不可用
+      if (mounted) setState(() => _analyzing = false);
+      try {
+        _analyze();
+      } catch (_) {
+        _words = [];
+        _categoryCounts = {};
+        _annotatedCount = 0;
+        _rebuildFiltered();
+      }
+    }
   }
 
   void _analyze() {
-    final freqMap = <String, int>{};
+    try {
+      final freqMap = <String, int>{};
     final caseMap = <String, String>{};
 
-    for (final m in _wordRegex.allMatches(widget.text)) {
+    // 剥离真题选项字母粘连（如 hostedB 还原为 hosted），与 Windows 导出侧 filterGluedRe 同款
+    final gluedLetterRe = RegExp(r'^([a-zA-Z]{3,})([A-H])$');
+    for (final m in _wordRegex.allMatches(_text)) {
       final original = m.group(0)!;
       if (_digitsOnly.hasMatch(original)) continue;
-      final lower = original.toLowerCase();
+      var lower = original.toLowerCase();
+      var display = original;
+      final glued = gluedLetterRe.firstMatch(original);
+      if (glued != null) {
+        lower = glued.group(1)!.toLowerCase();
+        display = glued.group(1)!;
+      }
       freqMap[lower] = (freqMap[lower] ?? 0) + 1;
-      if (!caseMap.containsKey(lower)) caseMap[lower] = original;
+      if (!caseMap.containsKey(lower)) caseMap[lower] = display;
     }
 
     _words = freqMap.entries.map((e) {
@@ -2196,8 +2579,8 @@ class _AnalysisPageState extends State<_AnalysisPage> {
 
     // 构建汉语标注词集合（统计用，仅计数不加色）
     // O(N) 实现：避免对全文反复 substring + firstMatch 造成 O(N^2) 卡顿
-    final _parenChineseRegex = RegExp(r'^\s*[\(（][^)）]*[\u4e00-\u9fa5]+[^)）]*[\)）]');
-    final _importedWordsLower = _words.map((aw) => aw.word.toLowerCase()).toSet();
+    final parenChineseRegex = RegExp(r'^\s*[\(（][^)）]*[\u4e00-\u9fa5]+[^)）]*[\)）]');
+    final importedWordsLower = _words.map((aw) => aw.word.toLowerCase()).toSet();
     final annotatedPhrases = <String>{};
     final wordPattern = RegExp(r'\b[a-zA-Z]{2,}\b');
     bool isAsciiLetter(int u) =>
@@ -2207,37 +2590,53 @@ class _AnalysisPageState extends State<_AnalysisPage> {
     // 用 allMatches 遍历所有词（替代逐位指针推进，避免 O(N^2) 与跨行跳词）
     for (final m in wordPattern.allMatches(_text)) {
       final w = m.group(0)!;
-      if (!_importedWordsLower.contains(w.toLowerCase())) { continue; }
+      if (!importedWordsLower.contains(w.toLowerCase())) { continue; }
       // 直接从原文本 m.end 处匹配中文注解，避免创建 O(N) 子串
-      if (_parenChineseRegex.matchAsPrefix(_text, m.end) == null) continue;
+      if (parenChineseRegex.matchAsPrefix(_text, m.end) == null) continue;
       // 向前回溯合并短语：跳过空白连字符，取前面一段连续字母作为前一词
       int phraseStart = m.start;
       while (phraseStart > 0) {
         int p = phraseStart;
-        while (p > 0 && isSep(_text.codeUnitAt(p - 1))) p--;
+        while (p > 0 && isSep(_text.codeUnitAt(p - 1))) {
+          p--;
+        }
         int q = p;
-        while (q > 0 && isAsciiLetter(_text.codeUnitAt(q - 1))) q--;
+        while (q > 0 && isAsciiLetter(_text.codeUnitAt(q - 1))) {
+          q--;
+        }
         if (q == p) break; // 前方不是单词，停止回溯
         final pw = _text.substring(q, p);
-        if (!_importedWordsLower.contains(pw.toLowerCase())) break;
+        if (!importedWordsLower.contains(pw.toLowerCase())) break;
         phraseStart = q;
       }
-      annotatedPhrases.add(widget.text.substring(phraseStart, m.end).trim());
+      annotatedPhrases.add(_text.substring(phraseStart, m.end).trim());
     }
     _annotatedCount = annotatedPhrases.length;
-    // 寮傛鑾峰彇真题词频锛堜笉闃诲鍒嗘瀽涓绘祦绋嬶級
+    } catch (_) {
+      // 分析异常时兜底为空结果，避免闪退
+      _words = [];
+      _categoryCounts = {};
+      _annotatedCount = 0;
+    }
+    // 异步获取真题词频（不阻塞分析主流程）
     _loadRealFreq();
     _rebuildFiltered();
   }
 
-  /// 鑾峰彇鐪熼璇枡搴撶洰褰曡矾寰勶紙搴旂敤鏂囨。鐩綍涓嬬殑 corpus 瀛愮洰褰曪級銆?
+  /// 获取真题语料库目录路径（应用文档目录下的 corpus 子目录）。
   Future<String> _corpusDirPath() async {
-    final dir = await getApplicationDocumentsDirectory();
-    return '${dir.path}/corpus';
+    final dir = await _appDocDir();
+    return '$dir/corpus';
   }
 
-  /// 浠?corpus 鍏ㄩ噺绱㈠紩锛坈orpus_index.json锛夋煡琛ㄨ幏鍙栨瘡涓凡璇嗗埆璇嶇殑鐪熼鍑虹幇娆℃暟銆?
-  /// 绱㈠紩棣栨鏋勫缓鏃舵壂鎻忓叏閮?txt 骞跺啓鍏ョ鐩橈紝鍚庣画鐩存帴璇诲唴瀛?Map锛屾绉掔骇鍝嶅簲銆?
+  /// 获取教材语料目录路径（应用文档目录下的 textbook 子目录）。
+  Future<String> _textbookDirPath() async {
+    final dir = await _appDocDir();
+    return '$dir/textbook';
+  }
+
+  /// 从 corpus 全量索引（corpus_index.json）查表获取每个已识别词的真实出现次数。
+  /// 索引首次构建时扫描全部 txt 并写入磁盘，后续直接读内存 Map，毫秒级响应。
   Future<void> _loadRealFreq() async {
     if (mounted) setState(() => _freqLoading = true);
     try {
@@ -2247,7 +2646,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
         _realFreq[aw.word.toLowerCase()] = index[aw.word.toLowerCase()] ?? 0;
       }
     } catch (_) {
-      // 词频查询澶辫触涓嶅奖鍝嶄富娴佺▼
+      // 词频查询失败不影响主流程
     } finally {
       if (mounted) setState(() => _freqLoading = false);
     }
@@ -2270,7 +2669,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
       'fileName': widget.fileName,
       'totalWords': _words.length,
       'categoryCounts': Map<String, int>.from(_categoryCounts),
-      'text': widget.text,
+      'sourcePath': widget.sourcePath, // P6：历史仅存源路径，不存全文
       'annotatedCount': _annotatedCount,
     };
   }
@@ -2281,15 +2680,40 @@ class _AnalysisPageState extends State<_AnalysisPage> {
 
   @override
   Widget build(BuildContext context) {
+    if (_analyzing) {
+      return Scaffold(
+        backgroundColor: AppTheme.surfaceLight,
+        appBar: AppBar(
+          backgroundColor: AppTheme.surfaceLight,
+          title: Text(widget.fileName, style: const TextStyle(fontSize: 16)),
+          leading: IconButton(icon: const Icon(Icons.arrow_back), onPressed: _popWithResult),
+          actions: [
+            TextButton(onPressed: _popWithResult, child: const Text('完成')),
+          ],
+        ),
+        body: const Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 12),
+              Text('正在分析文本…', style: TextStyle(fontSize: 14, color: AppTheme.textSecondary)),
+              SizedBox(height: 4),
+              Text('大文档首次分析较慢，请耐心等待', style: TextStyle(fontSize: 12, color: AppTheme.textHint)),
+            ],
+          ),
+        ),
+      );
+    }
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (didPop, _) {
         if (!didPop) _popWithResult();
       },
       child: Scaffold(
-      backgroundColor: const Color(0xFFFFF8E1),
+      backgroundColor: AppTheme.surfaceLight,
       appBar: AppBar(
-        backgroundColor: const Color(0xFFFFF8E1),
+        backgroundColor: AppTheme.surfaceLight,
         title: Text(widget.fileName, style: const TextStyle(fontSize: 16)),
         leading: IconButton(
           icon: const Icon(Icons.arrow_back),
@@ -2354,7 +2778,16 @@ class _AnalysisPageState extends State<_AnalysisPage> {
           // 筛选单词列表（填充可用空间）
           Expanded(
             child: _filtered.isEmpty
-                ? Center(child: Text('暂无 ${_filter == '全部' ? '单词' : _filter}', style: TextStyle(color: Colors.grey.shade400)))
+                ? Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.inbox_outlined, size: 36, color: AppTheme.textHint),
+                        const SizedBox(height: AppTheme.spacingSm),
+                        Text('暂无 ${_filter == '全部' ? '单词' : _filter}', style: TextStyle(color: AppTheme.textSecondary)),
+                      ],
+                    ),
+                  )
                 : ListView.builder(
                     itemCount: _filtered.length,
                     itemBuilder: (_, i) {
@@ -2384,7 +2817,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
                               padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                               decoration: BoxDecoration(
                                 color: _chipColor(aw.category).withValues(alpha: 0.15),
-                                borderRadius: BorderRadius.circular(4),
+                                borderRadius: BorderRadius.circular(AppTheme.radiusSm),
                               ),
                               child: Text(
                                 aw.category,
@@ -2406,7 +2839,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
                                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                                   decoration: BoxDecoration(
                                     color: Colors.blue.shade50,
-                                    borderRadius: BorderRadius.circular(10),
+                                    borderRadius: BorderRadius.circular(AppTheme.radiusMd),
                                   ),
                                   child: Text('$realFreq', style: TextStyle(fontSize: 11, color: Colors.blue.shade700, fontWeight: FontWeight.w600)),
                                 ),
@@ -2452,7 +2885,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
           if (_batchMode && _selectedOthers.isNotEmpty)
             Container(
               decoration: BoxDecoration(
-                color: const Color(0xFFFFF8E1),
+                color: AppTheme.surfaceLight,
                 boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 4, offset: Offset(0, -2))],
               ),
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
@@ -2474,8 +2907,8 @@ class _AnalysisPageState extends State<_AnalysisPage> {
   }
 
 
-  /// 寮瑰嚭鍏宠仈课标词嶅璇濇锛岀敤鎴烽€夋嫨鍩虹课标词嶅悗娣诲姞涓烘嫇灞曡瘝銆?
-  /// 寮瑰嚭鏃舵牴鎹娣诲姞鍗曡瘝鑷姩鎼滅储骞舵帓搴忓尮閰嶈鏍囪瘝銆?
+  /// 弹出关联课标词对话框，用户选择基础课标词后添加为拓展词。
+  /// 弹出时根据添加单词自动搜索并排序匹配课标词。
   Future<void> _showBaseWordDialog(String word) async {
     final controller = TextEditingController(text: word);
     final lowerWord = word.toLowerCase();
@@ -2503,7 +2936,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
                         border: OutlineInputBorder(),
                         isDense: true,
                         filled: true,
-                        fillColor: Color(0xFFFFF8E1),
+                        fillColor: AppTheme.surfaceLight,
                         contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                       ),
                       onChanged: (q) {
@@ -2515,7 +2948,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
                         });
                       },
                       onSubmitted: (q) {
-                        // 鍥炶溅涓斿彧鏈変竴涓畬鍏ㄥ尮閰嶆椂鑷姩閫夋嫨骞跺叧闂?
+                        // 回车且只有一个完全匹配时自动选择并关闭
                         final lower = q.trim().toLowerCase();
                         if (matches.length == 1 && matches.first.toLowerCase() == lower) {
                           widget.vocab.addExtendWord(word, baseWord: matches.first);
@@ -2591,7 +3024,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
                         border: OutlineInputBorder(),
                         isDense: true,
                         filled: true,
-                        fillColor: Color(0xFFFFF8E1),
+                        fillColor: AppTheme.surfaceLight,
                         contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                       ),
                       onChanged: (q) {
@@ -2678,9 +3111,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
       final others = _words.where((w) => w.category == '其他').toList();
       if (others.isEmpty) {
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('所有待筛选单词已处理完毕')),
-          );
+          showAppSnackBar(context, '所有待筛选单词已处理完毕', type: AppSnackBarType.success);
         }
         break;
       }
@@ -2733,7 +3164,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
                                 border: OutlineInputBorder(),
                                 isDense: true,
                                 filled: true,
-                                fillColor: Color(0xFFFFF8E1),
+                                fillColor: AppTheme.surfaceLight,
                                 contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                               ),
                               onChanged: (q) {
@@ -2837,10 +3268,6 @@ class _AnalysisPageState extends State<_AnalysisPage> {
         }
       }
 
-      // 分类计数实时更新 + 时间戳精确到秒
-      final now = DateTime.now();
-      _lastClassificationTime = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')} ${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}';
-
       widget.onSaveConfig();
       _analyze();
     }
@@ -2849,38 +3276,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
   }
 
 
-  String _buildAnnotatedText() {
-    final catByLower = <String, String>{};
-    for (final w in _words) {
-      catByLower.putIfAbsent(w.word.toLowerCase(), () => w.category);
-    }
-
-    final buffer = StringBuffer();
-    final text = widget.text;
-    final regex = RegExp(r'[a-zA-Z]+');
-    int lastEnd = 0;
-    for (final m in regex.allMatches(text)) {
-      final word = m.group(0)!;
-      final cat = catByLower[word.toLowerCase()];
-      buffer.write(text.substring(lastEnd, m.start));
-      if (cat == null || cat == '课标词' || cat == '其他') {
-        buffer.write(word);
-      } else if (cat == '拓展词') {
-        buffer.write('{$word}');
-      } else if (cat == '超标词') {
-        buffer.write('<$word>');
-      } else if (cat == '专有词') {
-        buffer.write('($word)');
-      } else {
-        buffer.write(word);
-      }
-      lastEnd = m.end;
-    }
-    buffer.write(text.substring(lastEnd));
-    return buffer.toString();
-  }
-
-  /// 瀵煎嚭鍒嗘瀽缁撴灉锛氬厛璁╃敤鎴烽€夋嫨 TXT 鎴?DOCX 鏍煎紡锛屽啀鐢熸垚鏂囦欢銆?
+  /// 导出分析结果：先让用户选择 TXT 或 DOCX 格式，再生成文件。
   Future<void> _exportResult() async {
     final choice = await showDialog<String>(
       context: context,
@@ -2907,6 +3303,8 @@ class _AnalysisPageState extends State<_AnalysisPage> {
     if (choice == null) return;
     if (!mounted) return;
 
+    ExportProgressOverlay? progress;
+    String? exportPath;
     try {
       final dir = await _pickExportDir(context, isVocab: false);
       final exportDir = dir;
@@ -2915,72 +3313,461 @@ class _AnalysisPageState extends State<_AnalysisPage> {
           '_${ts.hour.toString().padLeft(2, '0')}${ts.minute.toString().padLeft(2, '0')}${ts.second.toString().padLeft(2, '0')}';
 
       final totalRawCount = _words.fold<int>(0, (sum, w) => sum + w.frequency);
-      if (choice == 'txt') {
-        final path = '${exportDir.path}/analysis_$stamp.txt';
-        final buffer = StringBuffer();
-        buffer.writeln('ESW 文本检测导出');
-        buffer.writeln('分析时间: ${ts.year}-${ts.month.toString().padLeft(2, '0')}-${ts.day.toString().padLeft(2, '0')} ${ts.hour.toString().padLeft(2, '0')}:${ts.minute.toString().padLeft(2, '0')}');
-        buffer.writeln('文件名: ${widget.fileName}');
-        final cc = _categoryCounts;
-        buffer.writeln('全套题词数： $totalRawCount | 去重总词数： ${_words.length} | 课标词： ${cc['课标词'] ?? 0} | 拓展词： ${cc['拓展词'] ?? 0} | 超标词： ${cc['超标词'] ?? 0} | 专有词： ${cc['专有词'] ?? 0} | 其他: ${cc['其他'] ?? 0} | 汉语标注词: $_annotatedCount');
-        buffer.writeln('');
-        buffer.writeln('=' * 64);
-        buffer.writeln('【标注说明】');
-        buffer.writeln('[课标词]：单词本身（无标记）');
-        buffer.writeln('{拓展词}：用花括号标记');
-        buffer.writeln('<超标词>：用尖括号标记');
-        buffer.writeln('(专有词)：用圆括号标记');
-        buffer.writeln('=' * 64);
-        buffer.writeln('');
-        buffer.writeln(_buildAnnotatedText());
-        buffer.writeln('');
-        buffer.writeln(buildExtendTableText(_buildExtendSections()));
-        await File(path).writeAsString(buffer.toString());
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('已导出至: $path')));
+      // 1.5.7 行为：导出数据在主 isolate 同步构建并直接写盘，不再跨 isolate，
+      // 规避 Isolate.run/compute 消息合法性检查（object is unsendable）导致的
+      // 导出完全不可用问题；进度提示兜底大文档等待，异常全捕获落盘日志。
+      if (!mounted) return;
+      // 统一导出等待提示：延迟 500ms 未完成才浮出，含阶段文案与实时已用时
+      progress = ExportProgressOverlay.begin(
+        context,
+        stage: '正在生成导出文档…请稍候',
+        hint: '文档越大耗时越长，请耐心等待',
+      );
+      try {
+        await progress.setStage('正在整理检测数据…');
+        final exportData = await _buildExportTableDataAndroid(_text);
+        final baseName = _exportBaseName(widget.fileName, stamp);
+        final path = '${exportDir.path}/$baseName.${choice == 'txt' ? 'txt' : 'docx'}';
+        await progress.setStage('正在写入${choice == 'txt' ? 'TXT' : 'DOCX'}文件…');
+        if (choice == 'txt') {
+          await _writeTxtExportWorker(
+            path,
+            _text,
+            <Map<String, dynamic>>[
+              for (final w in _words)
+                {'word': w.word, 'frequency': w.frequency, 'category': w.category},
+            ],
+            Map<String, int>.from(_categoryCounts),
+            _annotatedCount,
+            totalRawCount,
+            widget.fileName,
+            _exportTableDataToMap(exportData),
+          );
+        } else {
+          await _exportDocx(path, exportData);
         }
-      } else {
-        final path = '${exportDir.path}/analysis_$stamp.docx';
-        await _exportDocx(path);
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('已导出至: $path')));
-        }
+        exportPath = path;
+      } finally {
+        // 无论成功或异常，导出结束立即收起提示层，绝不残留
+        progress.close();
+        progress = null;
       }
-    } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('导出失败: $e')));
+        showAppSnackBar(
+          context,
+          '已导出至: $exportPath',
+          type: AppSnackBarType.success,
+        );
+      }
+    } catch (e, st) {
+      progress?.close();
+      progress = null;
+      // 导出失败落盘日志，便于用户回传精确定位（含 isolate 消息不可发送等异常）
+      try {
+        final docs = await _appDocDir();
+        final log = File('$docs/esw_export_error.log');
+        await log.writeAsString(
+          '${DateTime.now().toIso8601String()} EXPORT_ERROR: $e\n$st\n---\n',
+          mode: FileMode.append,
+        );
+      } catch (_) {}
+      if (mounted) {
+        showAppSnackBar(context, '导出失败: $e', type: AppSnackBarType.error);
       }
     }
   }
 
-  /// 鐢熸垚 DOCX 鏂囨。锛氬惈带标注全文囷紙鎸夊垎绫荤潃鑹诧級+ 鍒嗙被璇嶆眹琛ㄣ€?
-  /// DOCX 鏈川鏄?ZIP 鍖咃紝鍐呭惈 OOXML銆傝繖閲岀敤 archive 鍖呮墜鍐欐渶灏忓彲鐢ㄦ枃妗ｃ€?
-  /// 构建拓展词按题型分组的明细（导出表格用）」
-  List<ExtendSection> _buildExtendSections() {
-    final extendWords = _words
-        .where((w) => w.category == '拓展词')
-        .map((w) => w.word)
-        .toList();
-    return buildExtendSections(
-      text: _text,
-      extendWords: extendWords,
-      baseWordOf: (w) {
-        // 优先取用户筛选拓展词时手动关联的课标词（extendBaseMap），保证导出列表课标词列非空
-        final linked = widget.vocab.extendBaseMap[w] ?? widget.vocab.extendBaseMap[w.toLowerCase()];
-        if (linked != null && linked.isNotEmpty) return linked;
-        final b = widget.vocab.extendReverseIndex[w.toLowerCase()];
-        if (b == null) {
-          // 词本身是课标词（如 discussing 还原后的 discuss）时直接返回
-          final ms2 = widget.vocab.standardWordsLower[w.toLowerCase()];
-          return (ms2 != null && ms2.isNotEmpty) ? ms2.first : '';
+  /// 将导出表格数据序列化为纯 Map（供后台 isolate 传参）。
+  Map<String, dynamic> _exportTableDataToMap(_ExportTableData data) {
+    return {
+      'extend': [
+        for (final sec in data.extend)
+          {
+            'name': sec.name,
+            'items': [
+              for (final it in sec.items)
+                {
+                  'word': it.word,
+                  'baseWord': it.baseWord,
+                  'originalExample': it.originalExample,
+                  'gaokaoExamples': [
+                    for (final g in it.gaokaoExamples)
+                      {'word': g.word, 'example': g.example, 'year': g.year},
+                  ],
+                  'textbookExample': it.textbookExample,
+                },
+            ],
+          },
+      ],
+      'overLimit': [
+        for (final sec in data.overLimit)
+          {
+            'name': sec.name,
+            'items': [
+              for (final it in sec.items)
+                {'word': it.word, 'posDef': it.posDef, 'originalExample': it.originalExample},
+            ],
+          },
+      ],
+    };
+  }
+
+  /// 判断单词是否为课标词（小写匹配课标词库键）。
+  bool _isStandardWordAndroid(String word) =>
+      widget.vocab.standardWordsLower.containsKey(word.toLowerCase());
+
+  /// 拓展词 → 课标原词：优先用户关联映射（extendBaseMap，小写键优先），
+  /// 其次反向索引，最后课标词库本身。
+  String _baseWordOfAndroid(String word) {
+    final linked =
+        widget.vocab.extendBaseMap[word.toLowerCase()] ?? widget.vocab.extendBaseMap[word];
+    if (linked != null && linked.isNotEmpty) return linked;
+    final b = widget.vocab.extendReverseIndex[word.toLowerCase()];
+    if (b == null) {
+      final ms2 = widget.vocab.standardWordsLower[word.toLowerCase()];
+      return (ms2 != null && ms2.isNotEmpty) ? ms2.first : '';
+    }
+    final ms = widget.vocab.standardWordsLower[b];
+    return (ms != null && ms.isNotEmpty) ? ms.first : b;
+  }
+
+  /// 获取单词"词性.释义"组合文本（课标词库 def 优先，其次词典 lookup）。
+  Future<String> _posDefOfAndroid(String word) async {
+    final lowerList = widget.vocab.standardWordsLower[word.toLowerCase()];
+    if (lowerList != null && lowerList.isNotEmpty) {
+      final sw = widget.vocab.standardWords[lowerList.first];
+      final def = sw?['def'] ?? '';
+      if (def.isNotEmpty) return def;
+    }
+    final entry = await DictionaryService.lookup(word);
+    return entry?['definition'] ?? '';
+  }
+
+  /// 构建导出用新格式表格数据：拓展词明细（仅真题词频 < 400）+ 超标词表。
+  /// 原文例句取自导入原文，高考例句取自真题语料目录，教材例句留空（安卓端无教材语料）。
+  Future<_ExportTableData> _buildExportTableDataAndroid(String originalText) async {
+    // 拓展词明细：仅保留真题词频 < 400 的单词（保留原文大小写、全局去重）
+    final lowFreqExtend = <String>[];
+    final seenLow = <String>{};
+    for (final iw in _words) {
+      if (iw.category != '拓展词') continue;
+      final lw = iw.word.toLowerCase();
+      // _realFreq 为真题词频（corpus 索引），未加载成功时按 0 处理不拦截
+      if ((_realFreq[lw] ?? 0) >= 400) continue;
+      if (seenLow.add(lw)) lowFreqExtend.add(iw.word);
+    }
+    // 过滤简单屈折变形（名词复数/第三人称单数/规则过去式等），
+    // 其课标原词已在拓展词明细中单独呈现，避免重复列出。
+    // 另：凡课标原词解析为 be 或 ok 的一律不进明细（覆盖 was/were/am/is/are
+    // 及其缩略拆词 wasn/weren/isn/aren、okay 等所有变体），按课标原词判断而非枚举。
+    final filterGluedRe = RegExp(r'^([a-zA-Z]{3,})([A-H])$');
+    lowFreqExtend.removeWhere((w) {
+      final glued = filterGluedRe.firstMatch(w);
+      final base =
+          resolveBaseWord(glued != null ? glued.group(1)! : w, _baseWordOfAndroid)
+              .toLowerCase();
+      if (base == 'be' || base == 'ok') return true;
+      return isSimpleInflection(w, _isStandardWordAndroid);
+    });
+    // 按题型分组（原文按题型标题行归属区间，组内同句多词合并成一行）
+    List<ExtendSection> sections = buildExtendSections(
+      text: originalText,
+      extendWords: lowFreqExtend,
+      baseWordOf: _baseWordOfAndroid,
+      mergeSameSentenceRows: true,
+    );
+    // 原文无题型标题时降级为单组"全部"（仍按纯文本编号输出）
+    if (sections.isEmpty && lowFreqExtend.isNotEmpty) {
+      sections = [
+        ExtendSection(
+          name: '全部',
+          rows: [
+            for (final w in lowFreqExtend)
+              ExtendRowData(
+                word: w,
+                example: pickShortExample(originalText, w),
+                baseWord: _baseWordOfAndroid(w),
+              ),
+          ],
+        ),
+      ];
+    }
+    // 教材例句源：合并 textbook 目录下已导入教材文本（对齐 Windows 版教材导入）
+    final tbSb = StringBuffer();
+    try {
+      final tbPath = await _textbookDirPath();
+      final tbDir = Directory(tbPath);
+      if (await tbDir.exists()) {
+        await for (final entity in tbDir.list()) {
+          if (entity is! File) continue;
+          if (!entity.path.toLowerCase().endsWith('.txt')) continue;
+          try {
+            tbSb.writeln(await entity.readAsString());
+          } catch (_) {}
         }
-        final ms = widget.vocab.standardWordsLower[b];
-        return (ms != null && ms.isNotEmpty) ? ms.first : b;
-      },
+      }
+    } catch (_) {}
+    final textbookText = tbSb.toString();
+    // 教材例句索引惰性构建：仅当存在词需降级到词组/结构时才 buildSentenceIndex，
+    // 避免教材全文的 flat/flatLower 双份副本常驻（峰值优化）。
+    SentenceIndex? textbookIndex;
+
+    // 高考例句：逐真题文件建索引并提取年份（文件名前缀），为每个词收集候选，
+    // 跨文件择优各取一句，保证"原文多词时每个词都有独立高考例句并标注年份"。
+    final gluedLetterRe = RegExp(r'^([a-zA-Z]{3,})([A-H])$');
+    final extendQueryWords = <String>{};
+    for (final sec in sections) {
+      for (final r in sec.rows) {
+        for (final w in r.word.split(' ')) {
+          if (w.isEmpty) continue;
+          final glued = gluedLetterRe.firstMatch(w);
+          extendQueryWords.add((glued != null ? glued.group(1)! : w).toLowerCase());
+        }
+      }
+    }
+    final gaokaoByWord =
+        <String, List<({String example, String year, bool isPhrase})>>{
+      for (final w in extendQueryWords)
+        w: <({String example, String year, bool isPhrase})>[],
+    };
+    final fileWordRe = RegExp(r'[a-zA-Z]+');
+    final yearPrefixRe = RegExp(r'^(\d{4})');
+    String corpusPath = '';
+    try {
+      corpusPath = await _corpusDirPath();
+    } catch (_) {}
+    if (corpusPath.isNotEmpty) {
+      final corpusDir = Directory(corpusPath);
+      if (await corpusDir.exists()) {
+        await for (final entity in corpusDir.list()) {
+          if (entity is! File) continue;
+          if (!entity.path.toLowerCase().endsWith('.txt')) continue;
+          final String fileText;
+          try {
+            fileText = await entity.readAsString();
+          } catch (_) {
+            continue;
+          }
+          final year = yearPrefixRe.firstMatch(entity.uri.pathSegments.last)?.group(1) ?? '';
+          // 整文件预检：拆词后只保留出现在目标词集合里的词，避免无谓建索引/切句
+          final hitQueries = <String>{};
+          for (final m in fileWordRe.allMatches(fileText)) {
+            final raw = m.group(0)!;
+            final glued = gluedLetterRe.firstMatch(raw);
+            final q = (glued != null ? glued.group(1)! : raw).toLowerCase();
+            if (extendQueryWords.contains(q)) hitQueries.add(q);
+          }
+          if (hitQueries.isEmpty) continue;
+          final idx = buildSentenceIndex(fileText);
+          // 一次扫描收集所有命中词的整句候选，替代逐词全量扫描（大幅提速）
+          final candsByWord = collectSentenceCandidates(idx, hitQueries);
+          for (final q in hitQueries) {
+            final cands = candsByWord[q];
+            final ex = (cands != null && cands.isNotEmpty)
+                ? pickBestCandidate(cands, q)
+                : '';
+            if (ex.isNotEmpty) {
+              gaokaoByWord[q]!.add((example: ex, year: year, isPhrase: false));
+            }
+            // 整句提取失败时备选：词组/结构级降级（bestGaokaoFor 按词性选用）
+            final ph = pickPhraseFromIndex(idx, [q]);
+            if (ph.isNotEmpty && ph != ex) {
+              gaokaoByWord[q]!.add((example: ph, year: year, isPhrase: true));
+            }
+          }
+        }
+      }
+    }
+    // 例句偏好评分（宁缺毋滥口径）：不含汉字 > 无下划线 > 词数>=3 > 句子短
+    final hanRe = RegExp(r'[\u4e00-\u9fff]');
+    final enWordRe = RegExp(r'[a-zA-Z]+');
+    int wordCountOfUsage(String s) => enWordRe.allMatches(s).length;
+    int gaokaoScore(String s) {
+      var score = 0;
+      if (!hanRe.hasMatch(s)) score += 1000;
+      if (!s.contains('_')) score += 100;
+      if (enWordRe.allMatches(s).length >= 3) score += 10;
+      score -= (s.length > 200 ? 200 : s.length) ~/ 5;
+      return score;
+    }
+
+    List<_GaokaoExampleItem> bestGaokaoFor(String w, bool isNounAdj) {
+      final glued = gluedLetterRe.firstMatch(w);
+      final q = (glued != null ? glued.group(1)! : w).toLowerCase();
+      final cands = gaokaoByWord[q] ??
+          const <({String example, String year, bool isPhrase})>[];
+      if (cands.isEmpty) return const [];
+      final sentences = cands.where((c) => !c.isPhrase).toList();
+      final phrases = cands.where((c) => c.isPhrase).toList();
+      List<({String example, String year, bool isPhrase})> pool;
+      if (isNounAdj) {
+        // 名/形：整句合适（词数<=12）时优先整句，否则降级取词组
+        final goodSentences =
+            sentences.where((c) => wordCountOfUsage(c.example) <= 12).toList();
+        pool = goodSentences.isNotEmpty
+            ? goodSentences
+            : (phrases.isNotEmpty ? phrases : sentences);
+      } else {
+        // 动/副：整句优先，整句无才用词组
+        pool = sentences.isNotEmpty ? sentences : phrases;
+      }
+      if (pool.isEmpty) return const [];
+      final best = pool.reduce((a, b) =>
+          gaokaoScore(b.example) > gaokaoScore(a.example) ? b : a);
+      return [_GaokaoExampleItem(word: w, example: best.example, year: best.year)];
+    }
+
+    // 词性判断缓存（名/形时整句过长降级为词组/结构）
+    final nounAdjCache = <String, bool>{};
+    Future<bool> isNounAdjOf(String w) async {
+      final lw = w.toLowerCase();
+      final cached = nounAdjCache[lw];
+      if (cached != null) return cached;
+      final def = await _posDefOfAndroid(lw);
+      final t = def.trim().toLowerCase();
+      // 释义含动词义项（vi./vt./v. 等）时按动词处理：整句优先，不降级词组
+      final hasVerbSense = t.contains('\nvi.') ||
+          t.contains('\nvt.') ||
+          RegExp(r'\bv\.').hasMatch(t) ||
+          RegExp(r'\bvi\.').hasMatch(t) ||
+          RegExp(r'\bvt\.').hasMatch(t);
+      final v = !hasVerbSense &&
+          (t.startsWith('n.') ||
+              t.startsWith('adj.') ||
+              (t.startsWith('a.') && !t.startsWith('adv.')));
+      nounAdjCache[lw] = v;
+      return v;
+    }
+
+    // 教材用法：完整句子优先（到句号/问号/感叹号等真正结束符为止，
+    // 不做逗号/分号细分、不因连词开头判为不合格），完整句缺失时才降级词组/结构
+    String resolveUsageFromIndex(String word) {
+      if (textbookText.isEmpty) return '';
+      final ws = word.split(' ').where((w) => w.isNotEmpty).toList();
+      final sentence = pickFullSentenceFromText(
+        textbookText,
+        ws,
+        fallbackToFirst: true,
+      );
+      if (sentence.isNotEmpty) return sentence;
+      textbookIndex ??= buildSentenceIndex(textbookText);
+      return pickPhraseFromIndex(textbookIndex!, ws);
+    }
+
+    final extendSections = <_ExportExtendSection>[];
+    for (final sec in sections) {
+      final items = <_ExportExtendItem>[];
+      for (final r in sec.rows) {
+        final isNA = await isNounAdjOf(r.word);
+        final gaokaoItems = <_GaokaoExampleItem>[];
+        for (final w in r.word.split(' ')) {
+          if (w.isNotEmpty) gaokaoItems.addAll(bestGaokaoFor(w, isNA));
+        }
+        items.add(_ExportExtendItem(
+          word: r.word,
+          baseWord: r.baseWord,
+          originalExample:
+              resolveUsageText(originalText, r.example, r.word, isNA),
+          gaokaoExamples: gaokaoItems,
+          textbookExample: resolveUsageFromIndex(r.word),
+        ));
+      }
+      extendSections.add(_ExportExtendSection(name: sec.name, items: items));
+    }
+
+    // 拓展词 sections 已消费完毕，显式释放引用便于 GC 回收大对象，
+    // 避免与后续超标词 sections 同时驻留推高峰值。
+    sections = const [];
+    textbookIndex = null;
+
+    // 超标词表：按题型分组（复用 buildExtendSections，课标原词回调对超标词返回空串），
+    // 每词输出 单词 / 词性.释义 / 原文例句（例句取所在题型区间的较短句）
+    final overLimitWords = <String>[];
+    final seenOver = <String>{};
+    for (final iw in _words) {
+      if (iw.category != '超标词') continue;
+      final lw = iw.word.toLowerCase();
+      if (seenOver.add(lw)) overLimitWords.add(iw.word);
+    }
+    List<ExtendSection> overSections = buildExtendSections(
+      text: originalText,
+      extendWords: overLimitWords,
+      baseWordOf: (w) => '',
+      mergeSameSentenceRows: false,
+    );
+    // 原文无题型标题时降级为单组"全部"
+    if (overSections.isEmpty && overLimitWords.isNotEmpty) {
+      overSections = [
+        ExtendSection(
+          name: '全部',
+          rows: [
+            for (final w in overLimitWords)
+              ExtendRowData(
+                word: w,
+                example: pickShortExample(originalText, w),
+                baseWord: '',
+              ),
+          ],
+        ),
+      ];
+    }
+    final overLimitSections = <_ExportOverLimitSection>[];
+    for (final sec in overSections) {
+      final items = <_ExportOverLimitItem>[];
+      for (final r in sec.rows) {
+        final def = await _posDefOfAndroid(r.word);
+        final t = def.trim().toLowerCase();
+        final isNA = t.startsWith('n.') ||
+            t.startsWith('adj.') ||
+            (t.startsWith('a.') && !t.startsWith('adv.'));
+        items.add(_ExportOverLimitItem(
+          word: r.word,
+          posDef: def,
+          originalExample:
+              resolveUsageText(originalText, r.example, r.word, isNA),
+        ));
+      }
+      overLimitSections.add(
+          _ExportOverLimitSection(name: sec.name, items: items));
+    }
+    return _ExportTableData(
+      extend: extendSections,
+      overLimit: overLimitSections,
     );
   }
 
-  Future<void> _exportDocx(String path) async {
+  Future<void> _exportDocx(String path, _ExportTableData exportData) async {
+    // 源文件为 .docx 时原地标注：只改写 word/document.xml 追加高亮/颜色，
+    // 其余部件原样保留，完整保留原文档排版格式；文末追加分页明细节。
+    final srcPath = widget.sourcePath;
+    if (srcPath != null &&
+        srcPath.toLowerCase().endsWith('.docx') &&
+        await File(srcPath).exists()) {
+      try {
+        final srcBytes = await File(srcPath).readAsBytes();
+        final catByLower = <String, String>{};
+        for (final w in _words) {
+          catByLower.putIfAbsent(w.word.toLowerCase(), () => w.category);
+        }
+        final preamble = _buildDocxPreambleAndroid(
+          fileName: widget.fileName,
+          exportData: exportData,
+        );
+        final appendix = _buildDocxAppendixAndroid(
+          exportData: exportData,
+        );
+        final bytes = annotateDocxBytes(
+          srcBytes: srcBytes,
+          catByLower: catByLower,
+          preambleParagraphsXml: preamble,
+          appendixParagraphsXml: appendix,
+        );
+        await File(path).writeAsBytes(bytes);
+        return;
+      } catch (_) {
+        // 原地标注失败（异常 docx）时回退到重新生成模式
+      }
+    }
     final bodyParts = <String>[];
     bodyParts.add(_docxParagraph('ESW 文本检测导出', heading: 1));
     bodyParts.add(_docxParagraph('文件名: ${widget.fileName}'));
@@ -2988,11 +3775,10 @@ class _AnalysisPageState extends State<_AnalysisPage> {
     final docxTotalRawCount = _words.fold<int>(0, (sum, w) => sum + w.frequency);
     bodyParts.add(_docxParagraph('全套题词数: $docxTotalRawCount | 去重总词数: ${_words.length} | 课标词: ${cc['课标词'] ?? 0} | 拓展词: ${cc['拓展词'] ?? 0} | 超标词: ${cc['超标词'] ?? 0} | 专有词: ${cc['专有词'] ?? 0} | 其他: ${cc['其他'] ?? 0} | 汉语标注词: $_annotatedCount'));
     bodyParts.add(_docxParagraph('【标注说明】', heading: 2));
-    bodyParts.add(_docxParagraph('课标词：黑色（无标记）；拓展词：绿色；超标词：红色；专有词：灰色'));
+    bodyParts.add(_docxParagraph('拓展词：浅黄高亮+加粗；超标词：浅粉高亮；专有词：浅绿高亮；课标词：无标记'));
     bodyParts.add(_docxParagraph('带标注全文', heading: 2));
     bodyParts.add(_docxAnnotatedParagraph());
-    bodyParts.add(_docxParagraph('拓展词明细（按题型）', heading: 2));
-    bodyParts.add(buildExtendTableXml(_buildExtendSections()));
+    bodyParts.addAll(_buildDocxDetailParagraphsAndroid(exportData));
 
     final documentXml = '''
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -3028,7 +3814,99 @@ ${bodyParts.join('\n')}
     await File(path).writeAsBytes(bytes);
   }
 
-  /// 鐢熸垚鍗曚釜 DOCX 娈佃惤 XML銆?
+  /// 构建 DOCX 正文前汇总段（原地标注用）：标题 + 文件名 + 统计 + 标注说明。
+  List<String> _buildDocxPreambleAndroid({
+    required String fileName,
+    required _ExportTableData exportData,
+  }) {
+    final cc = _categoryCounts;
+    final docxTotalRawCount = _words.fold<int>(0, (sum, w) => sum + w.frequency);
+    return [
+      _docxParagraph('ESW 文本检测导出', heading: 1),
+      _docxParagraph('文件名: $fileName'),
+      _docxParagraph('全套题词数: $docxTotalRawCount | 去重总词数: ${_words.length} | 课标词: ${cc['课标词'] ?? 0} | 拓展词: ${cc['拓展词'] ?? 0} | 超标词: ${cc['超标词'] ?? 0} | 专有词: ${cc['专有词'] ?? 0} | 其他: ${cc['其他'] ?? 0} | 汉语标注词: $_annotatedCount'),
+      _docxParagraph('【标注说明】', heading: 2),
+      _docxParagraph('拓展词：浅黄高亮+加粗；超标词：浅粉高亮；专有词：浅绿高亮；课标词：无标记'),
+    ];
+  }
+
+  /// 构建 DOCX 文末明细节段落（原地标注追加用）：分页 + 拓展词明细 + 超标词。
+  List<String> _buildDocxAppendixAndroid({
+    required _ExportTableData exportData,
+  }) {
+    return [
+      '<w:p><w:r><w:br w:type="page"/></w:r></w:p>',
+      ..._buildDocxDetailParagraphsAndroid(exportData),
+    ];
+  }
+
+  /// 构建 DOCX 明细节段落（拓展词明细 + 超标词表，供导出与原地标注共用）。
+  List<String> _buildDocxDetailParagraphsAndroid(_ExportTableData exportData) {
+    final bodyParts = <String>[];
+    bodyParts.add(_docxParagraph('【拓展词明细】', heading: 2));
+    if (exportData.extend.isEmpty) {
+      bodyParts.add(_docxParagraph('本套题无真题词频低于 400 次的拓展词'));
+    } else {
+      var firstSection = true;
+      for (final sec in exportData.extend) {
+        if (sec.items.isEmpty) continue; // 无词的题型区块不输出
+        if (!firstSection) bodyParts.add(_docxParagraph('')); // 题型之间空一行
+        firstSection = false;
+        bodyParts.add(_docxParagraph(sec.name)); // 题型名单独一行
+        for (var i = 0; i < sec.items.length; i++) {
+          final it = sec.items[i];
+          final no = i + 1;
+          bodyParts.add(_docxParagraph('$no. ${it.word}'));
+          bodyParts.add(_docxParagraph('课标原词：${it.baseWord}'));
+          final boldWords = it.word.split(' ');
+          bodyParts.add(
+            _docxParagraphWithBoldWords('原文用法：${it.originalExample}', boldWords),
+          );
+          if (it.gaokaoExamples.isEmpty) {
+            bodyParts.add(_docxParagraph('高考用法：'));
+          } else {
+            for (final g in it.gaokaoExamples) {
+              final prefix = boldWords.length > 1 ? '高考用法·${g.word}：' : '高考用法：';
+              bodyParts.add(_docxParagraphWithBoldWords(
+                '$prefix${g.example}${g.year.isNotEmpty ? '（${g.year}）' : ''}',
+                [g.word],
+              ));
+            }
+          }
+          bodyParts.add(_docxParagraphWithBoldWords(
+            '教材用法：${it.textbookExample.isEmpty ? '无' : it.textbookExample}',
+            boldWords,
+          ));
+        }
+      }
+    }
+    bodyParts.add(_docxParagraph('【超标词】', heading: 2));
+    if (exportData.overLimit.isEmpty) {
+      bodyParts.add(_docxParagraph('本套题未检测到超标词'));
+    } else {
+      var firstOverSection = true;
+      for (final sec in exportData.overLimit) {
+        if (sec.items.isEmpty) continue; // 无词的题型区块不输出
+        if (!firstOverSection) bodyParts.add(_docxParagraph('')); // 题型之间空一行
+        firstOverSection = false;
+        bodyParts.add(_docxParagraph(sec.name)); // 题型名单独一行
+        for (var i = 0; i < sec.items.length; i++) {
+          final it = sec.items[i];
+          final no = i + 1;
+          bodyParts.add(_docxParagraph('$no. ${it.word}'));
+          bodyParts.add(_docxParagraph(it.posDef));
+          // 超标词加粗（含剥离完形粘连字母后的词干，兼容原文两种形态）
+          final overBold = <String>[it.word];
+          final glued = RegExp(r'^([a-zA-Z]{3,})([A-H])$').firstMatch(it.word);
+          if (glued != null) overBold.add(glued.group(1)!);
+          bodyParts.add(_docxParagraphWithBoldWords(it.originalExample, overBold));
+        }
+      }
+    }
+    return bodyParts;
+  }
+
+  /// 生成单个 DOCX 段落 XML。
   String _docxParagraph(String text, {int? heading}) {
     final escaped = text
         .replaceAll('&', '&amp;')
@@ -3039,54 +3917,79 @@ ${bodyParts.join('\n')}
     return '<w:p><w:pPr><w:pStyle$style/></w:pPr>$runs</w:p>';
   }
 
-  /// 鐢熸垚带标注全文囩殑 DOCX 娈佃惤锛氭寜鍒嗙被鐢ㄤ笉鍚岄鑹?run 鐫€鑹层€?
+  /// 生成带标注全文的 DOCX 段落：按行拆分生成独立 `<w:p>` 保留原文换行；
+  /// 按分类用规范字色 + 字重着色，**不加底纹/高亮**（Word 导出统一口径，
+  /// 底纹只用于 PDF 导出）。
   String _docxAnnotatedParagraph() {
     final catByLower = <String, String>{};
     for (final w in _words) {
       catByLower.putIfAbsent(w.word.toLowerCase(), () => w.category);
     }
-    // 鍒嗙被 -> 鍗佸叚杩涘埗棰滆壊锛堟棤 # 鍓嶇紑锛?
-    String colorOf(String cat) {
+    // 分类 -> (文字颜色, 加粗)；原荧光高亮底纹已按口径去除，改用规范字色标注。
+    (String, bool) styleOf(String cat) {
       switch (cat) {
-        case '拓展词': return '2E7D32';
-        case '超标词': return 'C62828';
-        case '专有词': return '616161';
-        default: return '000000';
+        case '拓展词':
+          return ('006400', true);
+        case '超标词':
+          return ('FF0000', false);
+        case '专有词':
+          return ('800080', false);
+        default:
+          return ('000000', false);
       }
     }
 
-    final text = widget.text;
+    // 单行着色生成一个 <w:p>
+    String oneLine(String line) {
+      final regex = RegExp(r'[a-zA-Z]+');
+      final runs = <String>[];
+      int lastEnd = 0;
+      for (final m in regex.allMatches(line)) {
+        final word = m.group(0)!;
+        final cat = catByLower[word.toLowerCase()];
+        final plain = line.substring(lastEnd, m.start);
+        if (plain.isNotEmpty) {
+          runs.add(_docxRun(plain, '000000'));
+        }
+        final st = styleOf(cat ?? '');
+        runs.add(_docxRun(word, st.$1, bold: st.$2));
+        lastEnd = m.end;
+      }
+      final tail = line.substring(lastEnd);
+      if (tail.isNotEmpty) runs.add(_docxRun(tail, '000000'));
+      return '<w:p>${runs.join('')}</w:p>';
+    }
+
+    return _text.split('\n').map(oneLine).join('\n');
+  }
+
+  /// 生成单个 DOCX run（仅字色 + 可选加粗；不含底纹/高亮，Word 导出统一不加底纹）。
+  String _docxRun(String text, String color, {bool bold = false}) {
+    final escaped = text
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
+    final b = bold ? '<w:b/>' : '';
+    return '<w:r><w:rPr><w:color w:val="$color"/>$b</w:rPr>'
+           '<w:t xml:space="preserve">$escaped</w:t></w:r>';
+  }
+
+  /// 生成带目标词加粗的 DOCX 段落：按单词切分 run，命中目标词（忽略大小写）时加粗。
+  String _docxParagraphWithBoldWords(String text, List<String> words) {
+    final targets = words.map((w) => w.toLowerCase()).toSet();
     final regex = RegExp(r'[a-zA-Z]+');
     final runs = <String>[];
     int lastEnd = 0;
     for (final m in regex.allMatches(text)) {
       final word = m.group(0)!;
-      final cat = catByLower[word.toLowerCase()];
       final plain = text.substring(lastEnd, m.start);
-      if (plain.isNotEmpty) {
-        runs.add(_docxRun(plain, '000000'));
-      }
-      if (cat == null || cat == '课标词' || cat == '其他') {
-        runs.add(_docxRun(word, '000000'));
-      } else {
-        runs.add(_docxRun(word, colorOf(cat), highlight: cat == '超标词' ? 'yellow' : null));
-      }
+      if (plain.isNotEmpty) runs.add(_docxRun(plain, '000000'));
+      runs.add(_docxRun(word, '000000', bold: targets.contains(word.toLowerCase())));
       lastEnd = m.end;
     }
     final tail = text.substring(lastEnd);
     if (tail.isNotEmpty) runs.add(_docxRun(tail, '000000'));
     return '<w:p>${runs.join('')}</w:p>';
-  }
-
-  /// 鐢熸垚鍗曚釜 DOCX run锛堝甫棰滆壊锛夈€?
-  String _docxRun(String text, String color, {String? highlight}) {
-    final escaped = text
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;');
-    final hl = highlight != null ? '<w:highlight w:val="$highlight"/>' : '';
-    return '<w:r><w:rPr><w:color w:val="$color"/>$hl</w:rPr>'
-           '<w:t xml:space="preserve">$escaped</w:t></w:r>';
   }
 
   Color _chipColor(String cat) {
@@ -3132,9 +4035,7 @@ ${bodyParts.join('\n')}
     if (newWord == null || newWord.isEmpty || newWord == oldWord) return;
     if (!RegExp(r'^[a-zA-Z]+$').hasMatch(newWord)) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$newWord 不是合法的英文单词')),
-      );
+      showAppSnackBar(context, '$newWord 不是合法的英文单词', type: AppSnackBarType.info);
       return;
     }
     final replaced = _text.replaceAllMapped(
@@ -3143,24 +4044,20 @@ ${bodyParts.join('\n')}
     );
     if (replaced == _text) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('文本中未找到 $oldWord')),
-      );
+      showAppSnackBar(context, '文本中未找到 $oldWord', type: AppSnackBarType.error);
       return;
     }
     setState(() => _text = replaced);
     _analyze();
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('已将真题文本中 $oldWord 改为 $newWord')),
-      );
+      showAppSnackBar(context, '已将真题文本中 $oldWord 改为 $newWord', type: AppSnackBarType.success);
     }
   }
 
   void _openSourcePopup(String keyword) {
     Navigator.of(context).push(MaterialPageRoute(
       builder: (_) => _SourcePopupViewer(
-        text: widget.text,
+        text: _text,
         keyword: keyword,
         words: _words,
         chipColor: _chipColor,
@@ -3205,38 +4102,79 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
 
   final ScrollController _scrollCtrl = ScrollController();
 
-  late final List<String> _lines;
+  // 分块懒加载：全文按固定大小切成块，ListView.builder 只渲染可见块，
+  // 每块独立 SelectionArea，避免整篇文本放单个 SelectionArea 导致 O(全文) 布局/选区开销
+  List<String> _chunks = const [];
   late final Map<String, String> _catByLower;
   late final String _lowerKey;
-  late final int _targetLine;
-  GlobalKey? _targetKey;
+  // 目标关键词所在块的索引（用于打开时定位滚动）
+  int _targetChunkIndex = -1;
   SelectedContent? _selectedContent;
   late String _text;
+  // 每块最大字符数；块太小 item 过多、块太大失去懒加载意义
+  static const int _maxChunkChars = 1500;
+
+  /// 按固定大小 + 空格/标点边界切块，保证各块拼接后与原文逐字符一致
+  static List<String> _splitChunks(String text, {int maxChunk = _maxChunkChars}) {
+    final chunks = <String>[];
+    final n = text.length;
+    if (n == 0) return chunks;
+    final boundary = RegExp(r'[\s\u3000，。；：！？、,.!?;:()（）\[\]"\u0027]');
+    var start = 0;
+    while (start < n) {
+      var end = start + maxChunk;
+      if (end >= n) {
+        chunks.add(text.substring(start));
+        break;
+      }
+      final cut = text.lastIndexOf(boundary, end - 1);
+      if (cut > start + maxChunk ~/ 2) {
+        end = cut + 1;
+      }
+      chunks.add(text.substring(start, end));
+      start = end;
+    }
+    return chunks;
+  }
+
+  /// 返回包含指定字符偏移（相对全文）的块索引
+  static int _chunkIndexAt(List<String> chunks, int offset) {
+    var acc = 0;
+    for (var i = 0; i < chunks.length; i++) {
+      acc += chunks[i].length;
+      if (offset < acc) return i;
+    }
+    return chunks.isEmpty ? 0 : chunks.length - 1;
+  }
 
   @override
   void initState() {
     super.initState();
     _text = widget.text;
     _lowerKey = widget.keyword.toLowerCase();
-    _lines = widget.text.split('\n');
+    _chunks = _splitChunks(_text);
 
     _catByLower = <String, String>{};
     for (final w in widget.words) {
       _catByLower.putIfAbsent(w.word.toLowerCase(), () => w.category);
     }
 
-    _targetLine = _locateTargetLine();
+    final offset = _locateTargetOffset();
+    _targetChunkIndex = (offset != -1) ? _chunkIndexAt(_chunks, offset) : -1;
 
-    if (_targetLine != -1) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => _positionToTarget());
+    if (_targetChunkIndex != -1) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToTargetChunk());
     }
   }
 
-  int _locateTargetLine() {
-    for (int i = 0; i < _lines.length; i++) {
-      for (final m in _wordRegex.allMatches(_lines[i].toLowerCase())) {
-        if (m.group(0) == _lowerKey) return i;
+  /// 返回目标关键词首次命中的字符偏移（相对全文），未命中返回 -1
+  int _locateTargetOffset() {
+    var acc = 0;
+    for (final line in _text.split('\n')) {
+      for (final m in _wordRegex.allMatches(line.toLowerCase())) {
+        if (m.group(0) == _lowerKey) return acc + m.start;
       }
+      acc += line.length + 1; // +1 换行符
     }
     return -1;
   }
@@ -3247,17 +4185,29 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
     super.dispose();
   }
 
-  void _positionToTarget() {
-    final ctx = _targetKey?.currentContext;
-    if (ctx == null) return;
-    Scrollable.ensureVisible(
-      ctx,
-      alignment: 0.15,
-      duration: Duration.zero,
+  /// 滚动定位到目标关键词所在块（按累计字符权重粗定位，目标块会出现在视口附近）
+  void _scrollToTargetChunk() {
+    if (!_scrollCtrl.hasClients) return;
+    if (_chunks.isEmpty) return;
+    if (_targetChunkIndex >= _chunks.length) return;
+    final maxScroll = _scrollCtrl.position.maxScrollExtent;
+    if (maxScroll <= 0) return;
+    var charsBefore = 0;
+    for (var i = 0; i < _targetChunkIndex; i++) {
+      charsBefore += _chunks[i].length;
+    }
+    final total = _text.length;
+    final ratio = (total == 0) ? 0.0 : (charsBefore / total);
+    final target = (ratio * maxScroll).clamp(0.0, maxScroll);
+    _scrollCtrl.animateTo(
+      target,
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeInOut,
     );
   }
 
-  Widget _buildLine(int index, String line) {
+  /// 构建单个块内的高亮 TextSpan：keyword 黄底红字粗体、分类词着色、其余普通
+  List<TextSpan> _buildChunkSpan(String line) {
     final spans = <TextSpan>[];
     int lastEnd = 0;
     for (final m in _wordRegex.allMatches(line)) {
@@ -3297,15 +4247,10 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
     }
 
     if (spans.isEmpty) {
-      return Text(line, style: const TextStyle(fontSize: _fontSize, color: Colors.black87));
+      return [TextSpan(text: line)];
     }
 
-    return Text.rich(
-      TextSpan(
-        style: const TextStyle(fontSize: _fontSize, color: Colors.black87),
-        children: spans,
-      ),
-    );
+    return spans;
   }
 
   /// 自定义长按菜单：复制 / 修改 / 查词
@@ -3334,9 +4279,7 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
           onPressed: () {
             Clipboard.setData(ClipboardData(text: word));
             state.hideToolbar();
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('已复制 $word')),
-            );
+            showAppSnackBar(context, '已复制 $word', type: AppSnackBarType.success);
           },
         ),
         ContextMenuButtonItem(
@@ -3389,9 +4332,7 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
     if (newWord == null || newWord.isEmpty || newWord == oldWord) return;
     if (!RegExp(r'^[a-zA-Z]+$').hasMatch(newWord)) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('$newWord 不是合法的英文单词')),
-        );
+        showAppSnackBar(context, '$newWord 不是合法的英文单词', type: AppSnackBarType.info);
       }
       return;
     }
@@ -3401,58 +4342,65 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
     );
     if (replaced == _text) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('文本中未找到 $oldWord')),
-        );
+        showAppSnackBar(context, '文本中未找到 $oldWord', type: AppSnackBarType.error);
       }
       return;
     }
     setState(() {
       _text = replaced;
-      _lines
-        ..clear()
-        ..addAll(_text.split('\n'));
+      // 重建分块并重新定位目标词所在块
+      _chunks = _splitChunks(replaced);
       _catByLower.clear();
       for (final w in widget.words) {
         _catByLower.putIfAbsent(w.word.toLowerCase(), () => w.category);
       }
-      _targetLine = _locateTargetLine();
+      final offset = _locateTargetOffset();
+      _targetChunkIndex = (offset != -1) ? _chunkIndexAt(_chunks, offset) : -1;
     });
     widget.onTextChanged(_text);
     if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('已将原文中 $oldWord 改为 $newWord')),
-      );
+      showAppSnackBar(context, '已将原文中 $oldWord 改为 $newWord', type: AppSnackBarType.success);
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFFFF8E1),
+      backgroundColor: AppTheme.surfaceLight,
       appBar: AppBar(
         title: Text('"${widget.keyword}" 在原文中的位置'),
         titleTextStyle: const TextStyle(fontSize: 16, color: Colors.white),
         backgroundColor: AppTheme.primaryBlue,
         iconTheme: const IconThemeData(color: Colors.white),
       ),
-      body: SingleChildScrollView(
+      body: Scrollbar(
         controller: _scrollCtrl,
-        padding: const EdgeInsets.all(16),
-        child: SelectionArea(
-          onSelectionChanged: (content) => _selectedContent = content,
-          contextMenuBuilder: _buildWordContextMenu,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: List.generate(_lines.length, (i) => Padding(
-            key: i == _targetLine ? (_targetKey ??= GlobalKey()) : null,
-            padding: const EdgeInsets.only(bottom: 2),
-            child: _buildLine(i, _lines[i]),
-          )),
+        child: ListView.builder(
+          controller: _scrollCtrl,
+          padding: const EdgeInsets.all(16),
+          itemCount: _chunks.length,
+          // 懒加载：仅构建可见块，单帧布局/选区开销只与可见块相关
+          itemBuilder: (context, index) {
+            final chunk = _chunks[index];
+            return RepaintBoundary(
+              child: SelectionArea(
+                onSelectionChanged: (content) => _selectedContent = content,
+                contextMenuBuilder: _buildWordContextMenu,
+                child: Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Text.rich(
+                    TextSpan(
+                      style: const TextStyle(fontSize: _fontSize, color: Colors.black87),
+                      children: _buildChunkSpan(chunk),
+                    ),
+                  ),
+                ),
+              ),
+            );
+          },
         ),
       ),
-    ),
-  );
+    );
   }
 }
 
@@ -3462,6 +4410,68 @@ class _AnalyzedWord {
   final String category;
 
   _AnalyzedWord({required this.word, required this.frequency, required this.category});
+}
+
+// ==================== 导出表格数据（与 Windows 版对齐） ====================
+/// 高考例句条目：单词 + 例句 + 来源年份（年份从文件名前缀提取，无则空）
+class _GaokaoExampleItem {
+  final String word; // 单词（合并行时为其中的一个词）
+  final String example; // 高考例句
+  final String year; // 高考年份（如 2019；无法识别则为空）
+  const _GaokaoExampleItem({
+    required this.word,
+    required this.example,
+    required this.year,
+  });
+}
+
+/// 新格式拓展词明细项（仅真题词频 < 400 的拓展词，按题型分组内的一行）
+class _ExportExtendItem {
+  final String word; // 单词
+  final String baseWord; // 课标原词（无则空）
+  final String originalExample; // 原文例句
+  final List<_GaokaoExampleItem> gaokaoExamples; // 高考例句（逐词各一句，带年份）
+  final String textbookExample; // 教材例句（无则"无"）
+  const _ExportExtendItem({
+    required this.word,
+    required this.baseWord,
+    required this.originalExample,
+    required this.gaokaoExamples,
+    required this.textbookExample,
+  });
+}
+
+/// 新格式拓展词题型分区（听力/阅读/七选五/完形填空/语法填空/改错/写作）
+class _ExportExtendSection {
+  final String name; // 题型名
+  final List<_ExportExtendItem> items; // 该题型下的拓展词
+  const _ExportExtendSection({required this.name, required this.items});
+}
+
+/// 超标词项（按题型分组内的一行）
+class _ExportOverLimitItem {
+  final String word; // 词汇
+  final String posDef; // 词性.释义（参照查词页来源：课标词库 pos/def 优先，其次词典 lookup）
+  final String originalExample; // 原文例句
+  const _ExportOverLimitItem({
+    required this.word,
+    required this.posDef,
+    required this.originalExample,
+  });
+}
+
+/// 超标词题型分区（听力/阅读/七选五/完形填空/语法填空/改错/写作）
+class _ExportOverLimitSection {
+  final String name; // 题型名
+  final List<_ExportOverLimitItem> items; // 该题型下的超标词
+  const _ExportOverLimitSection({required this.name, required this.items});
+}
+
+/// 导出表格数据集合（拓展词明细 + 超标词表）
+class _ExportTableData {
+  final List<_ExportExtendSection> extend;
+  final List<_ExportOverLimitSection> overLimit;
+  const _ExportTableData({required this.extend, required this.overLimit});
 }
 
 class _DialogResult {
@@ -3538,18 +4548,18 @@ String _describeForm(String word, String base) {
   return '变形';
 }
 
-/// 鑾峰彇瀵煎嚭鐩爞鐩綍锛氫紭鍏堜娇鐢ㄥ閮ㄥ瓨鍌?Download 鐩綍锛屽け璐ュ洖閫€鍒板簲鐢ㄦ枃妗ｇ洰褰曘€?
+/// 获取导出目录：优先使用外部存储 Download 目录，失败回退到应用文档目录。
 Future<Directory> _downloadDir() async {
   try {
     final ext = await getExternalStorageDirectory();
     if (ext != null) {
-      // ext.path 褰㈠ /storage/emulated/0/Android/data/com.exam.esw/files
-      // 闇€寰€涓婁袱绾у基/storage/emulated/0锛屽啀杩涘叆绯荤粺 Download 鐩綍
+      // ext.path 形如 /storage/emulated/0/Android/data/com.exam.esw/files
+      // 需往上两级到 /storage/emulated/0，再进入系统 Download 目录
 final download = Directory('${ext.path}/../../Download');
       if (!await download.exists()) {
         await download.create(recursive: true);
       }
-      // 鍦?Download 涓嬪垱寤?esw_exports 瀛愮洰褰曠粍缁囧鍑烘枃浠?
+      // 在 Download 下创建 esw_exports 子目录组织导出文件
       final eswDir = Directory('${download.path}/esw_exports');
       if (!await eswDir.exists()) {
         await eswDir.create(recursive: true);
@@ -3557,14 +4567,13 @@ final download = Directory('${ext.path}/../../Download');
       return eswDir;
     }
   } catch (_) {
-    // 蹇界暐锛屽洖閫€鍒板簲鐢ㄦ枃妗ｇ洰褰?
+    // 忽略，回退到应用文档目录
   }
-  final dir = await getApplicationDocumentsDirectory();
-  return dir;
+  return Directory(await _appDocDir());
 }
 
-/// 閫夋嫨瀵煎嚭鐩綍锛氱洿鎺ュ脊鍑虹郴缁熺洰褰曢€夋嫨鍣紝閫夋嫨鍚庤蹇嗚矾寰勩€?
-/// 鐢ㄦ埛鍙栨秷閫夋嫨鏃讹紝鑻ユ湁璁板繂璺緞鍒欎娇鐢ㄨ蹇嗚矾寰勶紝鍚﹀垯鍥為€€鍒伴粯璁?Download/esw_exports銆?
+/// 选择导出目录：直接弹出系统目录选择器，选择后记忆路径。
+/// 用户取消选择时，若有记忆路径则使用记忆路径，否则回退到默认 Download/esw_exports。
 Future<Directory> _pickExportDir(BuildContext context, {required bool isVocab}) async {
   final picked = await FilePicker.getDirectoryPath();
   if (picked != null && picked.isNotEmpty) {
@@ -3576,7 +4585,7 @@ Future<Directory> _pickExportDir(BuildContext context, {required bool isVocab}) 
     return Directory(picked);
   }
 
-  // 鐢ㄦ埛鍙栨秷锛岃嫢鏈夎蹇嗚矾寰勫垯浣跨敤
+  // 用户取消，若有记忆路径则使用
   final remembered = isVocab ? _lastVocabExportPath : _lastExportPath;
   if (remembered != null && remembered.isNotEmpty) {
     final dir = Directory(remembered);
@@ -3586,7 +4595,7 @@ Future<Directory> _pickExportDir(BuildContext context, {required bool isVocab}) 
     return dir;
   }
 
-  // 閮芥病鏈夊垯鍥為€€榛樿 Download
+  // 都没有则回退默认 Download
   return _downloadDir();
 }
 
@@ -3614,771 +4623,11 @@ class _FilterChip extends StatelessWidget {
 
 
 
-/// 词库椤碉細鎼滅储妗'+ 鍥涚被璇嶆暟鍗＄墖 + 瀵煎叆瀵煎嚭鎸夐挳
-/// 使用说明椤?
-class _HelpItem {
-  final IconData icon;
-  final String title;
-  final String content;
-
-  const _HelpItem({
-    required this.icon,
-    required this.title,
-    required this.content,
-  });
-}
-
-class _HelpPage extends StatelessWidget {
-  const _HelpPage();
-
-  @override
-  Widget build(BuildContext context) {
-    final items = [
-      _HelpItem(
-        icon: Icons.description,
-        title: '文档导入',
-        content: '点击「文档导入」按钮，选择 TXT/DOCX/PDF 等格式文件，系统自动提取英文文本、分词并分析各词类覆盖占比。',
-      ),
-      _HelpItem(
-        icon: Icons.search,
-        title: '单词搜索',
-        content: '在搜索框输入单词后回车，即可查看课标释义、词性、真题频次及历年分布，同时展示真题例句。支持历史搜索记录快速回查。',
-      ),
-      _HelpItem(
-        icon: Icons.category,
-        title: '词库分类',
-        content: '单词按课标要求分为「课标词」「拓展词」「超标词」「专有词」四类，可手动调整分类，自动记忆跨平台导入的分类选择。',
-      ),
-      _HelpItem(
-        icon: Icons.save_alt,
-        title: '导出结果',
-        content: '点击「导出结果」按钮，将当前分析结果导出为 Word 文档（.docx），不同词类以不同颜色高亮标注并附带分类统计汇总表。',
-      ),
-      _HelpItem(
-        icon: Icons.sync,
-        title: '同步词库',
-        content: '点击「同步词库」可将本地积累的分类词库上传至坚果云云端，也可从云端拉取他人共享的词库，实现多人协作共享。',
-      ),
-      _HelpItem(
-        icon: Icons.system_update,
-        title: '检查更新',
-        content: '点击「检查更新」，自动检测最新版本，支持跳转 GitHub Releases 或蓝奏云（密码 52pj）下载更新。',
-      ),
-    ];
-
-    return Scaffold(
-      backgroundColor: const Color(0xFFFFF8E1),
-      appBar: AppBar(
-        backgroundColor: const Color(0xFFFFF8E1),
-        title: const Text('使用说明', style: TextStyle(fontWeight: FontWeight.bold)),
-        centerTitle: true,
-      ),
-      body: ListView.separated(
-        padding: const EdgeInsets.symmetric(vertical: 12),
-        itemCount: items.length,
-        separatorBuilder: (_, __) => const SizedBox(height: 4),
-        itemBuilder: (_, i) {
-          final item = items[i];
-          return Card(
-            margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-            elevation: 1,
-            color: const Color(0xFFFFF8E1),
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Icon(item.icon, size: 28, color: Colors.blue.shade700),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          item.title,
-                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          item.content,
-                          style: TextStyle(fontSize: 14, color: Colors.grey.shade700, height: 1.5),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          );
-        },
-      ),
-    );
-  }
-}
-
-class _VocabTabPage extends StatefulWidget {
-  final VocabService vocab;
-  final VoidCallback onSaveConfig;
-  final Future<void> Function(String word, VoidCallback onAdded) showBaseWordDialog;
-  final ValueChanged<String>? onWordTap;
-  final VoidCallback onSyncVocab;
-  final VoidCallback onCheckUpdate;
-  final bool syncing;
-  final WordSyncService wordSyncService;
-
-  const _VocabTabPage({required this.vocab, required this.onSaveConfig, required this.showBaseWordDialog, this.onWordTap, required this.onSyncVocab, required this.onCheckUpdate, required this.syncing, required this.wordSyncService});
-
-  @override
-  State<_VocabTabPage> createState() => _VocabTabPageState();
-}
-
-class _VocabTabPageState extends State<_VocabTabPage> {
-  final TextEditingController _searchCtrl = TextEditingController();
-  final FocusNode _searchFocus = FocusNode();
-
-  @override
-  void initState() {
-    super.initState();
-    _searchFocus.addListener(() => setState(() {}));
-  }
-
-  @override
-  void dispose() {
-    _searchFocus.dispose();
-    _searchCtrl.dispose();
-    super.dispose();
-  }
-
-  /// 鍚堝苟全部词库鍗曡瘝锛岃繑鍥'{word: category}銆?
-  Map<String, String> _allWordsWithCategory() {
-    final map = <String, String>{};
-    for (final w in widget.vocab.standardWords.keys) {
-      map[w] = '课标词';
-    }
-    for (final w in widget.vocab.extendWords) {
-      map[w] = '拓展词';
-    }
-    for (final w in widget.vocab.manualChaoGangWords) {
-      map[w] = '超标词';
-    }
-    for (final w in widget.vocab.manualExtraWords) {
-      map[w] = '专有词';
-    }
-    return map;
-  }
-
-  Color _catColor(String cat) {
-    switch (cat) {
-      case '课标词': return AppTheme.primaryBlue;
-      case '拓展词': return AppTheme.green;
-      case '超标词': return AppTheme.red;
-      case '专有词': return AppTheme.grey;
-      default: return AppTheme.orange;
-    }
-  }
-
-  /// 鎵撳紑鏌愮被词库璇︽儏椤?
-  void _openWordList(String category) {
-    Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => _WordListPage(
-        category: category,
-        vocab: widget.vocab,
-        onSaveConfig: widget.onSaveConfig,
-        showBaseWordDialog: widget.showBaseWordDialog,
-        wordSyncService: widget.wordSyncService,
-        onWordTap: widget.onWordTap,
-      ),
-    ));
-  }
-
-  /// 导出词库涓?JSON 澶囦唤鍒颁笅杞界洰褰曘€?
-  Future<void> _exportVocab() async {
-    if (!mounted) return;
-    try {
-      final dir = await _pickExportDir(context, isVocab: true);
-      final backupDir = dir;
-      final now = DateTime.now();
-      final dateStr = '${now.year}${now.month.toString().padLeft(2, '0')}${now.day.toString().padLeft(2, '0')}';
-      final path = '${backupDir.path}/esw_vocab_backup_$dateStr.json';
-      final data = widget.vocab.toJson();
-      await File(path).writeAsString(jsonEncode(data));
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('词库已导出: $path')));
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('导出失败: $e')));
-      }
-    }
-  }
-
-  /// 浠?JSON 鏂囦欢导入词库锛岃拷鍔犲悎骞讹紙涓嶈鐩栧凡鏈夛級銆?
-  Future<void> _importVocab() async {
-    try {
-      final result = await FilePicker.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['json'],
-      );
-      if (result == null || result.files.isEmpty) return;
-      final file = result.files.single;
-      final content = file.path != null
-          ? await File(file.path!).readAsString()
-          : utf8.decode(file.bytes!);
-      final json = jsonDecode(content) as Map<String, dynamic>;
-      widget.vocab.mergeFromJson(json);
-      widget.onSaveConfig();
-      if (mounted) {
-        setState(() {});
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('词库导入完成（已合并）')));
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('导入失败: $e')));
-      }
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final totalStandard = widget.vocab.standardWords.length;
-    final totalExtend = widget.vocab.extendWords.length;
-    final totalChaoGang = widget.vocab.manualChaoGangWords.length;
-    final totalExtra = widget.vocab.manualExtraWords.length;
-
-    final allMap = _allWordsWithCategory();
-    final q = _searchCtrl.text.trim().toLowerCase();
-    final filtered = q.isEmpty
-        ? <MapEntry<String, String>>[]
-        : allMap.entries.where((e) => e.key.toLowerCase().contains(q)).toList()
-      ..sort((a, b) => a.key.compareTo(b.key));
-
-    return SafeArea(
-      child: Column(
-        children: [
-          // 涓诲唴瀹瑰尯鍩燂紙鍗犳弧鍓╀綑绌洪棿锛屽彲婊氬姩锛?
-          Expanded(
-            child: CustomScrollView(
-              slivers: [
-                SliverAppBar(
-                  backgroundColor: const Color(0xFFFFF8E1),
-                  title: const Text('ESW词库', style: TextStyle(fontWeight: FontWeight.bold)),
-                  centerTitle: true,
-                  pinned: true,
-                ),
-                SliverPadding(
-                  padding: const EdgeInsets.all(16),
-                  sliver: SliverToBoxAdapter(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                  const SizedBox(height: 20),
-                  // 鎼滅储妗?
-                  TextField(
-                    controller: _searchCtrl,
-                    focusNode: _searchFocus,
-                    textAlign: TextAlign.center,
-                    decoration: InputDecoration(
-                      hintText: _searchFocus.hasFocus ? null : '搜索已积累的词库单词...',
-                      prefixIcon: const Icon(Icons.search, size: 20),
-                      suffixIcon: IconButton(
-                        icon: const Icon(Icons.clear, size: 18),
-                        onPressed: () {
-                          _searchCtrl.clear();
-                          setState(() {});
-                        },
-                      ),
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                      filled: true,
-                      fillColor: const Color(0xFFFFF8E1),
-                      isDense: true,
-                      contentPadding: const EdgeInsets.symmetric(vertical: 8),
-                    ),
-                    onChanged: (_) => setState(() {}),
-                  ),
-                  const SizedBox(height: 12),
-                  // 导入导出按钮
-                  Row(
-                    children: [
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: _importVocab,
-                          icon: const Icon(Icons.download, size: 18),
-                          label: const Text('导入词库'),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: OutlinedButton.icon(
-                          onPressed: _exportVocab,
-                          icon: const Icon(Icons.upload_file, size: 18),
-                          label: const Text('导出词库'),
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 20),
-                  if (q.isEmpty) ...[
-                    Center(child: Text('词库积累', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600))),
-                    const SizedBox(height: 12),
-                    Row(
-                      children: [
-                        Expanded(child: _StatCard(
-                          label: '课标词', count: totalStandard, color: AppTheme.primaryBlue,
-                          onTap: () => _openWordList('课标词'),
-                        )),
-                        const SizedBox(width: 8),
-                        Expanded(child: _StatCard(
-                          label: '拓展词', count: totalExtend, color: AppTheme.green,
-                          onTap: () => _openWordList('拓展词'),
-                        )),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Expanded(child: _StatCard(
-                          label: '超标词', count: totalChaoGang, color: AppTheme.red,
-                          onTap: () => _openWordList('超标词'),
-                        )),
-                        const SizedBox(width: 8),
-                        Expanded(child: _StatCard(
-                          label: '专有词', count: totalExtra, color: AppTheme.grey,
-                          onTap: () => _openWordList('专有词'),
-                        )),
-                      ],
-                    ),
-                    const SizedBox(height: 24),
-                  ] else ...[
-                    Text('搜索结果 (${filtered.length})', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600)),
-                    const SizedBox(height: 12),
-                    ...filtered.map((e) {
-                      final color = _catColor(e.value);
-                      return Container(
-                        margin: const EdgeInsets.only(bottom: 6),
-                        decoration: BoxDecoration(
-                          border: Border(left: BorderSide(color: color, width: 4)),
-                          borderRadius: BorderRadius.circular(8),
-                          color: const Color(0xFFFFF8E1),
-                        ),
-                        child: ListTile(
-                          onTap: widget.onWordTap == null ? null : () => widget.onWordTap!(e.key),
-                          title: Text(e.key, style: const TextStyle(fontWeight: FontWeight.w500)),
-                          trailing: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
-                            decoration: BoxDecoration(
-                              color: color,
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: Text(e.value, style: const TextStyle(fontSize: 12, color: Colors.white, fontWeight: FontWeight.w600)),
-                          ),
-                          dense: true,
-                        ),
-                      );
-                    }),
-                  ],
-                  const SizedBox(height: 24),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-          ),
-          // 搴曢儴鍥哄畾锛堝缁堝湪椤甸潰鏈€涓嬫柟锛夛細使用说明 + 鐗堟湰鍙'+ Github 浠撳簱锛堜笁琛屽眳涓級
-          Center(
-            child: Padding(
-              padding: const EdgeInsets.only(bottom: 16, top: 8),
-              child: Column(
-                children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      TextButton(
-                        onPressed: () => Navigator.of(context).push(
-                          MaterialPageRoute(builder: (_) => const _HelpPage()),
-                        ),
-                        child: const Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(Icons.description, size: 18),
-                            SizedBox(width: 4),
-                            Text('使用说明'),
-                          ],
-                        ),
-                      ),
-                      const Text('  '),
-                      TextButton(
-                        onPressed: widget.syncing ? null : widget.onSyncVocab,
-                        child: widget.syncing
-                            ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
-                            : const Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Icon(Icons.sync, size: 18),
-                                  SizedBox(width: 4),
-                                  Text('同步词库'),
-                                ],
-                              ),
-                      ),
-                      const Text('  '),
-                      TextButton(
-                        onPressed: widget.onCheckUpdate,
-                        child: const Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(Icons.system_update, size: 18),
-                            SizedBox(width: 4),
-                            Text('检查更新'),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                  Text('V 1.5.2', style: TextStyle(color: Colors.grey, fontSize: 12)),
-                  SizedBox(height: 4),
-                  GestureDetector(
-                    onTap: () async {
-                      final uri = Uri.parse('https://github.com/beenhow/ESW');
-                      if (await canLaunchUrl(uri)) {
-                        await launchUrl(uri, mode: LaunchMode.externalApplication);
-                      }
-                    },
-                    child: const Text(
-                      'Github仓库：https://github.com/beenhow/ESW',
-                      style: TextStyle(color: Colors.blueGrey, fontSize: 11, decoration: TextDecoration.none),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-/// 鏌愮被词库璇︽儏椤碉細鍊掑簭灞曠ず璇ョ被鎵€鏈夊崟璇嶏紝姣忚鍙充晶鎻愪緵杞崲鎿嶄綔銆?
-class _WordListPage extends StatefulWidget {
-  final String category;
-  final VocabService vocab;
-  final VoidCallback onSaveConfig;
-  final Future<void> Function(String word, VoidCallback onAdded) showBaseWordDialog;
-  final ValueChanged<String>? onWordTap;
-  final WordSyncService wordSyncService;
-
-  const _WordListPage({
-    required this.category,
-    required this.vocab,
-    required this.onSaveConfig,
-    required this.showBaseWordDialog,
-    required this.wordSyncService,
-    this.onWordTap,
-  });
-
-  @override
-  State<_WordListPage> createState() => _WordListPageState();
-}
-
-class _WordListPageState extends State<_WordListPage> {
-  late List<String> _words;
-  final Set<String> _selected = {};
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  void _load() {
-    switch (widget.category) {
-      case '课标词':
-        _words = widget.vocab.standardWords.keys.toList();
-        break;
-      case '拓展词':
-        _words = List.from(widget.vocab.extendWords);
-        break;
-      case '超标词':
-        _words = List.from(widget.vocab.manualChaoGangWords);
-        break;
-      case '专有词':
-        _words = List.from(widget.vocab.manualExtraWords);
-        break;
-      default:
-        _words = [];
-    }
-    // 非课标词保持倒序（最新添加的在最前面）；课标词按词库原始顺序正序显示
-    if (widget.category != '课标词') {
-      _words = _words.reversed.toList();
-    }
-  }
-
-  Color _colorFor(String cat) {
-    switch (cat) {
-      case '课标词': return AppTheme.primaryBlue;
-      case '拓展词': return AppTheme.green;
-      case '超标词': return AppTheme.red;
-      case '专有词': return AppTheme.grey;
-      default: return AppTheme.orange;
-    }
-  }
-
-  /// 批量转为目标分类（接入 markChanged 同步本地变更）
-  void _applyBatchReclassify(String target) {
-    final words = _selected.toList();
-    if (words.isEmpty) return;
-    for (final w in words) {
-      widget.vocab.reclassifyWord(w, target);
-      widget.wordSyncService.markChanged(w);
-    }
-    widget.onSaveConfig();
-    setState(() {
-      _selected.clear();
-      _load();
-    });
-  }
-
-  /// 从三个手动词库列表中彻底移除该词（删除前清理）
-  void _removeFromLists(String word) {
-    final lower = word.toLowerCase();
-    widget.vocab.extendWords.removeWhere((e) => e.toLowerCase() == lower);
-    widget.vocab.extendBaseMap.remove(word);
-    widget.vocab.extendReverseIndex.remove(lower);
-    widget.vocab.manualChaoGangWords.removeWhere((e) => e.toLowerCase() == lower);
-    widget.vocab.manualExtraWords.removeWhere((e) => e.toLowerCase() == lower);
-  }
-
-  /// 批量删除所选单词（接入 markDeleted 删除墓碑，同步传播到云端）
-  /// 大范围删除保护：删除超过 10 个 → 确认；超过 50 个 → 先自动备份云端再确认；取消无副作用
-  Future<bool> _applyBatchDelete() async {
-    final words = _selected.toList();
-    if (words.isEmpty) return false;
-    if (words.length > 10) {
-      final total = widget.vocab.extendWords.length +
-          widget.vocab.manualChaoGangWords.length +
-          widget.vocab.manualExtraWords.length;
-      final backedUp = words.length > 50
-          ? await widget.wordSyncService.backupRemoteState()
-          : false;
-      if (!mounted) return false;
-      final confirmed = await _confirmLargeDelete(
-        context,
-        words.length,
-        total,
-        backedUp,
-      );
-      if (!confirmed) return false; // 取消：无副作用，不写墓碑
-    }
-    if (!mounted) return false;
-    for (final w in words) {
-      _removeFromLists(w);
-      widget.wordSyncService.markDeleted(w);
-    }
-    widget.onSaveConfig();
-    setState(() {
-      _selected.clear();
-      _load();
-    });
-    return true;
-  }
-
-  /// 删除确认弹窗：删除单词超过 10 个时提示用户确认，
-  /// 超过 50 个时云端已自动备份全部词库。
-  /// 返回 true=确认执行，false=取消（无副作用）。
-  Future<bool> _confirmLargeDelete(
-    BuildContext context,
-    int delCount,
-    int total,
-    bool backedUp,
-  ) async {
-    final backupMsg = delCount > 50
-        ? (backedUp
-            ? '已自动在云端备份全部词库。'
-            : '警告：云端备份失败，请确认网络正常后再操作！')
-        : '';
-    final res = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        title: const Text('删除确认'),
-        content: Text(
-          '本次操作将删除 $delCount 个单词（词库当前共 $total 个）。\n\n$backupMsg\n\n确认要继续执行该删除操作吗？',
-          textAlign: TextAlign.left,
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('取消'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('确认删除'),
-          ),
-        ],
-      ),
-    );
-    return res ?? false;
-  }
-
-  void _toggleWord(String w, bool? v) {
-    setState(() {
-      if (v == true) {
-        _selected.add(w);
-      } else {
-        _selected.remove(w);
-      }
-    });
-  }
-
-  void _toggleAll(bool? v) {
-    setState(() {
-      if (v == true) {
-        _selected.addAll(_words);
-      } else {
-        _selected.clear();
-      }
-    });
-  }
-
-  /// 按当前词库动态生成可转换的目标词库（不含自身词库）
-  List<String> get _batchTargets {
-    return switch (widget.category) {
-      '拓展词' => const ['超标词', '专有词'],
-      '超标词' => const ['拓展词', '专有词'],
-      '专有词' => const ['拓展词', '超标词'],
-      _ => const <String>[],
-    };
-  }
-
-  void _doCancelSelect() {
-    setState(() {
-      _selected.clear();
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final color = _colorFor(widget.category);
-    final bool editable = widget.category != '课标词';
-    return Scaffold(
-      backgroundColor: const Color(0xFFFFF8E1),
-      appBar: AppBar(
-        title: Text(
-          _selected.isEmpty
-              ? '${widget.category}（共${_words.length}个）'
-              : '${widget.category}（已选${_selected.length}个）',
-          style: const TextStyle(fontSize: 16),
-        ),
-        centerTitle: true,
-        backgroundColor: const Color(0xFFFFF8E1),
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back),
-          onPressed: () => Navigator.of(context).pop(),
-        ),
-        actions: editable
-            ? [
-                const SizedBox(width: 4),
-                const Text('全选', style: TextStyle(fontSize: 13)),
-                Checkbox(
-                  value: _words.isNotEmpty && _selected.length == _words.length,
-                  activeColor: color,
-                  onChanged: _toggleAll,
-                ),
-              ]
-            : null,
-      ),
-      body: Column(
-        children: [
-          Expanded(
-            child: _words.isEmpty
-                ? Center(child: Text('暂无${widget.category}', style: TextStyle(color: Colors.grey.shade500)))
-                : ListView.separated(
-              padding: const EdgeInsets.all(12),
-              itemCount: _words.length,
-              separatorBuilder: (_, __) => const Divider(height: 1),
-              itemBuilder: (_, i) {
-                final w = _words[i];
-                return ListTile(
-                  leading: editable
-                      ? Checkbox(
-                          value: _selected.contains(w),
-                          activeColor: color,
-                          onChanged: (v) => _toggleWord(w, v),
-                        )
-                      : CircleAvatar(
-                          radius: 16,
-                          backgroundColor: color.withValues(alpha: 0.15),
-                          child: Text('${i + 1}', style: TextStyle(fontSize: 12, color: color, fontWeight: FontWeight.bold)),
-                        ),
-                  title: Text(w, style: const TextStyle(fontWeight: FontWeight.w500)),
-                  trailing: editable ? null : const Text('仅查看', style: TextStyle(fontSize: 12, color: AppTheme.textSecondary)),
-                  dense: true,
-                  onTap: widget.onWordTap == null
-                      ? null
-                      : () {
-                          Navigator.of(context).pop();
-                          widget.onWordTap!(w);
-                        },
-                );
-              },
-            ),
-          ),
-          if (_selected.isNotEmpty)
-            SafeArea(
-              child: Container(
-                color: const Color(0xFFFFF8E1),
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                child: Row(
-                  children: [
-                    for (final t in _batchTargets) ...[
-                      Expanded(
-                        child: OutlinedButton(
-                          onPressed: () => _applyBatchReclassify(t),
-                          child: FittedBox(
-                            fit: BoxFit.scaleDown,
-                            child: Text('转为$t', style: const TextStyle(fontSize: 13)),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                    ],
-                    Expanded(
-                      child: OutlinedButton(
-                        onPressed: () {
-                          _applyBatchDelete();
-                        },
-                        child: const FittedBox(
-                          fit: BoxFit.scaleDown,
-                          child: Text('删除所选单词', style: TextStyle(fontSize: 13)),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: TextButton(
-                        onPressed: _doCancelSelect,
-                        child: const FittedBox(
-                          fit: BoxFit.scaleDown,
-                          child: Text('取消选择', style: TextStyle(fontSize: 13)),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-}
-
-/// 寮傛鎵弿鎵€鏈?corpus 璇枡鏂囦欢锛岀粺璁＄粰瀹氬崟璇嶇殑鍑虹幇娆℃暟銆?
-/// 鍙亶鍘嗘枃浠朵竴娆★紝浣跨敤鑱斿悎姝ｅ垯涓€娆℃€у尮閰嶆墍鏈夊崟璇嶏紝閬垮厤閫愪釜鍗曡瘝閲嶅鎵弿銆?
-/// 浣跨敤 readAsString锛堝紓姝ワ級+ 姣?10 涓枃浠惰鍑轰簨浠跺惊鐜紝閬垮厤闃诲 UI 绾跨▼銆?
-/// 鍔犺浇 corpus 鍏ㄩ噺璇嶉绱㈠紩銆?
-/// 棣栨璋冪敤鏃舵壂鎻?corpus 鐩綍涓嬫墍鏂.txt锛屾寜鍗曡瘝锛堥暱搴?=3锛夌粺璁″嚭鐜版鏁板苟鍐欏取/// corpus_index.json锛涘悗缁皟鐢ㄧ洿鎺ヨ鍐呭瓧Map锛屾绉掔骇鍝嶅簲锛屽交搴曡В鍐抽€愭枃浠舵壂鎻忚浆鍦堥棶棰樸€
+/// 异步扫描所有 corpus 语料文件，统计给定单词的出现次数。
+/// 只遍历文件一次，使用联合正则一次性匹配所有单词，避免逐个单词重复扫描。
+/// 使用 readAsString（异步）+ 每 10 个文件让出事件循环，避免阻塞 UI 线程。
+/// 加载 corpus 全量词频索引。
+/// 首次调用时扫描 corpus 目录下所有 .txt，按单词（长度>=3）统计出现次数并写入 corpus_index.json；后续调用直接读内容字 Map，毫秒级响应，彻底解决逐文件扫描转圈问题。
 Future<Map<String, int>> _loadCorpusIndex(String corpusPath) async {
   final indexFile = File('$corpusPath/corpus_index.json');
   if (indexFile.existsSync()) {
@@ -4387,10 +4636,34 @@ Future<Map<String, int>> _loadCorpusIndex(String corpusPath) async {
       final decoded = jsonDecode(json) as Map<String, dynamic>;
       return {for (final e in decoded.entries) e.key: (e.value as num).toInt()};
     } catch (_) {
-      // 绱㈠紩鎹熷潖鍒欓噸寤?
+      // 索引损坏则重建
     }
   }
 
+  // 首次构建（逐文件扫描 + split 词频统计）移入后台 isolate，
+  // 避免大语料在 UI isolate 同步执行导致界面冻结/ANR。
+  try {
+    final _ = await Isolate.run(() => _buildCorpusIndexSync(corpusPath));
+  } catch (_) {
+    // isolate 派发失败时回退到同步构建，保证功能可用
+    _buildCorpusIndexSync(corpusPath);
+  }
+
+  // worker 写盘后由 UI 侧统一读回（避免大 Map 跨 isolate 拷贝驻留内存）
+  if (!indexFile.existsSync()) return {};
+  try {
+    final json = await indexFile.readAsString();
+    final decoded = jsonDecode(json) as Map<String, dynamic>;
+    return {for (final e in decoded.entries) e.key: (e.value as num).toInt()};
+  } catch (_) {
+    return {};
+  }
+}
+
+/// 语料索引构建（isolate 版，同步 IO 可在后台 isolate 安全执行）：
+/// 扫描 corpus 目录全部 .txt，统计 3+ 字母词频并写盘 corpus_index.json。
+Map<String, int> _buildCorpusIndexSync(String corpusPath) {
+  final indexFile = File('$corpusPath/corpus_index.json');
   final index = <String, int>{};
   final dir = Directory(corpusPath);
   if (!dir.existsSync()) return index;
@@ -4404,7 +4677,7 @@ Future<Map<String, int>> _loadCorpusIndex(String corpusPath) async {
 
   for (int fi = 0; fi < files.length; fi++) {
     try {
-      final text = await files[fi].readAsString();
+      final text = files[fi].readAsStringSync();
       final words = text.toLowerCase().split(RegExp(r'\W+'));
       for (final w in words) {
         if (w.length >= 3) {
@@ -4412,41 +4685,445 @@ Future<Map<String, int>> _loadCorpusIndex(String corpusPath) async {
         }
       }
     } catch (_) {
-      // 鍗曚釜鏂囦欢璇诲彇鍑洪敊锛岃烦杩囩户缁?
-    }
-    // 姣?20 涓枃浠惰鍑轰簨浠跺惊鐜紝閬垮厤闃诲 UI
-    if (fi > 0 && fi % 20 == 0) {
-      await Future.delayed(Duration.zero);
+      // 单个文件读取出错，跳过继续
     }
   }
 
   try {
-    await indexFile.writeAsString(jsonEncode(index));
+    indexFile.writeAsStringSync(jsonEncode(index));
   } catch (_) {
-
+    // 写盘失败不阻塞调用方
   }
   return index;
 }
 
-class _DottedLinePainter extends CustomPainter {
-  final Color color;
-  _DottedLinePainter({this.color = const Color(0xFFB20000)});
+// ==================== 后台 isolate worker（顶层函数，可被 Isolate.run 派发） ====================
 
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = color
-      ..strokeWidth = 1.5
-      ..strokeCap = StrokeCap.round;
-    const dashWidth = 4.0;
-    const dashSpace = 3.0;
-    double startX = 0;
-    while (startX < size.width) {
-      canvas.drawLine(Offset(startX, 1), Offset(startX + dashWidth, 1), paint);
-      startX += dashWidth + dashSpace;
+/// P4：按 path 在 worker 内读取并解析导入文件（不整文件载入 UI 堆）。
+String _extractImportContentFromPathWorker(Map<String, dynamic> args) {
+  final path = args['path'] as String;
+  final name = args['name'] as String;
+  final raw = File(path).readAsBytesSync();
+  return _extractImportContentWorker(raw, name);
+}
+
+/// 按年份统计真题语料中词库命中单词数与命中明细（年份从文件名 4 位前缀提取，
+/// 对齐高考例句年份提取逻辑），供检测页"已导入语料"年份框展示与点击展开。
+/// 返回 {'counts': {年份: 命中次数}, 'words': {年份: [{w,p,c}]}}；
+/// 明细按小写单词去重（保留原大小写、词性与分类）并按单词字母序排列。
+/// 目录不存在或无法识别年份的文件忽略。
+Map<String, dynamic> _scanYearHitCountsWorker(Map<String, dynamic> args) {
+  final dirPath = args['dirPath'] as String;
+  final vocab = (args['vocab'] as Map).cast<String, Map<String, String>>();
+  final yearRe = RegExp(r'^(\d{4})');
+  final wordRe = RegExp(r"[a-zA-Z']+");
+  final counts = <int, int>{};
+  final hits = <int, Map<String, Map<String, String>>>{};
+  final dir = Directory(dirPath);
+  if (!dir.existsSync()) {
+    return {'counts': counts, 'words': <int, List<Map<String, String>>>{}};
+  }
+  for (final f in dir.listSync().whereType<File>()) {
+    if (!f.path.toLowerCase().endsWith('.txt')) continue;
+    final m = yearRe.firstMatch(f.uri.pathSegments.last);
+    if (m == null) continue;
+    final year = int.tryParse(m.group(1)!);
+    if (year == null) continue;
+    String text;
+    try {
+      text = f.readAsStringSync();
+    } catch (_) {
+      continue;
+    }
+    var count = 0;
+    for (final wm in wordRe.allMatches(text)) {
+      final raw = wm.group(0)!;
+      final lower = raw.toLowerCase();
+      final info = vocab[lower];
+      if (info == null) continue;
+      count++;
+      hits
+          .putIfAbsent(year, () => <String, Map<String, String>>{})[lower] = {
+        'w': raw,
+        'p': info['pos'] ?? '',
+        'c': info['cat'] ?? '',
+      };
+    }
+    counts[year] = (counts[year] ?? 0) + count;
+  }
+  final words = <int, List<Map<String, String>>>{};
+  for (final entry in hits.entries) {
+    final list = entry.value.values.toList()
+      ..sort(
+        (a, b) => (a['w'] ?? '')
+            .toLowerCase()
+            .compareTo((b['w'] ?? '').toLowerCase()),
+      );
+    words[entry.key] = list;
+  }
+  return {'counts': counts, 'words': words};
+}
+
+/// 统计 textbook 目录下各教材 txt 文件中词库命中单词数与命中明细
+/// （键为教材文件名去扩展名），供检测页"已导入语料"教材格展示与点击展开。
+/// 返回 {'counts': {教材名: 命中次数}, 'words': {教材名: [{w,p,c}]}}。
+Map<String, dynamic> _scanTextbookHitCountsWorker(Map<String, dynamic> args) {
+  final dirPath = args['dirPath'] as String;
+  final vocab = (args['vocab'] as Map).cast<String, Map<String, String>>();
+  final wordRe = RegExp(r"[a-zA-Z']+");
+  final counts = <String, int>{};
+  final hits = <String, Map<String, Map<String, String>>>{};
+  final dir = Directory(dirPath);
+  if (!dir.existsSync()) {
+    return {'counts': counts, 'words': <String, List<Map<String, String>>>{}};
+  }
+  for (final f in dir.listSync().whereType<File>()) {
+    if (!f.path.toLowerCase().endsWith('.txt')) continue;
+    final fileName = f.uri.pathSegments.last;
+    final dotIdx = fileName.lastIndexOf('.');
+    final name = dotIdx > 0 ? fileName.substring(0, dotIdx) : fileName;
+    String text;
+    try {
+      text = f.readAsStringSync();
+    } catch (_) {
+      continue;
+    }
+    var count = 0;
+    for (final wm in wordRe.allMatches(text)) {
+      final raw = wm.group(0)!;
+      final lower = raw.toLowerCase();
+      final info = vocab[lower];
+      if (info == null) continue;
+      count++;
+      hits
+          .putIfAbsent(name, () => <String, Map<String, String>>{})[lower] = {
+        'w': raw,
+        'p': info['pos'] ?? '',
+        'c': info['cat'] ?? '',
+      };
+    }
+    counts[name] = (counts[name] ?? 0) + count;
+  }
+  final words = <String, List<Map<String, String>>>{};
+  for (final entry in hits.entries) {
+    final list = entry.value.values.toList()
+      ..sort(
+        (a, b) => (a['w'] ?? '')
+            .toLowerCase()
+            .compareTo((b['w'] ?? '').toLowerCase()),
+      );
+    words[entry.key] = list;
+  }
+  return {'counts': counts, 'words': words};
+}
+
+/// 导入文件内容统一分流解析（isolate 版）：与 _extractImportContent 同逻辑，
+/// 但全程不依赖插件（docx 走内存解压，不写临时文件），可安全在后台 isolate 执行。
+String _extractImportContentWorker(List<int> raw, String name) {
+  final lowerName = name.toLowerCase();
+  final isZip = _isZipBytesTop(raw);
+  final isOle = _isOleBytesTop(raw);
+  if (lowerName.endsWith('.docx') || isZip) {
+    try {
+      return _readDocxContentBytes(raw);
+    } catch (e) {
+      if (isOle) {
+        final t = extractDocText(raw);
+        if (t.trim().isEmpty) throw Exception('暂不支持旧版 .doc 或内容为空，请转为 txt/docx');
+        return t;
+      }
+      if (isZip) throw Exception('文件不是有效的 DOCX（ZIP 结构损坏）：$e');
+      return _decodeTextBytesTop(raw);
     }
   }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+  if (lowerName.endsWith('.doc') || isOle) {
+    final t = extractDocText(raw);
+    if (t.trim().isEmpty) throw Exception('暂不支持旧版 .doc 或内容为空，请转为 txt/docx');
+    return t;
+  }
+  return _decodeTextBytesTop(raw);
 }
+
+bool _isZipBytesTop(List<int> b) =>
+    b.length >= 4 &&
+    b[0] == 0x50 && b[1] == 0x4B &&
+    (b[2] == 0x03 || b[2] == 0x05 || b[2] == 0x07) &&
+    b[3] == 0x04;
+
+bool _isOleBytesTop(List<int> b) =>
+    b.length >= 8 &&
+    b[0] == 0xD0 && b[1] == 0xCF && b[2] == 0x11 && b[3] == 0xE0;
+
+String _decodeTextBytesTop(List<int> raw) {
+  try {
+    final s = utf8.decode(raw);
+    if (!s.contains('\uFFFD')) return s;
+  } catch (e) {
+    // 编码无法识别时回退 GBK 解码，仍失败则给出明确提示而非崩溃/乱码
+  }
+  try {
+    return gbk.decode(raw);
+  } catch (e) {
+    throw Exception('文本编码无法识别，请转为 UTF-8 编码的 txt 文件');
+  }
+}
+
+/// 从 DOCX bytes 内存解压提取纯文本（isolate 版，不写临时文件）。
+String _readDocxContentBytes(List<int> bytes) {
+  final archive = ZipDecoder().decodeBytes(bytes);
+  for (final f in archive) {
+    if (f.name == 'word/document.xml') {
+      final content = utf8.decode(f.content as List<int>);
+      final document = XmlDocument.parse(content);
+      final paragraphs = document.findAllElements('w:p');
+      final lines = paragraphs.map((p) {
+        final texts = p.findAllElements('w:t');
+        return texts.map((t) => t.innerText).join('');
+      }).where((line) => line.trim().isNotEmpty);
+      return lines.join('\n');
+    }
+  }
+  throw Exception('word/document.xml not found in docx');
+}
+
+/// 文本分析 worker：词频统计 + 课标/拓展/超标/专有分类 + 汉语标注词回溯计数。
+/// 与 _AnalysisPageState._analyze 同逻辑，运行于后台 isolate，
+/// 输入输出均为可发送的基础类型，避免大文本/大集合跨 isolate 拷贝后驻留 UI。
+Map<String, dynamic> _analyzeTextWorker(Map<String, dynamic> args) {
+  final text = args['text'] as String;
+  final standard = (args['standard'] as List).cast<String>().toSet();
+  final extend = (args['extend'] as List).cast<String>().toSet();
+  final chaogang = (args['chaogang'] as List).cast<String>().toSet();
+  final extra = (args['extra'] as List).cast<String>().toSet();
+  final classMem = Map<String, String>.from(args['classMem'] as Map);
+
+  final freqMap = <String, int>{};
+  final caseMap = <String, String>{};
+
+  // 剥离真题选项字母粘连（如 hostedB 还原为 hosted），与 Windows 导出侧 filterGluedRe 同款
+  final gluedLetterRe = RegExp(r'^([a-zA-Z]{3,})([A-H])$');
+  final wordRegex = RegExp(r'\b[a-zA-Z]{2,}\b');
+  final digitsOnly = RegExp(r'^\d+$');
+  for (final m in wordRegex.allMatches(text)) {
+    final original = m.group(0)!;
+    if (digitsOnly.hasMatch(original)) continue;
+    var lower = original.toLowerCase();
+    var display = original;
+    final glued = gluedLetterRe.firstMatch(original);
+    if (glued != null) {
+      lower = glued.group(1)!.toLowerCase();
+      display = glued.group(1)!;
+    }
+    freqMap[lower] = (freqMap[lower] ?? 0) + 1;
+    if (!caseMap.containsKey(lower)) caseMap[lower] = display;
+  }
+
+  final words = freqMap.entries.map((e) {
+    final lower = e.key;
+    final original = caseMap[lower] ?? lower;
+    String cat;
+    if (classMem.containsKey(lower)) {
+      cat = classMem[lower]!;
+    } else if (standard.contains(lower)) {
+      cat = '课标词';
+    } else if (extend.contains(lower)) {
+      cat = '拓展词';
+    } else if (chaogang.contains(lower)) {
+      cat = '超标词';
+    } else if (extra.contains(lower)) {
+      cat = '专有词';
+    } else {
+      cat = '其他';
+    }
+    return <String, dynamic>{
+      'word': original,
+      'frequency': e.value,
+      'category': cat,
+    };
+  }).toList()
+    ..sort((a, b) => (b['frequency'] as int).compareTo(a['frequency'] as int));
+
+  final categoryCounts = <String, int>{};
+  for (final w in words) {
+    final c = w['category'] as String;
+    categoryCounts[c] = (categoryCounts[c] ?? 0) + 1;
+  }
+
+  // 构建汉语标注词集合（统计用，仅计数不加色）
+  // O(N) 实现：避免对全文反复 substring + firstMatch 造成 O(N^2) 卡顿
+  final parenChineseRegex = RegExp(r'^\s*[\(（][^)）]*[\u4e00-\u9fa5]+[^)）]*[\)）]');
+  final importedWordsLower = words
+      .map((w) => (w['word'] as String).toLowerCase())
+      .toSet();
+  final annotatedPhrases = <String>{};
+  bool isAsciiLetter(int u) =>
+      (u >= 0x41 && u <= 0x5A) || (u >= 0x61 && u <= 0x7A);
+  bool isSep(int u) =>
+      u == 0x20 || u == 0x09 || u == 0x2D; // 空格 / 制表 / 连字符
+  for (final m in wordRegex.allMatches(text)) {
+    final w = m.group(0)!;
+    if (!importedWordsLower.contains(w.toLowerCase())) continue;
+    if (parenChineseRegex.matchAsPrefix(text, m.end) == null) continue;
+    int phraseStart = m.start;
+    while (phraseStart > 0) {
+      int p = phraseStart;
+      while (p > 0 && isSep(text.codeUnitAt(p - 1))) {
+        p--;
+      }
+      int q = p;
+      while (q > 0 && isAsciiLetter(text.codeUnitAt(q - 1))) {
+        q--;
+      }
+      if (q == p) break;
+      final pw = text.substring(q, p);
+      if (!importedWordsLower.contains(pw.toLowerCase())) break;
+      phraseStart = q;
+    }
+    annotatedPhrases.add(text.substring(phraseStart, m.end).trim());
+  }
+
+  return {
+    'words': words,
+    'categoryCounts': categoryCounts,
+    'annotatedCount': annotatedPhrases.length,
+  };
+}
+
+// ==================== 导出后台 worker（1.5.7+14 隔离化） ====================
+// 导出的文件生成 / 打包 / 写盘全部在此后台 isolate 中执行，UI 只等待结果。
+// 策略：先在应用缓存目录生成（必定可写），成功后复制到用户所选目录；
+// 复制失败（分区存储/SAF 无权限）时保留缓存副本并返回 warning 提示。
+
+/// P2：导出表格数据后台构建（isolate 版）。
+/// 输入纯 Map（text/words/realFreq/课标词三索引/教材与真题目录/dbPath），
+/// 输出与 _exportTableDataToMap 同构的纯 Map。整体在独立 isolate 执行：
+/// 同步读全量语料、逐词词典查询、例句索引构建均不占用 UI isolate；
+/// 内部全捕获，异常时返回空表结构而非抛出，杜绝 isolate 崩溃冒泡。
+/// 例句候选限容：每个目标词跨文件最多保留 6 条候选，避免小语料大量同词
+/// 候选无限累积推高峰值。
+/// TXT 导出：流式写盘（不产生全文副本）。
+Future<void> _writeTxtExportWorker(
+  String path,
+  String text,
+  List<Map<String, dynamic>> words,
+  Map<String, int> categoryCounts,
+  int annotatedCount,
+  int totalRawCount,
+  String fileName,
+  Map<String, dynamic> exportData,
+) async {
+  final sink = File(path).openWrite();
+  try {
+    final ts = DateTime.now();
+    sink.writeln('ESW 文本检测导出');
+    sink.writeln('分析时间: ${ts.year}-${ts.month.toString().padLeft(2, '0')}-${ts.day.toString().padLeft(2, '0')} ${ts.hour.toString().padLeft(2, '0')}:${ts.minute.toString().padLeft(2, '0')}');
+    sink.writeln('文件名: $fileName');
+    final cc = categoryCounts;
+    sink.writeln('全套题词数： $totalRawCount | 去重总词数： ${words.length} | 课标词： ${cc['课标词'] ?? 0} | 拓展词： ${cc['拓展词'] ?? 0} | 超标词： ${cc['超标词'] ?? 0} | 专有词： ${cc['专有词'] ?? 0} | 其他: ${cc['其他'] ?? 0} | 汉语标注词: $annotatedCount');
+    sink.writeln('');
+    sink.writeln('=' * 64);
+    sink.writeln('【标注说明】');
+    sink.writeln('[课标词]：单词本身（无标记）');
+    sink.writeln('{拓展词}：用花括号标记');
+    sink.writeln('<超标词>：用尖括号标记');
+    sink.writeln('(专有词)：用圆括号标记');
+    sink.writeln('=' * 64);
+    sink.writeln('');
+    // 标注全文流式生成
+    final catByLower2 = <String, String>{};
+    for (final w in words) {
+      catByLower2.putIfAbsent((w['word'] as String).toLowerCase(), () => w['category'] as String);
+    }
+    final aText = text;
+    final aRe = RegExp(r'[a-zA-Z]+');
+    int aEnd = 0;
+    for (final m in aRe.allMatches(aText)) {
+      final word = m.group(0)!;
+      final cat = catByLower2[word.toLowerCase()];
+      sink.write(aText.substring(aEnd, m.start));
+      if (cat == null || cat == '课标词' || cat == '其他') {
+        sink.write(word);
+      } else if (cat == '拓展词') {
+        sink.write('{$word}');
+      } else if (cat == '超标词') {
+        sink.write('<$word>');
+      } else if (cat == '专有词') {
+        sink.write('($word)');
+      } else {
+        sink.write(word);
+      }
+      aEnd = m.end;
+    }
+    sink.write(aText.substring(aEnd));
+    sink.writeln('');
+    sink.writeln('【拓展词明细】');
+    sink.writeln(_buildExtendDetailPlainTop(exportData));
+    sink.writeln('');
+    sink.writeln('【超标词】');
+    sink.writeln(_buildOverLimitPlainTop(exportData));
+  } finally {
+    await sink.close();
+  }
+}
+
+/// DOCX 导出：源文件为 .docx 时优先原地标注（annotateDocxBytes），
+/// 失败或非 docx 源则重建轻量 docx；全程后台执行并全捕获。
+/// 源 docx 超过 15MB 直接跳过原地标注走重建：原地标注需全量解压 zip +
+/// DOM + 序列化 + 重打包，多副本内存峰值随源文件增大线性攀升，是
+/// 真机大文档 OOM 闪退的最可能根因；重建轻量 docx 内存可控。
+String _buildExtendDetailPlainTop(Map<String, dynamic> exportData) {
+  final sections = (exportData['extend'] as List).cast<Map<String, dynamic>>();
+  if (sections.isEmpty) return '本套题无真题词频低于 400 次的拓展词';
+  final sb = StringBuffer();
+  var first = true;
+  for (final sec in sections) {
+    final items = (sec['items'] as List).cast<Map<String, dynamic>>();
+    if (items.isEmpty) continue;
+    if (!first) sb.writeln();
+    first = false;
+    sb.writeln(sec['name'] as String);
+    for (var i = 0; i < items.length; i++) {
+      final it = items[i];
+      final no = i + 1;
+      sb.writeln('$no. ${it['word']}');
+      sb.writeln('课标原词：${it['baseWord']}');
+      sb.writeln('原文用法：${it['originalExample']}');
+      final words = (it['word'] as String).split(' ');
+      final gks = (it['gaokaoExamples'] as List).cast<Map<String, dynamic>>();
+      if (gks.isEmpty) {
+        sb.writeln('高考用法：');
+      } else {
+        for (final g in gks) {
+          final prefix = words.length > 1 ? '高考用法·${g['word']}：' : '高考用法：';
+          sb.writeln('$prefix${g['example']}${(g['year'] as String).isNotEmpty ? '（${g['year']}）' : ''}');
+        }
+      }
+      sb.writeln('教材用法：${(it['textbookExample'] as String).isEmpty ? '无' : it['textbookExample']}');
+    }
+  }
+  return sb.toString();
+}
+
+String _buildOverLimitPlainTop(Map<String, dynamic> exportData) {
+  final sections = (exportData['overLimit'] as List).cast<Map<String, dynamic>>();
+  if (sections.isEmpty) return '本套题未检测到超标词';
+  final sb = StringBuffer();
+  var first = true;
+  for (final sec in sections) {
+    final items = (sec['items'] as List).cast<Map<String, dynamic>>();
+    if (items.isEmpty) continue;
+    if (!first) sb.writeln();
+    first = false;
+    sb.writeln(sec['name'] as String);
+    for (var i = 0; i < items.length; i++) {
+      final it = items[i];
+      final no = i + 1;
+      sb.writeln('$no. ${it['word']}');
+      sb.writeln(it['posDef'] as String);
+      sb.writeln(it['originalExample'] as String);
+    }
+  }
+  return sb.toString();
+}
+
+

@@ -16,6 +16,8 @@
 #endif
 
 #include "flutter/generated_plugin_registrant.h"
+#include "perf_mark.h"
+#include "window_setup.h"
 
 // Thread-safe queue for files dropped via WM_DROPFILES
 static std::mutex g_dropMutex;
@@ -45,6 +47,37 @@ static void DropDebug(const char* msg) {
 
 // Replacement WndProc for Flutter child window (direct hook via GWLP_WNDPROC)
 static LRESULT CALLBACK ChildWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+  // 父窗口是「客户区 = 整窗」的无边框窗口，四边/四角缩放热区落在 Flutter
+  // 子窗口覆盖范围内，子窗口默认会把 WM_NCHITTEST 判成 HTCLIENT，父窗口的
+  // 缩放判定永远收不到。这里把边缘命中以 HTTRANSPARENT 转回同一线程的父窗口，
+  // 由父窗口的 HandleNcHitTest 返回 HTLEFT / HTBOTTOMRIGHT 等，恢复四边缩放。
+  if (msg == WM_NCHITTEST) {
+    HWND parent = ::GetParent(hwnd);
+    if (parent != nullptr) {
+      RECT window_rect = {};
+      if (::GetWindowRect(parent, &window_rect)) {
+        const POINT pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        // ① 顶部自绘标题栏空白带（扣除右侧窗口三键交互区）：以 HTTRANSPARENT
+        //    把命中测试透传给父窗口，由父窗口返回 HTCAPTION —— 拖动移动窗口、
+        //    双击最大化/还原全部回到系统标准非客户区流程。
+        //    这是「窗口拖不动」的修复点：去掉 WS_CAPTION 后系统不再提供标题栏
+        //    非客户区，Dart 侧 startDragging()（SC_MOVE|HTCAPTION）落在客户区内
+        //    同样无效；三键区继续保持 HTCLIENT 交给 Flutter 处理点击。
+        if (esw_window_setup::IsPointInTitleBarDragBand(parent, pt)) {
+          return HTTRANSPARENT;
+        }
+        if (!::IsZoomed(parent)) {
+          const int border = esw_window_setup::ResizeBorderWidth(parent);
+          if (pt.x < window_rect.left + border ||
+              pt.x >= window_rect.right - border ||
+              pt.y < window_rect.top + border ||
+              pt.y >= window_rect.bottom - border) {
+            return HTTRANSPARENT;
+          }
+        }
+      }
+    }
+  }
   if (msg == WM_DROPFILES) {
     HDROP hDrop = reinterpret_cast<HDROP>(wp);
     UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
@@ -82,9 +115,11 @@ FlutterWindow::FlutterWindow(const flutter::DartProject& project)
 FlutterWindow::~FlutterWindow() {}
 
 bool FlutterWindow::OnCreate() {
+  EswCxxPerfMark("onCreate.enter");
   if (!Win32Window::OnCreate()) {
     return false;
   }
+  EswCxxPerfMark("onCreate.win32WindowReady");
 
   RECT frame = GetClientArea();
 
@@ -102,14 +137,18 @@ bool FlutterWindow::OnCreate() {
   // creation / destruction in the startup path.
   flutter_controller_ = std::make_unique<flutter::FlutterViewController>(
       width, height, project_);
+  EswCxxPerfMark("onCreate.viewControllerCreated");
   // Ensure that basic setup of the controller was successful.
   if (!flutter_controller_->engine() || !flutter_controller_->view()) {
     return false;
   }
   RegisterPlugins(flutter_controller_->engine());
+  EswCxxPerfMark("onCreate.pluginsRegistered");
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
+  EswCxxPerfMark("onCreate.childContentSet");
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
+    EswCxxPerfMark("firstFrame.nativeShow");
     this->Show();
   });
 
@@ -167,6 +206,53 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  // 最小窗口尺寸必须在最前处理：window_manager 插件同样会消费
+  // WM_GETMINMAXINFO（无条件下返回 0），若先交给插件，原生设定的最小尺寸
+  // 就不会生效。这里一次设定后直接返回，替代 Dart 侧 setMinimumSize 往返。
+  if (message == WM_GETMINMAXINFO) {
+    if (esw_window_setup::ApplyMinTrackSize(
+            hwnd, reinterpret_cast<MINMAXINFO*>(lparam))) {
+      return 0;
+    }
+  }
+
+  // 非客户区计算必须由原生层接管：去掉 WS_CAPTION 后若继续交给系统 / 插件，
+  // 客户区仍会从窗口外框内缩一圈非客户边框，顶部那圈未绘制区域就是用户看到的
+  // ~7px 深色横条。同样放在插件之前，避免 window_manager 的无边框逻辑覆盖。
+  if (message == WM_NCCALCSIZE) {
+    if (esw_window_setup::HandleNcCalcSize(hwnd, wparam, lparam)) {
+      return 0;
+    }
+  }
+
+  // 客户区 = 整窗后，四边/四角缩放热区由自己判定（Flutter 子窗口会先把边缘
+  // 命中以 HTTRANSPARENT 转回本窗口，见 ChildWndProc）。
+  if (message == WM_NCHITTEST) {
+    const LRESULT hit = esw_window_setup::HandleNcHitTest(hwnd, lparam);
+    if (hit != HTCLIENT) {
+      return hit;
+    }
+  }
+
+  // 圆角随「尺寸 / DPI / 最大化状态」刷新：Win11 由 DWM 自动处理最大化直角，
+  // Win10 回退路径需要这里的 WM_SIZE 钩子 —— 最大化时清掉圆角区域（否则四角
+  // 缺块、贴屏留缝），还原时按新宽高重新生成圆角区域。
+  if (message == WM_SIZE || message == WM_DPICHANGED) {
+    esw_window_setup::ApplyRoundedCorners(hwnd);
+  }
+
+  // 激活/退出尺寸循环后强制引擎出一帧：
+  // 系统对话框（保存/打开）关闭、或从最大化还原后，窗口可能带着「激活前」
+  // 的合成缓存回到前台，Flutter 侧又没有触发重绘，顶栏就会停一帧旧像素。
+  // 这里显式请求一帧，保证回到前台的第一帧就是当前状态，顶栏不再残留旧条带。
+  if (message == WM_ACTIVATE || message == WM_EXITSIZEMOVE) {
+    if (message == WM_EXITSIZEMOVE || LOWORD(wparam) != WA_INACTIVE) {
+      if (flutter_controller_ && flutter_controller_->engine()) {
+        flutter_controller_->ForceRedraw();
+      }
+    }
+  }
+
   // Handle WM_DROPFILES before Flutter engine processes it
   if (message == WM_DROPFILES) {
     HDROP hDrop = reinterpret_cast<HDROP>(wparam);

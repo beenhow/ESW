@@ -24,6 +24,22 @@ class DictionaryService {
   static Future<sqlite3.Database> _database() async {
     if (_db != null) return _db!;
 
+    final dbPath = await _deployDb();
+    _db = sqlite3.sqlite3.open(dbPath);
+    return _db!;
+  }
+
+  /// 确保词典库已部署到本地，并返回其绝对路径。
+  /// 跨平台统一：Windows 为 LOCALAPPDATA/ESW/ecdict.db，
+  /// Android 为应用文档目录/ESW/ecdict.db。
+  /// 供导出等需要在独立 isolate 中自行打开数据库的调用方使用，
+  /// 避免直接拼接目录导致打开空库（如安卓端导出高频 no such table: dict）。
+  static Future<String> ensureDeployedDbPath() async {
+    return _deployDb();
+  }
+
+  /// 部署词典库：版本过低或缺失时从 assets/ecdict.db 拷贝到本地目录。
+  static Future<String> _deployDb() async {
     // 跨平台目录：Android 用 path_provider，Windows 用 LOCALAPPDATA
     String baseDir;
     if (Platform.isWindows) {
@@ -59,8 +75,7 @@ class DictionaryService {
       await File(versionPath).writeAsString(_dbVersion.toString());
     }
 
-    _db = sqlite3.sqlite3.open(dbPath);
-    return _db!;
+    return dbPath;
   }
 
   static Map<String, String>? _rowToResult(sqlite3.Row row) {
@@ -79,7 +94,6 @@ class DictionaryService {
     if (cleanPos.isEmpty) {
       final exchange = (row['exchange'] as String?) ?? '';
       if (exchange.isNotEmpty) {
-        final ex = exchange.replaceAll(RegExp(r'/\d+:'), '/').replaceAll(RegExp(r'^\d+:/'), '');
         if (RegExp(r'(^|/)s:').hasMatch(exchange)) {
           cleanPos = 'n.';
         } else if (RegExp(r'(^|/)(d|i|3):').hasMatch(exchange)) {
@@ -154,7 +168,7 @@ class DictionaryService {
         return null;
       }
       return result;
-    } catch (e, st) {
+    } catch (e) {
       debugPrint('[DictService] lookup error: $e');
       return null;
     }

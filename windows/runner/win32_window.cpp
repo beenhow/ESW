@@ -1,9 +1,10 @@
-#include "win32_window.h"
+﻿#include "win32_window.h"
 
 #include <dwmapi.h>
 #include <flutter_windows.h>
 
 #include "resource.h"
+#include "window_setup.h"
 
 namespace {
 
@@ -28,6 +29,20 @@ constexpr const wchar_t kGetPreferredBrightnessRegValue[] = L"AppsUseLightTheme"
 
 // The number of Win32Window objects that currently exist.
 static int g_active_window_count = 0;
+
+// 窗口类背景刷：主题基色 #FAFAFA（与 Dart 侧 GlassTheme.bg 完全一致）。
+// 进程内只创建一次，随窗口类存活到进程退出，不需要额外释放。
+//
+// 作用不是「给界面刷底」，而是「给系统一个可用的兜底像素来源」：
+// Flutter 视图是客户区子窗口，视图尺寸在 WM_SIZE 里跟着父窗口跳变，
+// 而引擎的下一帧要等到 VSync 才提交；这段空窗期内，新暴露的区域若
+// 没有背景刷，DWM 只能合成出黑色 —— 用户看到的就是顶栏一带的黑色条带。
+HBRUSH kBackgroundBrush() {
+  // 与界面自身底色(浅粉白)保持一致：对话框关闭/窗口被遮挡恢复时，
+  // 系统擦除背景不再出现白色闪带，避免顶栏与内容之间产生割裂感。
+  static HBRUSH brush = ::CreateSolidBrush(RGB(0xDA, 0xD5, 0xF1));
+  return brush;
+}
 
 using EnableNonClientDpiScaling = BOOL __stdcall(HWND hwnd);
 
@@ -97,7 +112,14 @@ const wchar_t* WindowClassRegistrar::GetWindowClass() {
     window_class.hInstance = GetModuleHandle(nullptr);
     window_class.hIcon =
         LoadIcon(window_class.hInstance, MAKEINTRESOURCE(IDI_APP_ICON));
-    window_class.hbrBackground = 0;
+    // 窗口背景刷 = 主题基色 #FAFAFA（GlassTheme.bg）。
+    //
+    // 修复「尺寸变化瞬间露黑边/条带」：hbrBackground = 0 时系统不做任何擦除，
+    // 一旦客户区在 Flutter 出下一帧之前先变大（最大化动画、快速拖动缩放、
+    // 从最大化还原），DWM 合成到的新区域没有任何像素来源，只能显示为纯黑，
+    // 表现为顶栏一带的黑色/异色条带。给窗口类一个与主题基色一致的纯色刷后，
+    // 新暴露区域由系统立即填该颜色，Flutter 帧到达后覆盖，全程无黑无割裂。
+    window_class.hbrBackground = kBackgroundBrush();
     window_class.lpszMenuName = nullptr;
     window_class.lpfnWndProc = Win32Window::WndProc;
     RegisterClass(&window_class);
@@ -145,6 +167,11 @@ bool Win32Window::Create(const std::wstring& title,
   }
 
   UpdateTheme(window);
+
+  // 启动期一次性原生窗口设定（尺寸 / 居中 / 去系统标题栏）。
+  // 位置必须在 OnCreate() 之前：FlutterViewController 按「当时的客户区尺寸」创建，
+  // 这样视图尺寸一次到位，不会出现「创建后再改尺寸」引发的重排版。
+  esw_window_setup::ApplyOneShotWindowSetup(window);
 
   return OnCreate();
 }

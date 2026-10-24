@@ -1,10 +1,11 @@
-#include <flutter/dart_project.h>
+﻿#include <flutter/dart_project.h>
 #include <flutter/flutter_view_controller.h>
 #include <windows.h>
 #include <string>
 #include <cstdio>
 
 #include "flutter_window.h"
+#include "perf_mark.h"
 #include "utils.h"
 
 // Crash log fallback: any unhandled native exception is written to
@@ -31,8 +32,75 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
   return EXCEPTION_EXECUTE_HANDLER;
 }
 
+// ---------------- 运行环境自检（跨机器可运行性） ----------------
+// 发布包必须自带 data\ 资源与 tesseract\ OCR 组件，且一律按「exe 同级相对路径」
+// 定位。这里在窗口创建前做一次存在性检查：缺文件时弹出明确清单并退出，
+// 而不是让界面起来之后因资源缺失闪退或功能静默失效。
+// 仅在 Release 布局（data\app.so 存在）下生效，避免影响 flutter run 的 Debug 产物。
+static void AppendMissingPath(std::wstring* out, const std::wstring& base,
+                              const wchar_t* rel) {
+  const std::wstring full = base + rel;
+  if (GetFileAttributesW(full.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    if (!out->empty()) out->append(L"\n");
+    out->append(L"  · ");
+    out->append(rel);
+  }
+}
+
+static bool PreflightRuntimeCheck() {
+  wchar_t exe_path[MAX_PATH] = {};
+  if (GetModuleFileNameW(nullptr, exe_path, MAX_PATH) == 0) return true;
+  std::wstring dir(exe_path);
+  const size_t slash = dir.find_last_of(L"\\/");
+  if (slash == std::wstring::npos) return true;
+  dir = dir.substr(0, slash + 1);  // 末尾保留分隔符
+
+  // Debug/Profile 产物没有 app.so，直接放行。
+  const std::wstring app_so = dir + L"data\\app.so";
+  if (GetFileAttributesW(app_so.c_str()) == INVALID_FILE_ATTRIBUTES) return true;
+
+  const wchar_t* kRequired[] = {
+      L"data\\icudtl.dat",
+      L"data\\app.so",
+      L"data\\flutter_assets\\assets\\ecdict.db",
+      L"data\\flutter_assets\\assets\\standard_words.json",
+      L"tesseract\\tesseract.exe",
+      L"tesseract\\tessdata\\chi_sim.traineddata",
+      L"tesseract\\tessdata\\eng.traineddata",
+  };
+  const wchar_t* kRequiredDlls[] = {
+      L"flutter_windows.dll",
+      L"window_manager_plugin.dll",
+      L"pdfrx.dll",
+      L"pdfium.dll",
+      L"sqlite3.dll",
+      L"sqlite3_flutter_libs_plugin.dll",
+      L"charset_converter_plugin.dll",
+      L"file_selector_windows_plugin.dll",
+      L"screen_retriever_windows_plugin.dll",
+      L"url_launcher_windows_plugin.dll",
+  };
+
+  std::wstring missing;
+  for (const wchar_t* rel : kRequired) AppendMissingPath(&missing, dir, rel);
+  for (const wchar_t* rel : kRequiredDlls) AppendMissingPath(&missing, dir, rel);
+  if (missing.empty()) return true;
+
+  const std::wstring msg =
+      L"程序缺少必要的运行文件，无法启动。\n\n缺失清单：\n" + missing +
+      L"\n\n请使用完整的发布包：解压后保持 exe、data、tesseract 在同一目录，"
+      L"不要单独复制 exe。\n\n当前程序目录：\n" + dir;
+  MessageBoxW(nullptr, msg.c_str(), L"真题课标词 · 运行环境不完整",
+              MB_ICONERROR | MB_OK);
+  return false;
+}
+
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
                       _In_ wchar_t *command_line, _In_ int show_command) {
+  // 启动探针（仅 ESW_PERF_PROBE 时落盘）：进程创建 -> 此处已包含 CRT 与
+  // 各导入 DLL 的加载时间，是 Dart 侧探针看不到的一段。
+  EswCxxPerfMark("wWinMain.enter");
+
   // Register unhandled exception filter: log native crash then exit.
   SetUnhandledExceptionFilter(CrashFilter);
 
@@ -57,7 +125,15 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   // plugins.
   ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
+  // 运行环境自检：缺 data\ / tesseract\ / 插件 DLL 时明确提示后退出。
+  if (!PreflightRuntimeCheck()) {
+    WriteCrashInfo("preflight.missing_runtime_files");
+    ::CoUninitialize();
+    return EXIT_FAILURE;
+  }
+
   flutter::DartProject project(L"data");
+  EswCxxPerfMark("dartProject.ready");
 
   std::vector<std::string> command_line_arguments =
       GetCommandLineArguments();
@@ -81,6 +157,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     return EXIT_FAILURE;
   }
   window.SetQuitOnClose(true);
+  EswCxxPerfMark("window.Create.return");
 
   ::MSG msg;
   while (::GetMessage(&msg, nullptr, 0, 0)) {

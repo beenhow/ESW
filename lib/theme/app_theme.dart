@@ -4,31 +4,31 @@ import 'package:flutter/material.dart';
 class AppTheme {
   AppTheme._();
 
-  // ── 主色系 ──
-  static const primaryBlue = Color(0xFF1565C0);
-  static const primaryYellow = Color(0xFFF9A825);
-  static const orange = Color(0xFFE65100);
-  static const green = Color(0xFF2E7D32);
-  static const red = Color(0xFFD32F2F);
-  static const grey = Color(0xFF757575);
-  static const lightBlue = Color(0xFF42A5F5);
-  static const teal = Color(0xFF00897B);
-  static const purple = Color(0xFF6A1B9A);
+  // ── 主色系（现代柔和配色，教育场景低刺激） ──
+  static const primaryBlue = Color(0xFF2F6BDF);
+  static const primaryYellow = Color(0xFFF5A800);
+  static const orange = Color(0xFFE8590C);
+  static const green = Color(0xFF2F9E44);
+  static const red = Color(0xFFE03131);
+  static const grey = Color(0xFF6B7280);
+  static const lightBlue = Color(0xFF74C0FC);
+  static const teal = Color(0xFF12B886);
+  static const purple = Color(0xFF7048E8);
 
-  // ── 表面/背景色 (层级: lightest → lighter → light) ──
-  static const surfaceLightest = Color(0xFFFFFDE7);
-  static const surfaceLighter = Color(0xFFFFF9C4);
-  static const surfaceLight = Color(0xFFFFF8E1);
+  // ── 表面/背景色 (层级: lightest → lighter → light，中性蓝灰系) ──
+  static const surfaceLightest = Color(0xFFF8FAFC);
+  static const surfaceLighter = Color(0xFFF2F5F9);
+  static const surfaceLight = Color(0xFFEBF0F6);
 
   // ── 边框色 ──
-  static const borderLight = Color(0xFFE0DCC0);
-  static const borderLighter = Color(0xFFECECD0);
+  static const borderLight = Color(0xFFE3E7EE);
+  static const borderLighter = Color(0xFFEDF0F5);
 
   // ── 文本色 ──
-  static const textPrimary = Color(0xFF212121);
-  static const textSecondary = Color(0xFF555555);
-  static const textHint = Color(0xFF888888);
-  static const textDisabled = Color(0xFFBDBDBD);
+  static const textPrimary = Color(0xFF1F2937);
+  static const textSecondary = Color(0xFF4B5563);
+  static const textHint = Color(0xFF98A2B3);
+  static const textDisabled = Color(0xFFCBD2D9);
 
   // ── 间距体系 ──
   static const double spacingXs = 4;
@@ -45,20 +45,20 @@ class AppTheme {
   static const double fontSizeTitle = 16;
 
   // ── 圆角 ──
-  static const double radiusSm = 6;
-  static const double radiusMd = 8;
-  static const double radiusLg = 12;
-  static const double radiusXl = 20;
+  static const double radiusSm = 8;
+  static const double radiusMd = 10;
+  static const double radiusLg = 14;
+  static const double radiusXl = 24;
 
   // ── 阴影 ──
   static const BoxShadow shadowLight = BoxShadow(
     color: Color(0x0A000000),
-    blurRadius: 4,
+    blurRadius: 6,
     offset: Offset(0, 2),
   );
   static const BoxShadow shadowMedium = BoxShadow(
-    color: Color(0x14000000),
-    blurRadius: 8,
-    offset: Offset(0, 2),
+    color: Color(0x12000000),
+    blurRadius: 10,
+    offset: Offset(0, 3),
   );
 }

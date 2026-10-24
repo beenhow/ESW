@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:async';
+import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'webdav_client.dart';
 
@@ -9,17 +10,30 @@ import 'webdav_client.dart';
 /// 原则：逐词比对时间戳，谁新谁赢。
 /// - 本地更新 → 上传覆盖云端
 /// - 云端更新 → 返回变更列表，由调用方弹窗让用户决定接受/拒绝
-/// - 无网络 → 静默，不报错不弹窗
+/// - 无网络 / 无凭据 / 鉴权失败 → 不再静默：返回 success:false + error_kind，
+///   由 UI 明确告知原因（历史版本静默当成"已是最新"，换机后无从判断）。
 class WordSyncService {
   static final WordSyncService _instance = WordSyncService._();
   factory WordSyncService() => _instance;
 
   WordSyncService._();
 
-  // 诊断日志：定位同步失败环节。写入 exe 同目录 esw_sync_debug.log
+  /// 诊断日志：定位同步失败环节。
+  /// 跨机器可运行性：日志写入用户可写目录（%LOCALAPPDATA%\ESW），不再写 exe
+  /// 同目录——安装到 Program Files 等只读位置时那里不可写；用户目录不可用时
+  /// 才退回 exe 同目录，且整段写入失败均静默忽略，绝不影响主流程。
   static Future<void> _debugLog(String msg) async {
     try {
-      final dir = File(Platform.resolvedExecutable).parent.path;
+      final local = Platform.environment['LOCALAPPDATA'];
+      var dir = (local == null || local.isEmpty)
+          ? File(Platform.resolvedExecutable).parent.path
+          : '$local${Platform.pathSeparator}ESW';
+      try {
+        final d = Directory(dir);
+        if (!await d.exists()) await d.create(recursive: true);
+      } catch (_) {
+        dir = File(Platform.resolvedExecutable).parent.path;
+      }
       final f = File('$dir${Platform.pathSeparator}esw_sync_debug.log');
       await f.writeAsString(
         '${DateTime.now().toIso8601String()} $msg\n',
@@ -28,24 +42,59 @@ class WordSyncService {
     } catch (_) {}
   }
 
-  // WebDAV 传输客户端（懒加载，无配置时为 null → 同步静默 offline）
+  // WebDAV 传输客户端（懒加载，无配置时为 null → sync 返回 no_config 失败）
   WebDavClient? _dav;
+
+  /// 最近一次同步失败的分类原因，供 UI 给出可读提示：
+  /// no_config / auth / network / timeout / http / unknown；null 表示最近一次未失败。
+  String? lastErrorKind;
+  String? lastError;
+
+  /// 本次实际使用凭据的来源（user / localappdata / portable / bundled），用于诊断。
+  String? credentialSource;
+
+  /// 凭据或网络环境变化后强制重新加载配置（手动填写账号后必须调用）。
+  void resetClient() {
+    _dav = null;
+    lastErrorKind = null;
+    lastError = null;
+    credentialSource = null;
+  }
 
   Future<WebDavClient?> _davClient() async {
     if (_dav != null) return _dav;
     try {
       final cfg = await WebDavConfig.load();
       if (cfg == null || !cfg.isValid) {
-        await _debugLog('[_davClient] 配置加载失败或无效 (cfg==null: ${cfg == null})');
+        lastErrorKind = 'no_config';
+        lastError = '本机未找到可用的同步账号配置（用户目录 / %LOCALAPPDATA%\\ESW / exe 同目录 / 内置配置均不可用）';
+        await _debugLog('[_davClient] 无可用凭据: $lastError');
         return null;
       }
       _dav = WebDavClient.fromConfig(cfg);
-      await _debugLog('[_davClient] 配置加载成功 baseUrl=${cfg.baseUrl}');
+      credentialSource = cfg.source;
+      lastErrorKind = null;
+      lastError = null;
+      await _debugLog(
+          '[_davClient] 配置加载成功 source=${cfg.source} baseUrl=${cfg.baseUrl} user=${cfg.username}');
       return _dav;
     } catch (e) {
+      lastErrorKind = 'no_config';
+      lastError = '同步账号配置读取异常：$e';
       await _debugLog('[_davClient] 配置加载异常: $e');
       return null;
     }
+  }
+
+  /// 账号自检（供「同步账号设置 → 测试连接」使用），返回 {ok, message, kind, status}。
+  Future<Map<String, dynamic>> verifyAccount(WebDavConfig cfg) async {
+    final probe = await WebDavClient.fromConfig(cfg).probe();
+    return {
+      'ok': probe['ok'] == true,
+      'message': probe['message']?.toString() ?? '',
+      'kind': probe['kind']?.toString() ?? '',
+      'status': probe['status'],
+    };
   }
 
   // 本地时间戳缓存：{lowercase_word: iso8601_timestamp}
@@ -235,19 +284,27 @@ class WordSyncService {
       ).timeout(const Duration(seconds: 120));
     } catch (e) {
       if (e is TimeoutException) {
+        lastErrorKind = 'timeout';
+        lastError = '同步超时（120 秒无响应），请检查网络后重试';
         await _debugLog('[sync] 同步超时(120s)');
         return {
           'success': false,
           'offline': true,
+          'error_kind': 'timeout',
+          'error': lastError,
           'remote_changes': <Map<String, String>>[],
           'pushed_count': 0,
           'extendBaseMap': <String, String>{},
         };
       }
+      lastErrorKind = 'unknown';
+      lastError = '同步异常：$e';
       await _debugLog('[sync] 外层异常: $e');
       return {
         'success': false,
         'offline': true,
+        'error_kind': 'unknown',
+        'error': lastError,
         'remote_changes': <Map<String, String>>[],
         'pushed_count': 0,
         'extendBaseMap': <String, String>{},
@@ -286,6 +343,40 @@ class WordSyncService {
             needsPush = true;
           }
         }
+      }
+
+      // 3-pre. 换电脑 / 首次同步的整库恢复（bootstrap）
+      //
+      // 新机本地词库为空（无词、无时间戳、无删除墓碑）时，云端每个词都会被判成
+      // remote_only 新增，历史实现会生成上万条逐词冲突卡（1.5.8 实测 12973 条），
+      // 用户既不可能逐词点选，体验上等同于"换电脑后同步不了词库"。
+      // 这里改为一次性整库恢复：不弹逐词冲突，也不反向推送。
+      final freshLocal =
+          localWords.isEmpty && _localTimestamps.isEmpty && _localDeletions.isEmpty;
+      if (freshLocal && remoteWords.isNotEmpty) {
+        final bootstrapWords = <String, Map<String, String>>{};
+        for (final e in remoteWords.entries) {
+          final v = e.value;
+          if (v is! Map) continue;
+          final cat = (v['category'] as String?) ?? '';
+          if (cat.isEmpty) continue;
+          bootstrapWords[e.key] = {
+            'original_case': (v['original_case'] as String?) ?? e.key,
+            'category': cat,
+            'timestamp': (v['timestamp'] as String?) ?? '',
+          };
+        }
+        await _debugLog(
+            '[bootstrap] 本机词库为空，云端 ${bootstrapWords.length} 词 → 整库恢复（不生成逐词冲突）');
+        return {
+          'success': true,
+          'bootstrap': true,
+          'bootstrap_words': bootstrapWords,
+          'remote_changes': <Map<String, String>>[],
+          'pushed_count': 0,
+          'extendBaseMap': _mapToStringMap(remoteBaseMap),
+          'remote_count': remoteInitialCount,
+        };
       }
 
       // 3. 逐词比对
@@ -377,6 +468,7 @@ class WordSyncService {
 
       // 4. 推送
       int pushedCount = 0;
+      var pushFailed = false;
       if (needsPush) {
         state['words'] = remoteWords;
         state['deleted'] = remoteDeleted;
@@ -386,6 +478,13 @@ class WordSyncService {
         if (ok) {
           pushedCount = 1;
           await _saveTimestampsNow(); // 同步成功后立即持久化时间戳
+        } else {
+          // 拉取成功但上传失败（网络抖动 / 目录权限）：不能报"已是最新"，
+          // 否则用户以为同步成功，重装或换机后云端仍是旧数据。
+          pushFailed = true;
+          lastErrorKind = 'push_failed';
+          lastError = '本地变更上传云端失败（网络或云端权限问题）';
+          await _debugLog('[sync] 推送失败：本地变更未上传');
         }
       }
 
@@ -393,16 +492,99 @@ class WordSyncService {
         'success': true,
         'remote_changes': remoteChanges,
         'pushed_count': pushedCount,
+        'push_failed': pushFailed,
         'extendBaseMap': _mapToStringMap(remoteBaseMap),
         'remote_count': remoteInitialCount,
       };
 
-    } catch (e, st) {
-      // 无网络或其它异常 → 静默
-      await _debugLog('[_doSync] 同步异常被静默: $e\n$st');
+    } on WebDavConfigException catch (e) {
+      lastErrorKind = 'no_config';
+      lastError = e.message;
+      await _debugLog('[_doSync] 无可用凭据: $e');
+      return {
+        'success': false,
+        'offline': false,
+        'error_kind': 'no_config',
+        'error': lastError,
+        'remote_changes': <Map<String, String>>[],
+        'pushed_count': 0,
+        'extendBaseMap': <String, String>{},
+      };
+    } on WebDavAuthException catch (e) {
+      lastErrorKind = 'auth';
+      lastError = e.message;
+      await _debugLog('[_doSync] 鉴权失败: $e');
+      return {
+        'success': false,
+        'offline': false,
+        'error_kind': 'auth',
+        'error': lastError,
+        'remote_changes': <Map<String, String>>[],
+        'pushed_count': 0,
+        'extendBaseMap': <String, String>{},
+      };
+    } on WebDavHttpException catch (e) {
+      lastErrorKind = 'http';
+      lastError = e.message;
+      await _debugLog('[_doSync] 云端返回错误: $e');
+      return {
+        'success': false,
+        'offline': false,
+        'error_kind': 'http',
+        'error': lastError,
+        'remote_changes': <Map<String, String>>[],
+        'pushed_count': 0,
+        'extendBaseMap': <String, String>{},
+      };
+    } on TimeoutException catch (e) {
+      lastErrorKind = 'timeout';
+      lastError = '云端响应超时：$e';
+      await _debugLog('[_doSync] 超时: $e');
       return {
         'success': false,
         'offline': true,
+        'error_kind': 'timeout',
+        'error': lastError,
+        'remote_changes': <Map<String, String>>[],
+        'pushed_count': 0,
+        'extendBaseMap': <String, String>{},
+      };
+    } on SocketException catch (e) {
+      lastErrorKind = 'network';
+      lastError = '网络不可用：${e.message}';
+      await _debugLog('[_doSync] 网络异常: $e');
+      return {
+        'success': false,
+        'offline': true,
+        'error_kind': 'network',
+        'error': lastError,
+        'remote_changes': <Map<String, String>>[],
+        'pushed_count': 0,
+        'extendBaseMap': <String, String>{},
+      };
+    } on http.ClientException catch (e) {
+      lastErrorKind = 'network';
+      lastError = '网络请求失败：${e.message}';
+      await _debugLog('[_doSync] HTTP 客户端异常: $e');
+      return {
+        'success': false,
+        'offline': true,
+        'error_kind': 'network',
+        'error': lastError,
+        'remote_changes': <Map<String, String>>[],
+        'pushed_count': 0,
+        'extendBaseMap': <String, String>{},
+      };
+    } catch (e, st) {
+      // 其它异常：不再静默吞掉，返回 unknown 由 UI 提示，同时写日志留证
+      lastErrorKind = 'unknown';
+      lastError = '同步失败：$e';
+      await _debugLog('[_doSync] 同步异常: $e\n$st');
+      return {
+        'success': false,
+        'offline': false,
+        'error_kind': 'unknown',
+        'error': lastError,
         'remote_changes': <Map<String, String>>[],
         'pushed_count': 0,
         'extendBaseMap': <String, String>{},
@@ -426,7 +608,7 @@ class WordSyncService {
     final dav = await _davClient();
     if (dav == null) {
       await _debugLog('[_davGet] davClient 为 null，无法同步');
-      throw Exception('未配置 WebDAV 同步');
+      throw WebDavConfigException(lastError ?? '未配置 WebDAV 同步');
     }
     final content = await dav.getJson(path);
     if (content == null) {
