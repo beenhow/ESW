@@ -24,13 +24,20 @@ import 'pages/detect_page.dart';
 import 'pages/word_bank_page.dart';
 import 'shared/vocab_service.dart';
 import 'shared/word_sync_service.dart';
+import 'shared/webdav_client.dart';
 import 'shared/doc_extractor.dart';
 import 'shared/export_extra_table.dart';
 import 'shared/base_word_candidates.dart';
 import 'shared/inplace_docx_annotator.dart';
+import 'shared/export_annotate_markup.dart';
+import 'shared/export_word_style.dart';
+import 'export_summary.dart';
 import 'shared/app_snack_bar.dart';
 import 'shared/export_progress_overlay.dart';
 import 'dictionary_service.dart';
+
+/// 安卓端当前版本号（显示与更新比较的唯一来源，发布版需与 pubspec 保持一致）。
+const String kAndroidAppVersion = '1.5.8';
 
 /// 生成导出文件名：ESW + 原文件名(去扩展名) + 检测结果 + 时间戳防重后缀。
 /// 源文件场景取 widget.fileName；为空（粘贴文本）时用「文本检测」兜底；
@@ -88,14 +95,6 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
   /// 按教材文件统计的教材语料词库命中单词数（{教材名(去扩展名): 命中次数}）。
   /// null 表示尚未统计完成 / 加载中；空 Map 表示无教材数据。
   Map<String, int>? _textbookHitCounts;
-
-  /// 按年份统计的真题语料命中明细（{年份: [单词 + 词性/分类]}），
-  /// 供检测页点击年份格展开查看。与 _yearHitCounts 同批统计。
-  Map<int, List<CorpusHitWord>>? _yearHitWords;
-
-  /// 按教材文件统计的教材语料命中明细（{教材名(去扩展名): [单词 + 词性/分类]}），
-  /// 供检测页点击教材格展开查看。
-  Map<String, List<CorpusHitWord>>? _textbookHitWords;
   bool _syncing = false;
   final WordSyncService _wordSyncService = WordSyncService();
   String _userId = '';
@@ -287,6 +286,52 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
         source: 'android',
       );
 
+      // 同步失败（无凭据 / 鉴权被拒 / 网络 / 超时 / 云端错误）：
+      // 历史实现直接取 remote_changes，失败时该字段为 null 会抛异常，
+      // 最终只弹一句 "同步失败: type 'Null' is not a subtype..."，
+      // 用户既看不出是没账号还是账号错，也始终拿不到云端词库。
+      if (result['success'] != true) {
+        await _handleSyncFailure(result);
+        return;
+      }
+
+      // 本机词库为空但云端已有词库：服务端返回整库恢复（bootstrap），
+      // remote_changes 恒为空列表。历史实现只处理 remote_changes，
+      // 于是提示"同步完成"却一个词也没落库，拓展/超标/专有词长期显示 0。
+      if (result['bootstrap'] == true) {
+        final raw = result['bootstrap_words'];
+        final words = <String, Map<String, String>>{};
+        if (raw is Map) {
+          for (final e in raw.entries) {
+            final v = e.value;
+            if (v is! Map) continue;
+            final cat = (v['category'] ?? '').toString();
+            if (cat.isEmpty) continue;
+            words[e.key.toString()] = {
+              'original_case': (v['original_case'] ?? e.key).toString(),
+              'category': cat,
+            };
+          }
+        }
+        final restored = _vocab.applyBootstrapWords(words);
+        final bootstrapEbm = result['extendBaseMap'] as Map<String, dynamic>?;
+        if (bootstrapEbm != null) {
+          for (final entry in bootstrapEbm.entries) {
+            _vocab.extendBaseMap[entry.key] = entry.value.toString();
+          }
+        }
+        await _saveConfig();
+        if (mounted) {
+          setState(() {});
+          showAppSnackBar(
+            context,
+            '已从云端恢复 $restored 个词条',
+            type: AppSnackBarType.success,
+          );
+        }
+        return;
+      }
+
       final remoteChanges = result['remote_changes'] as List<dynamic>;
 
       if (remoteChanges.isNotEmpty && mounted) {
@@ -376,6 +421,209 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
       }
     } finally {
       if (mounted) setState(() => _syncing = false);
+    }
+  }
+
+  /// 同步失败的分类提示（对齐 Windows 主流程）。
+  ///
+  /// 历史实现把无凭据 / 鉴权失败一律吞成"已是最新"，用户无法判断是没账号、
+  /// 账号错、还是云端没数据，也就永远拿不到云端词库。
+  Future<void> _handleSyncFailure(Map<String, dynamic> result) async {
+    final kind = result['error_kind']?.toString() ?? 'unknown';
+    final msg = result['error']?.toString() ?? '未知原因';
+    if (!mounted) return;
+
+    if (kind == 'no_config' || kind == 'auth') {
+      final open = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => AlertDialog(
+          title: Text(kind == 'no_config' ? '未配置同步账号' : '同步账号无效'),
+          content: Text(
+            kind == 'no_config'
+                ? '本机没有找到可用的坚果云同步账号，因此无法同步词库。\n\n'
+                    '可以直接填写坚果云账号与应用密码（只保存在本机，不随安装包分发）。'
+                : '坚果云拒绝了当前同步账号：$msg\n\n'
+                    '请在坚果云「安全设置」里重新生成应用密码后填写。',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('稍后'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('填写同步账号'),
+            ),
+          ],
+        ),
+      );
+      if (open == true) await _showSyncAccountDialog();
+      return;
+    }
+
+    final hint = kind == 'timeout'
+        ? '同步超时：网络较慢或云端无响应，请稍后重试。'
+        : kind == 'network'
+            ? '网络不可用：请检查网络连接后重试。'
+            : kind == 'http'
+                ? '云端返回错误：$msg'
+                : '同步失败：$msg';
+    showAppSnackBar(
+      context,
+      hint,
+      type: AppSnackBarType.error,
+      duration: const Duration(seconds: 6),
+    );
+  }
+
+  /// 手动填写同步账号（换机 / 换密码 / 内置凭据失效时的兜底入口）。
+  Future<void> _showSyncAccountDialog() async {
+    final cfg = await WebDavConfig.load();
+    final baseCtrl = TextEditingController(
+      text: (cfg != null && cfg.baseUrl.isNotEmpty)
+          ? cfg.baseUrl
+          : 'https://dav.jianguoyun.com/dav/esw_sync',
+    );
+    final userCtrl = TextEditingController(text: cfg?.username ?? '');
+    final pwdCtrl = TextEditingController(text: cfg?.password ?? '');
+    if (!mounted) return;
+
+    final saved = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        var testing = false;
+        var status = '';
+        var statusOk = false;
+        return StatefulBuilder(
+          builder: (ctx2, setDialogState) => AlertDialog(
+            title: const Text('同步账号'),
+            content: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    '填写坚果云账号与「应用密码」（坚果云 → 账户信息 → 安全设置 → 添加应用），'
+                    '保存后只写入本机存储，不随安装包分发。',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: baseCtrl,
+                    decoration: const InputDecoration(
+                      labelText: '服务地址',
+                      isDense: true,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: userCtrl,
+                    keyboardType: TextInputType.emailAddress,
+                    decoration: const InputDecoration(
+                      labelText: '账号（邮箱）',
+                      isDense: true,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: pwdCtrl,
+                    obscureText: true,
+                    decoration: const InputDecoration(
+                      labelText: '应用密码',
+                      isDense: true,
+                    ),
+                  ),
+                  if (status.isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    Text(
+                      status,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: statusOk ? EswColors.green : EswColors.red,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('取消'),
+              ),
+              TextButton(
+                onPressed: testing
+                    ? null
+                    : () async {
+                        setDialogState(() {
+                          testing = true;
+                          status = '';
+                        });
+                        final testCfg = WebDavConfig(
+                          baseUrl: baseCtrl.text.trim(),
+                          username: userCtrl.text.trim(),
+                          password: pwdCtrl.text,
+                        );
+                        final probe =
+                            await _wordSyncService.verifyAccount(testCfg);
+                        if (!mounted) return;
+                        setDialogState(() {
+                          testing = false;
+                          statusOk = probe['ok'] == true;
+                          status = probe['message']?.toString() ?? '';
+                        });
+                      },
+                child: Text(testing ? '测试中…' : '测试连接'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('保存并同步'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+
+    if (saved == true) {
+      final base = baseCtrl.text.trim();
+      final user = userCtrl.text.trim();
+      final pwd = pwdCtrl.text;
+      if (base.isEmpty || user.isEmpty || pwd.isEmpty) {
+        if (mounted) {
+          showAppSnackBar(
+            context,
+            '服务地址 / 账号 / 应用密码都不能为空',
+            type: AppSnackBarType.error,
+          );
+        }
+        return;
+      }
+      final ok = await WebDavConfig(
+        baseUrl: base,
+        username: user,
+        password: pwd,
+        source: 'user',
+      ).save();
+      // 凭据变更后必须重建客户端，否则仍用旧 header 请求
+      _wordSyncService.resetClient();
+      if (!mounted) return;
+      if (!ok) {
+        showAppSnackBar(
+          context,
+          '账号保存失败：无法写入本机存储',
+          type: AppSnackBarType.error,
+        );
+        return;
+      }
+      showAppSnackBar(
+        context,
+        '同步账号已保存，正在同步词库…',
+        type: AppSnackBarType.success,
+      );
+      await _syncVocab();
     }
   }
 
@@ -638,7 +886,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
       }
       final json = jsonDecode(resp.body) as Map<String, dynamic>;
       final tagName = (json['tag_name'] as String?)?.replaceFirst('v', '') ?? '0.0.0';
-      if (_compareVersions(tagName, '1.5.8') <= 0) {
+      if (_compareVersions(tagName, kAndroidAppVersion) <= 0) {
         if (context.mounted) {
           showAppSnackBar(context, '已是最新版本', type: AppSnackBarType.success);
         }
@@ -652,7 +900,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Text('当前版本: V1.5.8'),
+              Text('当前版本: V$kAndroidAppVersion'),
               Text('最新版本: $tagName'),
               const SizedBox(height: 12),
               const Text('请选择下载入口：'),
@@ -763,11 +1011,34 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     }
     final corpusPath = await _corpusDirPath();
     final textbookPath = await _textbookDirPath();
-    Map<int, int> yearCounts = const <int, int>{};
-    Map<String, int> textbookCounts = const <String, int>{};
-    Map<int, List<CorpusHitWord>> yearWords = const <int, List<CorpusHitWord>>{};
-    Map<String, List<CorpusHitWord>> textbookWords =
-        const <String, List<CorpusHitWord>>{};
+
+    Map<int, int> parseYearCounts(Map raw) {
+      final out = <int, int>{};
+      final counts = raw['counts'];
+      if (counts is Map) {
+        counts.forEach((k, v) {
+          final year = k is int ? k : int.tryParse('$k');
+          final cnt = v is int ? v : int.tryParse('$v');
+          if (year != null && cnt != null) out[year] = cnt;
+        });
+      }
+      return out;
+    }
+
+    Map<String, int> parseTextbookCounts(Map raw) {
+      final out = <String, int>{};
+      final counts = raw['counts'];
+      if (counts is Map) {
+        counts.forEach((k, v) {
+          final cnt = v is int ? v : int.tryParse('$v');
+          if (k != null && cnt != null) out['$k'] = cnt;
+        });
+      }
+      return out;
+    }
+
+    Map<int, int>? yearCounts;
+    Map<String, int>? textbookCounts;
     try {
       final results = await Future.wait([
         Isolate.run(
@@ -781,54 +1052,44 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
           }),
         ),
       ]);
-      final yearRaw = results[0];
-      final textbookRaw = results[1];
-      yearCounts = yearRaw['counts'].cast<int, int>();
-      textbookCounts = textbookRaw['counts'].cast<String, int>();
-      yearWords = _decodeYearHitWords(yearRaw['words'] as Map);
-      textbookWords = _decodeTextbookHitWords(textbookRaw['words'] as Map);
+      yearCounts = parseYearCounts(results[0]);
+      textbookCounts = parseTextbookCounts(results[1]);
     } catch (_) {
-      yearCounts = const <int, int>{};
-      textbookCounts = const <String, int>{};
-      yearWords = const <int, List<CorpusHitWord>>{};
-      textbookWords = const <String, List<CorpusHitWord>>{};
+      // 留空表示"未知"，不当作"无数据"，稍后回退主 isolate 重算
+      yearCounts = null;
+      textbookCounts = null;
     }
+
+    // 后台 isolate 结果异常或为空、但语料目录确有文件时，回退主 isolate 重算一次，
+    // 杜绝"已导入语料却提示暂无年份数据"的假空统计。
+    if (yearCounts == null ||
+        (yearCounts.isEmpty && _corpusFileCount > 0)) {
+      try {
+        yearCounts = parseYearCounts(
+          _scanYearHitCountsWorker({
+            'dirPath': corpusPath,
+            'vocab': vocabInfo,
+          }),
+        );
+      } catch (_) {}
+    }
+    if (textbookCounts == null ||
+        (textbookCounts.isEmpty && _textbookFileCount > 0)) {
+      try {
+        textbookCounts = parseTextbookCounts(
+          _scanTextbookHitCountsWorker({
+            'dirPath': textbookPath,
+            'vocab': vocabInfo,
+          }),
+        );
+      } catch (_) {}
+    }
+
     if (!mounted) return;
     setState(() {
       _yearHitCounts = yearCounts;
       _textbookHitCounts = textbookCounts;
-      _yearHitWords = yearWords;
-      _textbookHitWords = textbookWords;
     });
-  }
-
-  /// 将 isolate 返回的年份命中明细（{年份: [{w,p,c}]}）还原为强类型列表。
-  static Map<int, List<CorpusHitWord>> _decodeYearHitWords(Map raw) {
-    final out = <int, List<CorpusHitWord>>{};
-    raw.forEach((key, value) {
-      out[key as int] = _decodeHitWordList(value as List);
-    });
-    return out;
-  }
-
-  /// 将 isolate 返回的教材命中明细（{教材名: [{w,p,c}]}）还原为强类型列表。
-  static Map<String, List<CorpusHitWord>> _decodeTextbookHitWords(Map raw) {
-    final out = <String, List<CorpusHitWord>>{};
-    raw.forEach((key, value) {
-      out[key as String] = _decodeHitWordList(value as List);
-    });
-    return out;
-  }
-
-  static List<CorpusHitWord> _decodeHitWordList(List raw) {
-    return [
-      for (final e in raw)
-        CorpusHitWord(
-          word: (e as Map)['w'] as String? ?? '',
-          pos: e['p'] as String? ?? '',
-          category: e['c'] as String? ?? '',
-        ),
-    ];
   }
 
   /// 返回教材语料目录路径（应用文档目录下的 textbook 子目录）。
@@ -918,8 +1179,6 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
       textbookCount: _textbookFileCount < 0 ? null : _textbookFileCount,
       yearHits: _yearHitCounts,
       textbookHits: _textbookHitCounts,
-      yearHitWords: _yearHitWords,
-      textbookHitWords: _textbookHitWords,
       categoryCounts: [
         _vocab.standardWords.length,
         _vocab.extendWords.length,
@@ -3745,10 +4004,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
         await File(srcPath).exists()) {
       try {
         final srcBytes = await File(srcPath).readAsBytes();
-        final catByLower = <String, String>{};
-        for (final w in _words) {
-          catByLower.putIfAbsent(w.word.toLowerCase(), () => w.category);
-        }
+        final catByLower = _exportCatByLower();
         final preamble = _buildDocxPreambleAndroid(
           fileName: widget.fileName,
           exportData: exportData,
@@ -3771,11 +4027,9 @@ class _AnalysisPageState extends State<_AnalysisPage> {
     final bodyParts = <String>[];
     bodyParts.add(_docxParagraph('ESW 文本检测导出', heading: 1));
     bodyParts.add(_docxParagraph('文件名: ${widget.fileName}'));
-    final cc = _categoryCounts;
-    final docxTotalRawCount = _words.fold<int>(0, (sum, w) => sum + w.frequency);
-    bodyParts.add(_docxParagraph('全套题词数: $docxTotalRawCount | 去重总词数: ${_words.length} | 课标词: ${cc['课标词'] ?? 0} | 拓展词: ${cc['拓展词'] ?? 0} | 超标词: ${cc['超标词'] ?? 0} | 专有词: ${cc['专有词'] ?? 0} | 其他: ${cc['其他'] ?? 0} | 汉语标注词: $_annotatedCount'));
+    bodyParts.add(_docxSummaryParagraphAndroid());
     bodyParts.add(_docxParagraph('【标注说明】', heading: 2));
-    bodyParts.add(_docxParagraph('拓展词：浅黄高亮+加粗；超标词：浅粉高亮；专有词：浅绿高亮；课标词：无标记'));
+    bodyParts.add(_docxAnnotateLegendParagraphAndroid());
     bodyParts.add(_docxParagraph('带标注全文', heading: 2));
     bodyParts.add(_docxAnnotatedParagraph());
     bodyParts.addAll(_buildDocxDetailParagraphsAndroid(exportData));
@@ -3819,14 +4073,12 @@ ${bodyParts.join('\n')}
     required String fileName,
     required _ExportTableData exportData,
   }) {
-    final cc = _categoryCounts;
-    final docxTotalRawCount = _words.fold<int>(0, (sum, w) => sum + w.frequency);
     return [
       _docxParagraph('ESW 文本检测导出', heading: 1),
       _docxParagraph('文件名: $fileName'),
-      _docxParagraph('全套题词数: $docxTotalRawCount | 去重总词数: ${_words.length} | 课标词: ${cc['课标词'] ?? 0} | 拓展词: ${cc['拓展词'] ?? 0} | 超标词: ${cc['超标词'] ?? 0} | 专有词: ${cc['专有词'] ?? 0} | 其他: ${cc['其他'] ?? 0} | 汉语标注词: $_annotatedCount'),
+      _docxSummaryParagraphAndroid(),
       _docxParagraph('【标注说明】', heading: 2),
-      _docxParagraph('拓展词：浅黄高亮+加粗；超标词：浅粉高亮；专有词：浅绿高亮；课标词：无标记'),
+      _docxAnnotateLegendParagraphAndroid(),
     ];
   }
 
@@ -3917,80 +4169,82 @@ ${bodyParts.join('\n')}
     return '<w:p><w:pPr><w:pStyle$style/></w:pPr>$runs</w:p>';
   }
 
-  /// 生成带标注全文的 DOCX 段落：按行拆分生成独立 `<w:p>` 保留原文换行；
-  /// 按分类用规范字色 + 字重着色，**不加底纹/高亮**（Word 导出统一口径，
-  /// 底纹只用于 PDF 导出）。
-  String _docxAnnotatedParagraph() {
-    final catByLower = <String, String>{};
+  /// 原文标注用的「小写单词 → 分类」映射，逐字对齐 Windows 版 `wordCatMap`。
+  /// 安卓检测分类只有「课标词 / 拓展词 / 超标词 / 专有词 / 其他」：
+  ///
+  /// - 词库归属原样传入（课标词 / 拓展词 / 超标词 / 专有词），**不按课标级别细分**：
+  ///   Windows 端的分类映射取的就是粗粒度「课标词」，`exportWordStyleOf('课标词')`
+  ///   查不到规范色 → 原文中保持默认黑、不加粗。安卓端若自行细分成
+  ///   初中/必修/选修课标词，反而会着上黑粗 / 深蓝 / 浅蓝，与 Windows 版不一致。
+  /// - 安卓的「其他」等价于 Windows 的「未筛选且语料出现过」，Windows 侧统一降为
+  ///   「真题词」不参与配色，此处同样处理。
+  Map<String, String> _exportCatByLower() {
+    final map = <String, String>{};
     for (final w in _words) {
-      catByLower.putIfAbsent(w.word.toLowerCase(), () => w.category);
+      final cat = exportAnnotateCategoryOfFilter(w.category);
+      map.putIfAbsent(w.word.toLowerCase(), () => cat);
     }
-    // 分类 -> (文字颜色, 加粗)；原荧光高亮底纹已按口径去除，改用规范字色标注。
-    (String, bool) styleOf(String cat) {
-      switch (cat) {
-        case '拓展词':
-          return ('006400', true);
-        case '超标词':
-          return ('FF0000', false);
-        case '专有词':
-          return ('800080', false);
-        default:
-          return ('000000', false);
-      }
-    }
-
-    // 单行着色生成一个 <w:p>
-    String oneLine(String line) {
-      final regex = RegExp(r'[a-zA-Z]+');
-      final runs = <String>[];
-      int lastEnd = 0;
-      for (final m in regex.allMatches(line)) {
-        final word = m.group(0)!;
-        final cat = catByLower[word.toLowerCase()];
-        final plain = line.substring(lastEnd, m.start);
-        if (plain.isNotEmpty) {
-          runs.add(_docxRun(plain, '000000'));
-        }
-        final st = styleOf(cat ?? '');
-        runs.add(_docxRun(word, st.$1, bold: st.$2));
-        lastEnd = m.end;
-      }
-      final tail = line.substring(lastEnd);
-      if (tail.isNotEmpty) runs.add(_docxRun(tail, '000000'));
-      return '<w:p>${runs.join('')}</w:p>';
-    }
-
-    return _text.split('\n').map(oneLine).join('\n');
+    return map;
   }
 
-  /// 生成单个 DOCX run（仅字色 + 可选加粗；不含底纹/高亮，Word 导出统一不加底纹）。
-  String _docxRun(String text, String color, {bool bold = false}) {
-    final escaped = text
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;');
-    final b = bold ? '<w:b/>' : '';
-    return '<w:r><w:rPr><w:color w:val="$color"/>$b</w:rPr>'
-           '<w:t xml:space="preserve">$escaped</w:t></w:r>';
+  /// 课标词按课标级别（初中 / 必修 / 选修）计数，供导出汇总与标注说明使用。
+  Map<String, int> _exportStandardCategoryCounts() {
+    final counts = <String, int>{};
+    for (final w in _words) {
+      if (w.category != '课标词') continue;
+      final cat = (widget.vocab.lookup(w.word)['category'] ?? '').toString();
+      if (counts.containsKey(cat)) {
+        counts[cat] = counts[cat]! + 1;
+      }
+    }
+    return counts;
   }
 
-  /// 生成带目标词加粗的 DOCX 段落：按单词切分 run，命中目标词（忽略大小写）时加粗。
-  String _docxParagraphWithBoldWords(String text, List<String> words) {
-    final targets = words.map((w) => w.toLowerCase()).toSet();
-    final regex = RegExp(r'[a-zA-Z]+');
+  /// 导出汇总条目（顺序、名称、配色与 Windows 版共用同一份构建逻辑）。
+  List<ExportSummaryItem> _buildExportSummaryItemsAndroid() =>
+      buildExportSummaryItems(
+        totalRawCount: _words.fold<int>(0, (sum, w) => sum + w.frequency),
+        dedupCount: _words.length,
+        filterCounts: Map<String, int>.from(_categoryCounts),
+        standardCategoryCounts: _exportStandardCategoryCounts(),
+      );
+
+  /// DOCX 汇总段：七类条目按规范色 + 字重着色，竖线分隔（与 Windows 版同款）。
+  String _docxSummaryParagraphAndroid() {
+    final items = _buildExportSummaryItemsAndroid();
     final runs = <String>[];
-    int lastEnd = 0;
-    for (final m in regex.allMatches(text)) {
-      final word = m.group(0)!;
-      final plain = text.substring(lastEnd, m.start);
-      if (plain.isNotEmpty) runs.add(_docxRun(plain, '000000'));
-      runs.add(_docxRun(word, '000000', bold: targets.contains(word.toLowerCase())));
-      lastEnd = m.end;
+    for (var i = 0; i < items.length; i++) {
+      if (i > 0) runs.add(docxRunXml(' | ', ExportSummaryItem.black));
+      runs.add(docxRunXml('${items[i].label}: ${items[i].value}',
+          items[i].colorHex, bold: items[i].bold));
     }
-    final tail = text.substring(lastEnd);
-    if (tail.isNotEmpty) runs.add(_docxRun(tail, '000000'));
     return '<w:p>${runs.join('')}</w:p>';
   }
+
+  /// DOCX 标注说明段：七类逐类以规范色 + 字重呈现，末尾跟该类统计词数。
+  String _docxAnnotateLegendParagraphAndroid() {
+    final segments =
+        exportAnnotateLegendSegments(_buildExportSummaryItemsAndroid());
+    final runs = <String>[];
+    for (var i = 0; i < segments.length; i++) {
+      final seg = segments[i];
+      if (i > 0) runs.add(docxRunXml('；', ExportSummaryItem.black));
+      runs.add(docxRunXml('${seg.label}（${seg.count} 词）', seg.colorHex,
+          bold: seg.bold));
+    }
+    return '<w:p>${runs.join('')}</w:p>';
+  }
+
+  /// 生成带标注全文的 DOCX 段落：规范七类的字色 + 字重着色，**不加底纹**。
+  ///
+  /// 实现单点落地于 shared/export_annotate_markup.dart，与 Windows 版
+  /// 共用同一份标注实现，杜绝双端配色 / 字重漂移。
+  String _docxAnnotatedParagraph() =>
+      docxAnnotatedParagraphXml(_text, _exportCatByLower());
+
+  /// 生成带目标词加粗的 DOCX 段落：命中目标词（忽略大小写）时加粗。
+  String _docxParagraphWithBoldWords(String text, List<String> words) =>
+      docxParagraphWithBoldWordsXml(text, words);
 
   Color _chipColor(String cat) {
     switch (cat) {
@@ -4714,8 +4968,10 @@ String _extractImportContentFromPathWorker(Map<String, dynamic> args) {
 /// 目录不存在或无法识别年份的文件忽略。
 Map<String, dynamic> _scanYearHitCountsWorker(Map<String, dynamic> args) {
   final dirPath = args['dirPath'] as String;
-  final vocab = (args['vocab'] as Map).cast<String, Map<String, String>>();
-  final yearRe = RegExp(r'^(\d{4})');
+  // isolate 传输后嵌套 Map 的泛型实参可能退化为 dynamic，
+  // 这里不做 cast，统一按 dynamic 读取，避免 CastError 导致整段统计失败。
+  final vocabRaw = args['vocab'] as Map;
+  final yearRe = RegExp(r'(?<!\d)((?:19|20)\d{2})(?!\d)');
   final wordRe = RegExp(r"[a-zA-Z']+");
   final counts = <int, int>{};
   final hits = <int, Map<String, Map<String, String>>>{};
@@ -4725,7 +4981,10 @@ Map<String, dynamic> _scanYearHitCountsWorker(Map<String, dynamic> args) {
   }
   for (final f in dir.listSync().whereType<File>()) {
     if (!f.path.toLowerCase().endsWith('.txt')) continue;
-    final m = yearRe.firstMatch(f.uri.pathSegments.last);
+    // 年份允许出现在文件名任意位置（2023全国卷 / 全国卷-2023 / 2019-2023 均取首个）
+    final m = yearRe.firstMatch(
+      f.path.split(RegExp(r'[/\\]')).last,
+    );
     if (m == null) continue;
     final year = int.tryParse(m.group(1)!);
     if (year == null) continue;
@@ -4739,14 +4998,14 @@ Map<String, dynamic> _scanYearHitCountsWorker(Map<String, dynamic> args) {
     for (final wm in wordRe.allMatches(text)) {
       final raw = wm.group(0)!;
       final lower = raw.toLowerCase();
-      final info = vocab[lower];
-      if (info == null) continue;
+      final infoRaw = vocabRaw[lower];
+      if (infoRaw is! Map) continue;
       count++;
       hits
           .putIfAbsent(year, () => <String, Map<String, String>>{})[lower] = {
         'w': raw,
-        'p': info['pos'] ?? '',
-        'c': info['cat'] ?? '',
+        'p': infoRaw['pos']?.toString() ?? '',
+        'c': infoRaw['cat']?.toString() ?? '',
       };
     }
     counts[year] = (counts[year] ?? 0) + count;
@@ -4769,7 +5028,8 @@ Map<String, dynamic> _scanYearHitCountsWorker(Map<String, dynamic> args) {
 /// 返回 {'counts': {教材名: 命中次数}, 'words': {教材名: [{w,p,c}]}}。
 Map<String, dynamic> _scanTextbookHitCountsWorker(Map<String, dynamic> args) {
   final dirPath = args['dirPath'] as String;
-  final vocab = (args['vocab'] as Map).cast<String, Map<String, String>>();
+  // 同 _scanYearHitCountsWorker：避免 isolate 传输后泛型退化引发的 CastError
+  final vocabRaw = args['vocab'] as Map;
   final wordRe = RegExp(r"[a-zA-Z']+");
   final counts = <String, int>{};
   final hits = <String, Map<String, Map<String, String>>>{};
@@ -4792,14 +5052,14 @@ Map<String, dynamic> _scanTextbookHitCountsWorker(Map<String, dynamic> args) {
     for (final wm in wordRe.allMatches(text)) {
       final raw = wm.group(0)!;
       final lower = raw.toLowerCase();
-      final info = vocab[lower];
-      if (info == null) continue;
+      final infoRaw = vocabRaw[lower];
+      if (infoRaw is! Map) continue;
       count++;
       hits
           .putIfAbsent(name, () => <String, Map<String, String>>{})[lower] = {
         'w': raw,
-        'p': info['pos'] ?? '',
-        'c': info['cat'] ?? '',
+        'p': infoRaw['pos']?.toString() ?? '',
+        'c': infoRaw['cat']?.toString() ?? '',
       };
     }
     counts[name] = (counts[name] ?? 0) + count;

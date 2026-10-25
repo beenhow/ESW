@@ -184,6 +184,46 @@ class VocabService {
     classificationMemory[word.toLowerCase()] = '专有词';
   }
 
+  /// 整库恢复（跨端首次同步 bootstrap）：一次性写入云端分类词。
+  ///
+  /// 逐词调用 [reclassifyWord] 是 O(n²)（每次 removeWhere 都要扫全表），
+  /// 上万条词会把主线程卡死；这里改为清空重建 + 一次性重建索引。
+  /// 返回恢复的词条总数。
+  int applyBootstrapWords(Map<String, Map<String, String>> words) {
+    extendWords.clear();
+    extendWordsLowerSet.clear();
+    manualChaoGangWords.clear();
+    manualExtraWords.clear();
+    for (final e in words.entries) {
+      final v = e.value;
+      final cat = (v['category'] ?? '').toString();
+      final original = (v['original_case'] ?? '').toString();
+      final display = original.isEmpty ? e.key : original;
+      final lower = display.toLowerCase();
+      switch (cat) {
+        case '拓展词':
+          extendWords.add(display);
+          extendWordsLowerSet.add(lower);
+          classificationMemory[lower] = '拓展词';
+          break;
+        case '超标词':
+          manualChaoGangWords.add(display);
+          chaoGangLowerSet.add(lower);
+          classificationMemory[lower] = '超标词';
+          break;
+        case '专有词':
+          manualExtraWords.add(display);
+          extraLowerSet.add(lower);
+          classificationMemory[lower] = '专有词';
+          break;
+      }
+    }
+    _rebuildLowerSets();
+    return extendWords.length +
+        manualChaoGangWords.length +
+        manualExtraWords.length;
+  }
+
   /// 重新归类：先从旧分类移除，再加入新分类。
   /// 返回新分类标签（'拓展词'/'超标词'/'专有词'），如果新旧相同则返回 null。
   String? reclassifyWord(String word, String newCategory) {

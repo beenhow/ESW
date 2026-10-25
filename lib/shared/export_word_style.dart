@@ -128,6 +128,16 @@ String standardExportCategory(String level) {
   }
 }
 
+/// 检测结果的词库归属 → 导出原文标注分类（安卓检测口径）。
+///
+/// 安卓检测分类为「课标词 / 拓展词 / 超标词 / 专有词 / 其他」，Windows 为
+/// 「课标词 / 拓展词 / 超标词 / 专有词 / 未筛选」。两端必须给出同一个导出分类：
+/// - 课标词**保持粗粒度**，不按课标级别细分（细分只用于汇总统计），否则原文会
+///   被染成黑粗 / 深蓝 / 浅蓝，与 Windows 版不一致；
+/// - 「其他」= Windows「未筛选且语料出现过」，统一降为真题词，不参与配色。
+String exportAnnotateCategoryOfFilter(String filterCategory) =>
+    filterCategory == '其他' ? '真题词' : filterCategory;
+
 /// 七类规范色按规范顺序排列的色表，
 /// 供 RTF 颜色表等「按索引引用颜色」的格式使用（索引 1 起对应本表第 1 项）。
 List<String> exportPaletteHex() {

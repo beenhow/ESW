@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../theme/esw_tokens.dart';
+import '../theme/responsive.dart';
 import '../widgets/esw_widgets.dart';
 
 /// 查词页：真题查词（左对齐标题 + 副标题）。
@@ -41,66 +42,72 @@ class SearchPage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SafeArea(
-      child: Column(
-        children: [
-          EswPageHeader(
-            title: '真题查词',
-            subtitle: '输入单词即可查看真题出处',
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(
-              EswSpace.lg,
-                0,
-              EswSpace.lg,
-              EswSpace.md,
+    return EswResponsive.wrap(
+      context,
+      SafeArea(
+        child: Column(
+          children: [
+            EswPageHeader(
+              title: '真题查词',
+              subtitle: '输入单词即可查看真题出处',
             ),
-            child: EswSearchField(
-              controller: controller,
-              focusNode: focusNode,
-              hintText: '输入英文单词，如 gorilla',
-              onChanged: onChanged,
-              onSubmitted: onSubmitted,
-            ),
-          ),
-          Expanded(
-            child: ListView(
-              padding: const EdgeInsets.fromLTRB(
-                EswSpace.lg,
-                EswSpace.xs,
-                EswSpace.lg,
-                EswSpace.xxxl,
+            Padding(
+              padding: EswResponsive.inset(
+                context,
+                left: EswSpace.lg,
+                right: EswSpace.lg,
+                bottom: EswSpace.md,
               ),
-              children: [
-                if (resultVisible)
-                  resultBuilder(context)
-                else if (history.isEmpty)
-                  EswEmptyState(
-                    icon: Icons.search_off_rounded,
-                    title: '查过的词会留在这里',
-                    description: '输入单词并回车，即可查看真题出处与词义，最近查询会显示在下方。',
-                  )
-                else ...[
-                  EswSectionHeader(
-                    title: '最近查询',
-                    actionLabel: '清空',
-                    onAction: onClearHistory,
-                  ),
-                  const SizedBox(height: EswSpace.md),
-                  for (final word in history)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: EswSpace.md),
-                      child: _HistoryCard(
-                        word: word,
-                        subtitleOf: subtitleOf,
-                        onTap: () => onHistoryTap(word),
-                      ),
-                    ),
-                ],
-              ],
+              child: EswSearchField(
+                controller: controller,
+                focusNode: focusNode,
+                hintText: '输入英文单词，如 gorilla',
+                onChanged: onChanged,
+                onSubmitted: onSubmitted,
+              ),
             ),
-          ),
-        ],
+            Expanded(
+              child: ListView(
+                padding: EswResponsive.inset(
+                  context,
+                  left: EswSpace.lg,
+                  top: EswSpace.xs,
+                  right: EswSpace.lg,
+                  bottom: EswSpace.xxxl,
+                ),
+                children: [
+                  if (resultVisible)
+                    resultBuilder(context)
+                  else if (history.isEmpty)
+                    EswEmptyState(
+                      icon: Icons.search_off_rounded,
+                      title: '查过的词会留在这里',
+                      description: '输入单词并回车，即可查看真题出处与词义，最近查询会显示在下方。',
+                    )
+                  else ...[
+                    EswSectionHeader(
+                      title: '最近查询',
+                      actionLabel: '清空',
+                      onAction: onClearHistory,
+                    ),
+                    SizedBox(height: EswResponsive.s(context, EswSpace.md)),
+                    for (final word in history)
+                      Padding(
+                        padding: EdgeInsets.only(
+                          bottom: EswResponsive.s(context, EswSpace.md),
+                        ),
+                        child: _HistoryCard(
+                          word: word,
+                          subtitleOf: subtitleOf,
+                          onTap: () => onHistoryTap(word),
+                        ),
+                      ),
+                  ],
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -120,6 +127,7 @@ class _HistoryCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final f = EswResponsive.factorOf(context);
     return EswCard(
       margin: EdgeInsets.zero,
       padding: EdgeInsets.zero,
@@ -127,14 +135,14 @@ class _HistoryCard extends StatelessWidget {
         onTap: onTap,
         borderRadius: BorderRadius.circular(EswRadius.card),
         child: Padding(
-          padding: const EdgeInsets.symmetric(
-            horizontal: EswSpace.lg,
-            vertical: EswSpace.md,
+          padding: EdgeInsets.symmetric(
+            horizontal: EswSpace.lg * f,
+            vertical: EswSpace.md * f,
           ),
           child: Row(
             children: [
               EswLetterChip(letter: word, color: EswColors.primary),
-              const SizedBox(width: EswSpace.md),
+              SizedBox(width: EswSpace.md * f),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -167,7 +175,7 @@ class _HistoryCard extends StatelessWidget {
               ),
               Icon(
                 Icons.chevron_right_rounded,
-                size: 20,
+                size: 20 * f,
                 color: EswColors.textSecondary,
               ),
             ],

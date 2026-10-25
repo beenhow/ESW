@@ -7,6 +7,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../theme/esw_tokens.dart';
+import '../theme/responsive.dart';
 import '../widgets/esw_widgets.dart';
 import '../shared/vocab_service.dart';
 import '../shared/word_sync_service.dart';
@@ -443,216 +444,297 @@ class _WordBankPageState extends State<WordBankPage> {
         : allMap.entries.where((e) => e.key.toLowerCase().contains(q)).toList()
           ..sort((a, b) => a.key.compareTo(b.key));
 
-    return SafeArea(
-      child: Column(
-        children: [
-          EswPageHeader(title: 'ESW 词库', subtitle: '共 $total 个词条'),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(
-              EswSpace.lg,
-              0,
-              EswSpace.lg,
-              EswSpace.md,
+    final Widget searchField = EswSearchField(
+      controller: _searchCtrl,
+      focusNode: _searchFocus,
+      hintText: '搜索已添加的单词来源',
+      onChanged: (_) => setState(() {}),
+      onSubmitted: (_) {},
+    );
+
+    // 搜索态结果列表（仅列表内部滚动，搜索框常驻）
+    Widget searchResults(double f) {
+      if (filtered.isEmpty) {
+        return Center(
+          child: Text(
+            '未找到匹配的词条',
+            style: EswText.bodySmall.copyWith(color: EswColors.textSecondary),
+          ),
+        );
+      }
+      return ListView.separated(
+        padding: EdgeInsets.zero,
+        itemCount: filtered.length,
+        separatorBuilder: (_, __) => Divider(
+          height: 1,
+          indent: EswSpace.lg * f,
+          endIndent: EswSpace.lg * f,
+        ),
+        itemBuilder: (context, i) {
+          final e = filtered[i];
+          return EswListTile(
+            leading: EswLetterChip(
+              letter: e.key,
+              color: _catColor(e.value),
             ),
-            child: EswSearchField(
-              controller: _searchCtrl,
-              focusNode: _searchFocus,
-              hintText: '搜索已添加的单词来源',
-              onChanged: (_) => setState(() {}),
-              onSubmitted: (_) {},
+            title: e.key,
+            subtitle: e.value,
+            onTap: widget.onWordTap == null
+                ? null
+                : () => widget.onWordTap!(e.key),
+            trailing: Container(
+              padding: EdgeInsets.symmetric(
+                horizontal: EswSpace.sm * f,
+                vertical: 2 * f,
+              ),
+              decoration: BoxDecoration(
+                color: _catColor(e.value).withValues(alpha: 0.14),
+                borderRadius: BorderRadius.circular(EswRadius.small),
+              ),
+              child: Text(
+                e.value,
+                style: EswText.chip.copyWith(color: _catColor(e.value)),
+              ),
+            ),
+          );
+        },
+      );
+    }
+
+    Widget actionRow(double f) {
+      return Row(
+        children: [
+          Expanded(
+            child: OutlinedButton.icon(
+              onPressed: _importVocab,
+              icon: Icon(Icons.download_rounded, size: 18 * f),
+              label: const Text('导入词库'),
             ),
           ),
+          SizedBox(width: EswSpace.md * f),
           Expanded(
-            child: ListView(
-              padding: const EdgeInsets.fromLTRB(
-                EswSpace.lg,
-                EswSpace.xs,
-                EswSpace.lg,
-                EswSpace.xxxl,
-              ),
-              children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: _importVocab,
-                        icon: const Icon(Icons.download_rounded, size: 18),
-                        label: const Text('导入词库'),
-                      ),
-                    ),
-                    const SizedBox(width: EswSpace.md),
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: _exportVocab,
-                        icon: const Icon(Icons.upload_file_rounded, size: 18),
-                        label: const Text('导出词库'),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: EswSpace.lg),
-                if (q.isEmpty) ...[
-                  GridView.count(
-                    crossAxisCount: 2,
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    crossAxisSpacing: EswSpace.md,
-                    mainAxisSpacing: EswSpace.md,
-                    childAspectRatio: 1.55,
-                    children: [
-                      EswStatCard(
-                        label: '课标词',
-                        countText: '$totalStandard',
-                        color: EswColors.blue,
-                        ratioText: _ratioText(totalStandard, total),
-                        onTap: () => _openWordList('课标词'),
-                      ),
-                      EswStatCard(
-                        label: '拓展词',
-                        countText: '$totalExtend',
-                        color: EswColors.green,
-                        ratioText: _ratioText(totalExtend, total),
-                        onTap: () => _openWordList('拓展词'),
-                      ),
-                      EswStatCard(
-                        label: '超标词',
-                        countText: '$totalChaoGang',
-                        color: EswColors.red,
-                        ratioText: _ratioText(totalChaoGang, total),
-                        onTap: () => _openWordList('超标词'),
-                      ),
-                      EswStatCard(
-                        label: '专有词',
-                        countText: '$totalExtra',
-                        color: EswColors.grey,
-                        ratioText: _ratioText(totalExtra, total),
-                        onTap: () => _openWordList('专有词'),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: EswSpace.lg),
-                  EswPrimaryButton(
-                    label: _exportingHighFreq ? '导出中…' : '导出高频',
-                    icon: Icons.upload_file_rounded,
-                    height: 44,
-                    onPressed: _exportingHighFreq
-                        ? null
-                        : () {
-                            _exportHighFreq();
-                          },
-                  ),
-                ] else ...[
-                  EswSectionHeader(title: '搜索结果 (${filtered.length})'),
-                  const SizedBox(height: EswSpace.md),
-                  EswCard(
-                    padding: EdgeInsets.zero,
-                    child: Column(
-                      children: [
-                        for (final e in filtered)
-                          EswListTile(
-                            leading: EswLetterChip(
-                              letter: e.key,
-                              color: _catColor(e.value),
-                            ),
-                            title: e.key,
-                            subtitle: e.value,
-                            onTap: widget.onWordTap == null
-                                ? null
-                                : () => widget.onWordTap!(e.key),
-                            trailing: Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: EswSpace.sm,
-                                vertical: 2,
-                              ),
-                              decoration: BoxDecoration(
-                                color: _catColor(e.value).withValues(
-                                  alpha: 0.14,
-                                ),
-                                borderRadius: BorderRadius.circular(
-                                  EswRadius.small,
-                                ),
-                              ),
-                              child: Text(
-                                e.value,
-                                style: EswText.chip.copyWith(
-                                  color: _catColor(e.value),
-                                ),
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                  ),
-                ],
-                const SizedBox(height: EswSpace.xxl),
-                EswCard(
-                  padding: EdgeInsets.zero,
-                  child: Column(
-                    children: [
-                      EswSettingsTile(
-                        icon: Icons.description_outlined,
-                        title: '使用说明',
-                        onTap: () => Navigator.of(context).push(
-                          CupertinoPageRoute<void>(
-                            builder: (_) => const HelpPage(),
-                          ),
-                        ),
-                      ),
-                      const Divider(indent: EswSpace.lg, endIndent: EswSpace.lg),
-                      EswSettingsTile(
-                        icon: Icons.sync_rounded,
-                        title: '同步词库',
-                        subtitle: widget.syncing ? '同步中…' : null,
-                        onTap: widget.syncing ? null : widget.onSyncVocab,
-                        trailing: widget.syncing
-                            ? const SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(strokeWidth: 2),
-                              )
-                            : null,
-                      ),
-                      const Divider(indent: EswSpace.lg, endIndent: EswSpace.lg),
-                      EswSettingsTile(
-                        icon: Icons.system_update_alt_rounded,
-                        title: '检查更新',
-                        onTap: widget.onCheckUpdate,
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: EswSpace.lg),
-                Center(
-                  child: GestureDetector(
-                    onTap: () async {
-                      final uri = Uri.parse('https://github.com/beenhow/ESW');
-                      if (await canLaunchUrl(uri)) {
-                        await launchUrl(
-                          uri,
-                          mode: LaunchMode.externalApplication,
-                        );
-                      }
-                    },
-                    child: Text(
-                      'V1.5.8 · github.com/beenhow/ESW',
-                      style: EswText.caption.copyWith(
-                        color: EswColors.textSecondary,
-                      ),
-                    ),
-                  ),
-                ),
-              ],
+            child: OutlinedButton.icon(
+              onPressed: _exportVocab,
+              icon: Icon(Icons.upload_file_rounded, size: 18 * f),
+              label: const Text('导出词库'),
             ),
           ),
         ],
+      );
+    }
+
+    // 2×2 四宫格：宫格高度按剩余空间实时反算，始终单屏铺满、不产生滚动
+    Widget statGrid(double f) {
+      return LayoutBuilder(
+        builder: (context, c) {
+          final spacing = EswSpace.sm * f;
+          final cellW = (c.maxWidth - spacing) / 2;
+          final cellH = (c.maxHeight - spacing) / 2;
+          final ratio = cellH > 0 ? cellW / cellH : 1.55;
+          return GridView.count(
+            crossAxisCount: 2,
+            physics: const NeverScrollableScrollPhysics(),
+            padding: EdgeInsets.zero,
+            crossAxisSpacing: spacing,
+            mainAxisSpacing: spacing,
+            childAspectRatio: ratio,
+            children: [
+              EswStatCard(
+                label: '课标词',
+                countText: '$totalStandard',
+                color: EswColors.blue,
+                onTap: () => _openWordList('课标词'),
+              ),
+              EswStatCard(
+                label: '拓展词',
+                countText: '$totalExtend',
+                color: EswColors.green,
+                onTap: () => _openWordList('拓展词'),
+              ),
+              EswStatCard(
+                label: '超标词',
+                countText: '$totalChaoGang',
+                color: EswColors.red,
+                onTap: () => _openWordList('超标词'),
+              ),
+              EswStatCard(
+                label: '专有词',
+                countText: '$totalExtra',
+                color: EswColors.grey,
+                onTap: () => _openWordList('专有词'),
+              ),
+            ],
+          );
+        },
+      );
+    }
+
+    Widget exportPrimary(double f) {
+      return EswPrimaryButton(
+        label: _exportingHighFreq ? '导出中…' : '导出高频',
+        icon: Icons.upload_file_rounded,
+        height: 42 * f,
+        onPressed: _exportingHighFreq
+            ? null
+            : () {
+                _exportHighFreq();
+              },
+      );
+    }
+
+    Widget settingsCard(double f) {
+      return EswCard(
+        padding: EdgeInsets.zero,
+        child: Column(
+          children: [
+            EswSettingsTile(
+              dense: true,
+              icon: Icons.description_outlined,
+              title: '使用说明',
+              onTap: () => Navigator.of(context).push(
+                CupertinoPageRoute<void>(
+                  builder: (_) => const HelpPage(),
+                ),
+              ),
+            ),
+            Divider(
+              height: 1,
+              indent: EswSpace.lg * f,
+              endIndent: EswSpace.lg * f,
+            ),
+            EswSettingsTile(
+              dense: true,
+              icon: Icons.sync_rounded,
+              title: '同步词库',
+              subtitle: widget.syncing ? '同步中…' : null,
+              onTap: widget.syncing ? null : widget.onSyncVocab,
+              trailing: widget.syncing
+                  ? SizedBox(
+                      width: 18 * f,
+                      height: 18 * f,
+                      child: const CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : null,
+            ),
+            Divider(
+              height: 1,
+              indent: EswSpace.lg * f,
+              endIndent: EswSpace.lg * f,
+            ),
+            EswSettingsTile(
+              dense: true,
+              icon: Icons.system_update_alt_rounded,
+              title: '检查更新',
+              onTap: widget.onCheckUpdate,
+            ),
+          ],
+        ),
+      );
+    }
+
+    Widget versionFooter(double f) {
+      return Center(
+        child: GestureDetector(
+          onTap: () async {
+            final uri = Uri.parse('https://github.com/beenhow/ESW');
+            if (await canLaunchUrl(uri)) {
+              await launchUrl(uri, mode: LaunchMode.externalApplication);
+            }
+          },
+          child: Text(
+            'V1.5.8 · github.com/beenhow/ESW',
+            style: EswText.caption.copyWith(color: EswColors.textSecondary),
+          ),
+        ),
+      );
+    }
+
+    return EswResponsive.wrap(
+      context,
+      SafeArea(
+        child: Column(
+          children: [
+            EswPageHeader(title: 'ESW 词库', subtitle: '共 $total 个词条'),
+            Expanded(
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final f = EswResponsive.factorOf(context);
+                  final hPad = EdgeInsets.fromLTRB(
+                    EswSpace.lg * f,
+                    0,
+                    EswSpace.lg * f,
+                    EswSpace.sm * f,
+                  );
+
+                  // 搜索态：搜索框 + 结果列表（列表内部滚动）
+                  if (q.isNotEmpty) {
+                    return Padding(
+                      padding: hPad,
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          searchField,
+                          SizedBox(height: EswSpace.sm * f),
+                          EswSectionHeader(title: '搜索结果 (${filtered.length})'),
+                          SizedBox(height: EswSpace.sm * f),
+                          Expanded(child: searchResults(f)),
+                        ],
+                      ),
+                    );
+                  }
+
+                  // 极小屏 / 超大字体：整体滚动兜底，绝不溢出
+                  if (constraints.maxHeight < 460 * f) {
+                    return SingleChildScrollView(
+                      child: Padding(
+                        padding: hPad,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            searchField,
+                            SizedBox(height: EswSpace.sm * f),
+                            actionRow(f),
+                            SizedBox(height: EswSpace.sm * f),
+                            SizedBox(height: 240 * f, child: statGrid(f)),
+                            SizedBox(height: EswSpace.sm * f),
+                            exportPrimary(f),
+                            SizedBox(height: EswSpace.sm * f),
+                            settingsCard(f),
+                            SizedBox(height: EswSpace.xs * f),
+                            versionFooter(f),
+                          ],
+                        ),
+                      ),
+                    );
+                  }
+
+                  // 常规屏幕：固定 Column + 中段网格自适应填满，单屏不滚动
+                  return Padding(
+                    padding: hPad,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        searchField,
+                        SizedBox(height: EswSpace.sm * f),
+                        actionRow(f),
+                        SizedBox(height: EswSpace.sm * f),
+                        Expanded(child: statGrid(f)),
+                        SizedBox(height: EswSpace.sm * f),
+                        exportPrimary(f),
+                        SizedBox(height: EswSpace.sm * f),
+                        settingsCard(f),
+                        SizedBox(height: EswSpace.xs * f),
+                        versionFooter(f),
+                      ],
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
       ),
     );
-  }
-
-  String _ratioText(int count, int total) {
-    if (total <= 0) return '占总词条比例 0%';
-    final pct = (count / total * 100).toStringAsFixed(1);
-    return '占总词条比例 $pct%';
   }
 }
 

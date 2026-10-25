@@ -1,10 +1,15 @@
 import 'package:flutter/material.dart';
 import '../theme/esw_tokens.dart';
+import '../theme/responsive.dart';
 
 /// ESW 公共组件库。全部组件只使用设计令牌（EswColors / EswRadius /
 /// EswSpace / EswText / EswShadow），禁止任何颜色 / 字号 / 圆角字面量。
 
-/// 页面头部：左对齐标题 + 灰色副标题 + 右侧图标按钮。
+/// 页面头部：居中标题 + 居中灰色副标题 + 右侧图标按钮。
+///
+/// 标题与副标题在整行宽度内居中；actions 用 Stack 绝对定位贴右侧，
+/// 不占用文本行的宽度（因此不会把居中文字挤偏）。文本区左右各留出
+/// actions 占位宽度，保证窄屏时文字不会压到按钮上。
 class EswPageHeader extends StatelessWidget {
   final String title;
   final String subtitle;
@@ -19,33 +24,59 @@ class EswPageHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final f = EswResponsive.factorOf(context);
+    // 文本区两侧预留的 actions 占位宽度（对称留白 => 文本仍严格居中）
+    final double actionReserve = actions.isEmpty
+        ? 0
+        : (EswSpace.xxxl + EswSpace.md) * f * actions.length.clamp(1, 2);
     return Padding(
-      padding: const EdgeInsets.fromLTRB(
-        EswSpace.lg,
-        EswSpace.lg,
-        EswSpace.lg,
-        EswSpace.md,
+      padding: EswResponsive.inset(
+        context,
+        left: EswSpace.lg,
+        top: EswSpace.lg,
+        right: EswSpace.lg,
+        bottom: EswSpace.md,
       ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      child: Stack(
+        alignment: Alignment.center,
         children: [
-          Expanded(
+          Padding(
+            padding: EdgeInsets.symmetric(horizontal: actionReserve),
             child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.center,
               children: [
-                Text(title, style: EswText.title.copyWith(color: EswColors.textPrimary)),
-                const SizedBox(height: EswSpace.xs),
+                Text(
+                  title,
+                  textAlign: TextAlign.center,
+                  style: EswText.title.copyWith(
+                    color: EswColors.textPrimary,
+                    height: 1.2,
+                  ),
+                ),
+                SizedBox(height: EswSpace.xs * f),
                 Text(
                   subtitle,
-                  style: EswText.bodySmall.copyWith(color: EswColors.textSecondary),
+                  textAlign: TextAlign.center,
+                  style: EswText.bodySmall.copyWith(
+                    color: EswColors.textSecondary,
+                    height: 1.2,
+                  ),
                 ),
               ],
             ),
           ),
-          if (actions.isNotEmpty) ...[
-            const SizedBox(width: EswSpace.md),
-            ...actions,
-          ],
+          if (actions.isNotEmpty)
+            Positioned(
+              right: 0,
+              top: 0,
+              bottom: 0,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: actions,
+              ),
+            ),
         ],
       ),
     );
@@ -60,6 +91,9 @@ class EswSearchField extends StatefulWidget {
   final ValueChanged<String> onChanged;
   final ValueChanged<String> onSubmitted;
 
+  /// 设计态高度（内部会再乘屏幕缩放系数）。
+  final double height;
+
   const EswSearchField({
     super.key,
     required this.controller,
@@ -67,6 +101,7 @@ class EswSearchField extends StatefulWidget {
     required this.hintText,
     required this.onChanged,
     required this.onSubmitted,
+    this.height = 54,
   });
 
   @override
@@ -93,10 +128,11 @@ class _EswSearchFieldState extends State<EswSearchField> {
   @override
   Widget build(BuildContext context) {
     final focused = widget.focusNode.hasFocus;
+    final f = EswResponsive.factorOf(context);
     return AnimatedContainer(
       duration: const Duration(milliseconds: 160),
       curve: Curves.easeOut,
-      height: 54,
+      height: widget.height * f,
       decoration: BoxDecoration(
         color: EswColors.card,
         borderRadius: BorderRadius.circular(EswRadius.control),
@@ -256,9 +292,10 @@ class EswLetterChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final first = letter.isEmpty ? '?' : letter[0].toUpperCase();
+    final f = EswResponsive.factorOf(context);
     return Container(
-      width: 40,
-      height: 40,
+      width: 40 * f,
+      height: 40 * f,
       alignment: Alignment.center,
       decoration: BoxDecoration(
         color: color.withValues(alpha: 0.16),
@@ -279,7 +316,9 @@ class EswListTile extends StatelessWidget {
   final String? subtitle;
   final Widget? trailing;
   final VoidCallback? onTap;
-  final EdgeInsetsGeometry padding;
+
+  /// 自定义内边距；不传时使用随屏幕缩放的默认值。
+  final EdgeInsetsGeometry? padding;
 
   const EswListTile({
     super.key,
@@ -288,19 +327,21 @@ class EswListTile extends StatelessWidget {
     this.subtitle,
     this.trailing,
     this.onTap,
-    this.padding = const EdgeInsets.symmetric(
-      horizontal: EswSpace.lg,
-      vertical: EswSpace.md,
-    ),
+    this.padding,
   });
 
   @override
   Widget build(BuildContext context) {
+    final f = EswResponsive.factorOf(context);
     return InkWell(
       onTap: onTap,
       borderRadius: BorderRadius.circular(EswRadius.card),
       child: Padding(
-        padding: padding,
+        padding: padding ??
+            EdgeInsets.symmetric(
+              horizontal: EswSpace.lg * f,
+              vertical: EswSpace.md * f,
+            ),
         child: Row(
           children: [
             leading,
@@ -348,24 +389,25 @@ class EswEmptyState extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final f = EswResponsive.factorOf(context);
     return EswCard(
-      padding: const EdgeInsets.symmetric(
-        horizontal: EswSpace.xxl,
-        vertical: EswSpace.xxxl,
+      padding: EdgeInsets.symmetric(
+        horizontal: EswSpace.xxl * f,
+        vertical: EswSpace.xxxl * f,
       ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           Container(
-            width: 64,
-            height: 64,
+            width: 64 * f,
+            height: 64 * f,
             decoration: BoxDecoration(
               color: EswColors.primarySoft,
               shape: BoxShape.circle,
             ),
-            child: Icon(icon, size: 30, color: EswColors.primary),
+            child: Icon(icon, size: 30 * f, color: EswColors.primary),
           ),
-          const SizedBox(height: EswSpace.lg),
+          SizedBox(height: EswSpace.lg * f),
           Text(
             title,
             style: EswText.bodyMedium.copyWith(color: EswColors.textPrimary),
@@ -397,8 +439,9 @@ class EswSegmented extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final f = EswResponsive.factorOf(context);
     return Container(
-      padding: const EdgeInsets.all(EswSpace.xs),
+      padding: EdgeInsets.all(EswSpace.xs * f),
       decoration: BoxDecoration(
         color: EswColors.page,
         borderRadius: BorderRadius.circular(EswRadius.control),
@@ -406,12 +449,12 @@ class EswSegmented extends StatelessWidget {
       child: Row(
         children: [
           for (var i = 0; i < options.length; i++) ...[
-            if (i > 0) const SizedBox(width: EswSpace.xs),
+            if (i > 0) SizedBox(width: EswSpace.xs * f),
             Expanded(
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 160),
                 curve: Curves.easeOut,
-                height: 40,
+                height: 40 * f,
                 decoration: BoxDecoration(
                   color: i == selectedIndex
                       ? EswColors.primary
@@ -441,12 +484,12 @@ class EswSegmented extends StatelessWidget {
   }
 }
 
-/// 统计卡：白底、标题小色点、语义色大数字、右下占比、右上 16% 光晕。
+/// 统计卡：白底、标题小色点、语义色大数字、右上 16% 光晕。
+/// 卡内仅保留「色点 + 类目名（灰色小字）」一行与下方大号加粗同色数字。
 class EswStatCard extends StatelessWidget {
   final String label;
   final String countText;
   final Color color;
-  final String ratioText;
   final VoidCallback? onTap;
 
   const EswStatCard({
@@ -454,65 +497,78 @@ class EswStatCard extends StatelessWidget {
     required this.label,
     required this.countText,
     required this.color,
-    required this.ratioText,
     this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
-    return EswCard(
-      padding: const EdgeInsets.all(EswSpace.lg),
-      onTap: onTap,
-      child: Stack(
-        children: [
-          // 右上角 16% 透明圆形光晕
-          Positioned(
-            top: -EswSpace.xl,
-            right: -EswSpace.xl,
-            child: Container(
-              width: 56,
-              height: 56,
-              decoration: BoxDecoration(
-                color: color.withValues(alpha: 0.16),
-                shape: BoxShape.circle,
-              ),
+    final f = EswResponsive.factorOf(context);
+    final content = Stack(
+      children: [
+        // 右上角 16% 透明圆形光晕
+        Positioned(
+          top: -EswSpace.xl * f,
+          right: -EswSpace.xl * f,
+          child: Container(
+            width: 56 * f,
+            height: 56 * f,
+            decoration: BoxDecoration(
+              color: color.withValues(alpha: 0.16),
+              shape: BoxShape.circle,
             ),
           ),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Container(
-                    width: 8,
-                    height: 8,
-                    decoration: BoxDecoration(
-                      color: color,
-                      shape: BoxShape.circle,
+        ),
+        Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 8 * f,
+                  height: 8 * f,
+                  decoration: BoxDecoration(
+                    color: color,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+                SizedBox(width: EswSpace.sm * f),
+                Expanded(
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: EswText.bodySmall.copyWith(
+                      color: EswColors.textSecondary,
                     ),
                   ),
-                  const SizedBox(width: EswSpace.sm),
-                  Expanded(
-                    child: Text(
-                      label,
-                      style: EswText.bodySmall.copyWith(color: EswColors.textSecondary),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: EswSpace.md),
-              Text(
-                countText,
-                style: EswText.display.copyWith(color: color),
-              ),
-              const SizedBox(height: EswSpace.sm),
-              Text(
-                ratioText,
-                style: EswText.bodySmall.copyWith(color: EswColors.textSecondary),
-              ),
-            ],
-          ),
-        ],
+                ),
+              ],
+            ),
+            SizedBox(height: EswSpace.sm * f),
+            Text(
+              countText,
+              maxLines: 1,
+              style: EswText.display.copyWith(color: color),
+            ),
+          ],
+        ),
+      ],
+    );
+    return EswCard(
+      padding: EdgeInsets.all(EswSpace.md * f),
+      onTap: onTap,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          // 被放进固定高度的格子（2×2 统计卡）时，内容超高则整块等比缩小，
+          // 保证任何屏幕 / 任何格高都不会溢出。
+          if (!constraints.hasBoundedHeight) return content;
+          return FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.topLeft,
+            child: SizedBox(width: constraints.maxWidth, child: content),
+          );
+        },
       ),
     );
   }
@@ -533,6 +589,7 @@ class EswDashedButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final f = EswResponsive.factorOf(context);
     return CustomPaint(
       painter: _DashedBorderPainter(
         color: EswColors.primary,
@@ -540,15 +597,15 @@ class EswDashedButton extends StatelessWidget {
       ),
       child: SizedBox(
         width: double.infinity,
-        height: 52,
+        height: 52 * f,
         child: InkWell(
           onTap: onPressed,
           borderRadius: BorderRadius.circular(EswRadius.control),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(icon, size: 20, color: EswColors.primary),
-              const SizedBox(width: EswSpace.sm),
+              Icon(icon, size: 20 * f, color: EswColors.primary),
+              SizedBox(width: EswSpace.sm * f),
               Text(
                 label,
                 style: EswText.bodyMedium.copyWith(color: EswColors.primary),
@@ -617,9 +674,10 @@ class EswPrimaryButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final f = EswResponsive.factorOf(context);
     return AnimatedContainer(
       duration: const Duration(milliseconds: 160),
-      height: height,
+      height: height * f,
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(EswRadius.control),
         boxShadow: onPressed == null ? null : EswShadow.button,
@@ -628,7 +686,7 @@ class EswPrimaryButton extends StatelessWidget {
         onPressed: onPressed,
         icon: icon == null
             ? const SizedBox.shrink()
-            : Icon(icon, size: 20),
+            : Icon(icon, size: 20 * f),
         label: Text(label),
         style: FilledButton.styleFrom(
           backgroundColor: EswColors.primary,
@@ -652,37 +710,42 @@ class EswSettingsTile extends StatelessWidget {
   final VoidCallback? onTap;
   final Widget? trailing;
 
+  /// 紧凑模式：缩小图标与上下内边距，用于一屏内塞下多项设置。
+  final bool dense;
+
   const EswSettingsTile({
     super.key,
     required this.icon,
     required this.title,
     this.subtitle,
     this.onTap,
+    this.dense = false,
     this.trailing,
   });
 
   @override
   Widget build(BuildContext context) {
+    final f = EswResponsive.factorOf(context);
     return InkWell(
       onTap: onTap,
       borderRadius: BorderRadius.circular(EswRadius.card),
       child: Padding(
-        padding: const EdgeInsets.symmetric(
-          horizontal: EswSpace.lg,
-          vertical: EswSpace.md,
+        padding: EdgeInsets.symmetric(
+          horizontal: EswSpace.lg * f,
+          vertical: (dense ? EswSpace.sm : EswSpace.md) * f,
         ),
         child: Row(
           children: [
             Container(
-              width: 38,
-              height: 38,
+              width: (dense ? 32 : 38) * f,
+              height: (dense ? 32 : 38) * f,
               decoration: BoxDecoration(
                 color: EswColors.primarySoft,
                 borderRadius: BorderRadius.circular(EswRadius.small),
               ),
-              child: Icon(icon, size: 19, color: EswColors.primary),
+              child: Icon(icon, size: (dense ? 17 : 19) * f, color: EswColors.primary),
             ),
-            const SizedBox(width: EswSpace.md),
+            SizedBox(width: EswSpace.md * f),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -706,7 +769,7 @@ class EswSettingsTile extends StatelessWidget {
             else
               Icon(
                 Icons.chevron_right_rounded,
-                size: 20,
+                size: 20 * f,
                 color: EswColors.textSecondary,
               ),
           ],
@@ -735,6 +798,7 @@ class EswBottomNav extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final f = EswResponsive.factorOf(context);
     return Container(
       decoration: BoxDecoration(
         color: EswColors.card,
@@ -743,7 +807,7 @@ class EswBottomNav extends StatelessWidget {
       child: SafeArea(
         top: false,
         child: SizedBox(
-          height: 64,
+          height: 64 * f,
           child: Row(
             children: [
               for (var i = 0; i < labels.length; i++)
@@ -755,7 +819,7 @@ class EswBottomNav extends StatelessWidget {
                       children: [
                         Icon(
                           i == currentIndex ? selectedIcons[i] : icons[i],
-                          size: 24,
+                          size: 24 * f,
                           color: i == currentIndex
                               ? EswColors.primary
                               : EswColors.ink3,
