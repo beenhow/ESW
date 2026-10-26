@@ -1,132 +1,122 @@
+# ESW · 真题课标词
 
-# ESW — 真题课标词
+**Exam-tested Syllabus Words** — 高中英语命题研究的词汇检测与词频分析工具
 
-**Exam-tested Syllabus Words**
-
-一款面向高中英语命题研究的 Windows和Android应用程序，帮助命题者在真题语料中快速检测课标词汇的覆盖情况。
-
----
-
-## 功能特性
-
-- **词汇检索**：内置最新版3100课标词汇+初中专有名词+不规则变化词，合计3325词。
-- **词汇分类**：按「真题词」「课标词」「拓展词」「超纲词」「专有词」五级分类，支持实时搜索和过滤。
-- **语料分析**：支持导入 TXT / PDF / DOCX 格式的真题语料，自动扫描并标记其中出现的词汇。
-- **拖拽导入**：通过 Windows 原生 WM_DROPFILES 机制将文件直接拖入窗口即可导入。
-- **OCR 识别**：集成 Tesseract OCR，可将扫描版 PDF 转为可检索文本。
-- **词库扩展**：支持自定义拓展词库和词根映射，数据持久化存储。
-- **词频统计**：对已导入语料中的词汇进行出现频次统计，功能对标Antconc，在检索速度上完胜。
-- **系统支持**：目前电脑版仅支持win10和win11，安卓版支持7.0（API 24）及以上，后续可能拓展版本和系统支持。
+[![Release](https://img.shields.io/github/v/release/beenhow/ESW?label=release&color=2b6cb0)](https://github.com/beenhow/ESW/releases/latest)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20%7C%20Android%207.0%2B-1f7a5a)](#下载与安装)
+[![Flutter](https://img.shields.io/badge/Flutter-Dart%20%2B%20C%20FFI-02569b)](https://flutter.dev)
+[![License](https://img.shields.io/badge/license-MIT-555)](LICENSE)
 
 ---
+
+把一整套历年真题丢进去，几秒钟内看清：哪些词超纲、哪些词高频、哪些词反复出现却不在课标里。
+
+ESW 面向**命题人与教研人员**：以 3100 课标词为基准，对真题语料做词级穿透分析，并把结论直接导出成可交付的标注文档。**完全离线、数据不出本机**，Windows 桌面版与 Android 版共用一套核心代码与同一份词库。
+
+## 截图
+
+| 桌面版 · 四库词库总览 | 安卓版 · 词库概览 |
+|:---:|:---:|
+| ![](docs/screenshots/01-desktop-wordbank.jpg) | ![](docs/screenshots/02-android-wordbank.jpg) |
+| **安卓版 · 语料检测与分类** | **安卓版 · 高频词导出** |
+| ![](docs/screenshots/03-android-detect.jpg) | ![](docs/screenshots/04-android-export.jpg) |
+
+## 为什么值得用
+
+- **分类不是猜的**：五级分类引擎带明确优先级（手动超纲 > 手动拓展 > 课标 > 反向索引拓展 > 专有 > 真题），人工纠正一次即永久生效。
+- **一次检索，穿越全部年份**：词频按年份自动聚合成分布卡片，点某一年即筛出该年语境，命题时的"这个词今年考没考过"一秒回答。
+- **从结果直接回到原文**：上下文匹配逐词循环着色，点击关键词跳回源文件并定位，就地选中替换——改稿不用另一个窗口。
+- **导出即终稿**：高频词表一键导出 docx / xlsx，七类标注样式（初中、必修、选修、拓展、超标、专有、未筛选）全部由 `lib/shared/export_word_style.dart` 单一真源驱动，双端导出的样式像素级一致。
+- **语料格式宽容**：TXT / DOC / DOCX / PDF 通吃，扫描版 PDF 走 Tesseract OCR；Windows 下直接拖文件进窗口（原生 WM_DROPFILES）。
+- **不联网也能跑**：词库、语料、词典全部本地化；需要多机协同时，可选坚果云 WebDAV 同步词库（版本自适应 + 按修改时间合并，不覆盖人工标注）。
+- **双端同源**：`windows_app.dart` 与 `android_app.dart` 共享词库服务、导出管线与样式规范，界面按屏宽自适应，全局字号倍率兜底夹取 0.85–1.20，小屏大字号都不塌。
+
+## 功能一览
+
+| 模块 | 能力 |
+|------|------|
+| 词汇检索 | 课标词库 3100 词 + 初中专有名词 + 不规则变化词，合计 3300+ 词条；实时搜索与分类过滤 |
+| 语料分析 | 导入 TXT / DOC / DOCX / PDF，自动扫描并标记词汇；支持文件夹递归导入、多选参与检测 |
+| 词频统计 | 单词出现总频、年份分布卡片；功能对标 AntConc，大批量语料检索速度显著更快 |
+| 词库管理 | 课标 / 拓展 / 超纲 / 专有四库分离，支持自定义拓展词、词根映射与变形反查，四宫格一屏浏览 |
+| 高频词导出 | 导出 docx / xlsx 高频词表，支持七类标注与彩色高亮；导出在 isolate 中执行并显示进度浮层，不卡界面 |
+| 离线词典 | 安卓版内置 340 万词条离线词典：音标、释义、柯林斯星级、词频、变形词反查 |
+| 词库同步 | 可选坚果云 WebDAV 同步，示例配置见 `esw_sync_config.example.json` |
+| 跨端一致 | 桌面版与安卓版共享词库数据，可通过数据备份或 WebDAV 跨平台同步 |
+
+### 五级分类
+
+| 分类 | 含义 |
+|------|------|
+| **课标词** | 命中 3100 课标词库，附带词性与中文释义 |
+| **真题词** | 在导入语料中出现，但不在课标词库、且未被人工标记 |
+| **拓展词** | 人工添加的变形 / 派生 / 同义词，挂靠到某个课标词 |
+| **超纲词** | 语料中出现且不在课标词库，被人工判定为超纲 |
+| **专有词** | 人名、地名等专有名词，不计入超纲统计 |
 
 ## 技术栈
 
 | 层面 | 技术 |
 |------|------|
-| UI 框架 | Flutter (Windows) |
-| 语言 | Dart + C (FFI) |
-| 构建 | CMake + MSVC (Visual Studio) |
-| PDF 解析 | pdfrx |
-| OCR | Tesseract CLI |
-| 文档解析 | archive (EPUB), xml (DOCX) |
-| 打包格式 | 独立 EXE，附 data/、tesseract/、esw_config.json 及 DLL 依赖 |
+| UI 框架 | Flutter（Windows + Android 双端同源） |
+| 语言 | Dart + C（FFI / 原生窗口调用） |
+| 文档解析 | DOCX / EPUB（archive + xml）、PDF（pdfrx） |
+| OCR | Tesseract CLI（本地语言数据，离线可用） |
+| 导出 | docx / xlsx 生成 + OOXML 就地标注，isolate 并行管线 |
+| 同步 | WebDAV（坚果云）客户端，冲突按修改时间合并 |
+| 构建 | CMake + MSVC（Windows）、Gradle（Android） |
 
----
+## 下载与安装
 
-## 安卓版本
+前往 [Releases](https://github.com/beenhow/ESW/releases/latest) 下载最新版：
 
-ESW 同时提供 Android APK，支持手机端查词。
+| 平台 | 文件 | 说明 |
+|------|------|------|
+| Windows 10 / 11 | `ESW*-Windows.zip` | 解压即用，保留同目录 `data/`、`tesseract/` 与 DLL |
+| Android 7.0+（API 24） | `ESW*-Android.apk` | 直接安装，首次启动需授予文件读写权限 |
 
-<<<<<<< HEAD
-**Windows**
-- 修复超纲词导出 Word 文档黄色高亮背景不生效
-- 代码清理：删除约 325 行无效代码，13 处性能优化
-- 修复 Dart 空安全编译错误
-=======
-- **最新版本**：[ESW](https://github.com/beenhow/ESW/releases/latest)
-- 词典：本地离线词典（340万词条），含音标、释义、柯林斯星级、词频、变形词反查
-- 功能：真题检测、词频统计、词库积累、离线查词
-- UI：全局浅黄背景 #FFF8E1，词类标签置于音标上方加边框加粗
->>>>>>> 709b3684810134ba693011e39da06ce06c3e267c
+> 桌面版为免安装绿色包；升级时直接覆盖，用户数据保存在同目录 `esw_config.json` 中。
 
-> 安卓版与桌面版共享词库数据，通过数据备份功能可跨平台同步。
-
----
-
-## 构建与运行
-
-### 前置要求
-
-- Flutter SDK ≥ 3.9.2
-- Visual Studio 2022（含「使用 C++ 的桌面开发」工作负载）
-- Windows 10 / 11
-
-### 构建步骤
+## 构建
 
 ```powershell
-# 1. 克隆仓库
 git clone https://github.com/beenhow/ESW.git
 cd ESW
-
-# 2. 获取依赖
 flutter pub get
 
-# 3. Release 构建
-flutter build windows --release
+# Windows
+flutter build windows --release   # 产物：build/windows/x64/runner/Release/
 
-# 4. 产物位于 build/windows/x64/runner/Release/
+# Android
+flutter build apk --release       # 产物：build/app/outputs/flutter-apk/app-release.apk
 ```
 
-### 运行
-
-```powershell
-flutter run -d windows
-```
-
----
+桌面构建需 Visual Studio 2022（含「使用 C++ 的桌面开发」工作负载）与 Flutter SDK ≥ 3.9.2。
 
 ## 项目结构
 
 ```
 ESW/
-├── lib/                    # Dart 源码
-│   ├── main.dart           # 主入口（窗口、词库、语料分析）
-│   └── theme/              # 主题配置
-├── windows/                # Windows 平台代码（CMake + C）
-├── assets/                 # 内置资源
-│   └── standard_words.json # 课标词库
-├── esw_config.json         # 用户数据（拓展词、词根映射、历史记录）
-├── data/                  # Tesseract 语言数据
-├── tesseract/             # Tesseract CLI
-├── pubspec.yaml           # Flutter 依赖配置
-└── CMakeLists.txt         # CMake 构建入口
+├── lib/
+│   ├── main.dart               # 入口：主题、字号倍率兜底、平台分发
+│   ├── windows_app.dart        # 桌面版主界面与业务编排
+│   ├── android_app.dart        # 安卓版主界面与业务编排
+│   ├── pages/                  # 检测页、查词页、词库页
+│   ├── shared/                 # 双端共享：词库服务、文档抽取、导出管线、WebDAV 同步
+│   ├── theme/                  # 设计令牌、玻璃主题、响应式布局、弹窗套件
+│   ├── widgets/                # 通用组件（对话框、表格、提示条）
+│   └── utils/                  # 平台工具（安卓文件打开等）
+├── assets/                     # 内置课标词库与资源
+├── android/ · windows/         # 双端平台工程
+├── tesseract/                  # OCR CLI 与语言数据
+├── scripts/                    # 构建与发布脚本
+└── 使用说明书.md                # 完整功能手册
 ```
 
----
+## 文档
 
-## 版本命名
-
-版本号格式：`主版本.次版本.修订号`（如 `1.3.0`），窗口标题显示为 `真题课标词 v1.x.xx`。
-
-<<<<<<< HEAD
-```powershell
-flutter pub get
-flutter build windows --release
-# 产物：build/windows/x64/runner/Release/ESW1.3.1.exe（需同目录 DLL 和 data/）
-```
-
-### Android
-
-```powershell
-flutter pub get
-flutter build apk --release
-# 产物：build/app/outputs/flutter-apk/app-release.apk
-```
-=======
->>>>>>> 709b3684810134ba693011e39da06ce06c3e267c
-
----
+- [使用说明书](使用说明书.md) — 界面布局、导入规范、检测与导出全流程
+- [拓展词一致性比对报告](拓展词一致性比对报告.md) — 词库一致性校验记录
 
 ## 许可证
 
