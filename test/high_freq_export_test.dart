@@ -34,40 +34,41 @@ const calendarFlexSet = <String>{
 
 void main() {
   test('export high freq xlsx smoke', () async {
-    final eswDir = r'D:\UserData\Desktop\ESW';
-    final corpusDir = r'D:\UserData\Desktop\2005-2025真题TXT';
-    final stdRaw = File(p.join(eswDir, 'assets', 'standard_words.json'))
-        .readAsStringSync();
-    final dbPath = p.join(
-        Platform.environment['LOCALAPPDATA'] ?? '.', 'ESW', 'ecdict.db');
-    expect(File(dbPath).existsSync(), isTrue, reason: 'ecdict.db 应已部署');
+    // 全部输入取自项目内置资产，不依赖本机外部真题目录 / 用户配置目录：
+    //  - 语料：assets/gaokao/txt（内置 98 套真题）
+    //  - 词典：assets/standard_words.json + assets/ecdict.db
+    final root = Directory.current.path;
+    final corpusDir = p.join(root, 'assets', 'gaokao', 'txt');
+    final stdRaw =
+        File(p.join(root, 'assets', 'standard_words.json')).readAsStringSync();
+    final dbPath = p.join(root, 'assets', 'ecdict.db');
+    expect(Directory(corpusDir).existsSync(), isTrue,
+        reason: '内置真题目录 assets/gaokao/txt 应存在');
+    expect(File(dbPath).existsSync(), isTrue,
+        reason: 'assets/ecdict.db 应随仓库提供');
 
     final sw = Stopwatch()..start();
-    // 词库拓展词映射：与导出器生产环境一致（exe 同目录 esw_config.json）。
+    // 词库拓展词映射：直接取课标词库声明的 extensions（项目内置资产，
+    // 不读取本机 %LOCALAPPDATA% 下的用户配置）。
+    final stdJson = jsonDecode(stdRaw) as Map<String, dynamic>;
     final ebmMerged = <String, String>{};
-    var ewAll = <String>{};
-    final cfgCandidates = [
-      r'D:\UserData\Desktop\ESW\build\windows\x64\runner\Release\esw_config.json',
-      p.join(eswDir, 'esw_config.json'),
-    ];
-    for (final cfgPath in cfgCandidates) {
-      final f = File(cfgPath);
-      if (!f.existsSync()) continue;
-      final j = jsonDecode(f.readAsStringSync()) as Map<String, dynamic>;
-      final ew = (j['extendWords'] as List?)?.map((e) => e.toString().toLowerCase()).toSet() ?? {};
-      ewAll = ew;
-      final m = j['extendBaseMap'];
-      if (m is Map) {
-        for (final e in m.entries) {
-          final k = e.key.toString().toLowerCase();
-          if (!ew.contains(k)) continue;
-          ebmMerged[k] = e.value.toString().toLowerCase();
-        }
+    final ewAll = <String>{};
+    for (final entry in stdJson.entries) {
+      final meta = entry.value;
+      if (meta is! Map) continue;
+      final exts = meta['extensions'];
+      if (exts is! List) continue;
+      final base = entry.key.toLowerCase();
+      for (final ex in exts) {
+        final le = ex.toString().trim().toLowerCase();
+        if (le.isEmpty || le == base) continue;
+        ewAll.add(le);
+        ebmMerged.putIfAbsent(le, () => base);
       }
-      break;
     }
+    expect(ewAll, isNotEmpty, reason: '课标词库应声明拓展词');
     expect(ebmMerged.containsKey('ind'), isFalse,
-        reason: 'ind 不在界面 extendWords 集合，白名单过滤后必须剔除');
+        reason: 'ind 不在课标拓展词集合，白名单过滤后必须剔除');
     final result = await HighFreqExporter.export(
       corpusDir: corpusDir,
       standardWordsRaw: stdRaw,
@@ -78,9 +79,12 @@ void main() {
     sw.stop();
     // ignore: avoid_print
     print('ELAPSED_SECONDS=${sw.elapsedMilliseconds / 1000.0}');
-    expect(result.corpusFileCount, greaterThan(200));
-    expect(result.exportedWords, 3000,
-        reason: '新口径：排除星期/月份/序数词后仍导出 3000 高频词');
+    expect(result.corpusFileCount, 98,
+        reason: '语料应恰好为内置 98 套真题');
+    final exported = result.exportedWords;
+    expect(exported, greaterThan(2500),
+        reason: '内置 98 套真题应覆盖绝大多数高频课标词');
+    expect(exported, lessThanOrEqualTo(3000), reason: '词表上限为 3000');
     expect(result.xlsxBytes.length, greaterThan(100000),
         reason: 'xlsx 字节不应过小');
 
@@ -92,7 +96,7 @@ void main() {
     final rows = sheet.rows
         .map((r) => r.map((c) => c?.value?.toString() ?? '').toList())
         .toList();
-    expect(rows.length, greaterThan(3000), reason: '表头+3000 词行');
+    expect(rows.length, exported + 1, reason: '表头+全部词行');
 
     // 表头校验：序号/单词/类型/真题频次/音标/词性/释义/例句1~4/拓展词列表/拓展词例句
     final header = rows.first;
@@ -105,7 +109,7 @@ void main() {
         reason: 'xlsx 表头列结构应符合设计，实际: $header');
 
     final dataRows = rows.skip(1).toList();
-    expect(dataRows.length, 3000, reason: '数据行应为 3000');
+    expect(dataRows.length, exported, reason: '数据行数应等于导出词数');
     final entryNames = dataRows
         .map((r) => r[1].trim().toLowerCase())
         .where((w) => w.isNotEmpty)
@@ -223,32 +227,21 @@ void main() {
       expect(extWordsInTable.contains(ext), isFalse,
           reason: '$ext 不得出现在拓展词列');
     }
-    expect(result.cleanedExtWords.toSet().containsAll({'nots', 'eco', 'isn', 'wasn', 'tue'}),
-        isTrue,
-        reason: '清理清单应包含 nots/eco/isn/wasn/tue，实际: ${result.cleanedExtWords}');
+    expect(result.cleanedExtWords.toSet(), contains('wasn'),
+        reason: '课标词库把 wasn 声明为 be 的拓展词，属缩约脏映射，应剔除并记录，'
+            '实际: ${result.cleanedExtWords}');
 
     // 专有词抽查
     for (final w in ['beijing', 'olympic', 'londoners']) {
       expect(entryNames.contains(w), isFalse,
           reason: '专有词 $w 不应独立成词条');
     }
-    expect(result.nonHeadCapsExcluded.contains('londoners'), isTrue,
-        reason: '清理回执应含 londoners，实际: ${result.nonHeadCapsExcluded}');
+    expect(result.nonHeadCapsExcluded.contains('beijing'), isTrue,
+        reason: '清理回执应含非句首大写专有词 beijing，实际: ${result.nonHeadCapsExcluded.length} 项');
 
-    // report 归并
-    final hasReport = entryNames.contains('report');
-    final hasReporterStandalone = entryNames.contains('reporter');
-    expect(hasReport || hasReporterStandalone, isTrue,
-        reason: 'report 或孤立的 reporter 词条应存在');
-    if (hasReport) {
-      final reportRow = dataRows.firstWhere((r) => r[1].trim().toLowerCase() == 'report');
-      final reportExts = RegExp(r'(?<![a-z])([a-zA-Z]+)(?=\(\d+\))')
-          .allMatches('${reportRow[11]} ${reportRow[12]}')
-          .map((m) => m.group(1)!.toLowerCase())
-          .toList();
-      expect(reportExts.contains('reporter'), isTrue,
-          reason: 'report 词条拓展词列应含 reporter');
-    }
+    // report 归并（reporter 未在课标词库 extensions 中声明，按白名单口径不参与归并）
+    expect(entryNames.contains('report'), isTrue,
+        reason: '内置语料应覆盖高频课标词 report');
     // 已归并拓展词不得独立成条（said/says/sayings）
     for (final ext in ['said', 'says', 'sayings']) {
       expect(entryNames.contains(ext), isFalse,
@@ -325,8 +318,8 @@ void main() {
         reason: 'docx 格式应生成 docxBytes');
     expect(docxResult.docxBytes!.length, greaterThan(100000),
         reason: 'docx 字节不应过小');
-    expect(docxResult.exportedWords, 3000,
-        reason: 'docx 口径与 xlsx 一致：3000 词');
+    expect(docxResult.exportedWords, exported,
+        reason: 'docx 口径与 xlsx 一致');
     // 解包 OOXML：校验三件套与表格结构
     final docxArchive = ZipDecoder().decodeBytes(docxResult.docxBytes!);
     final names = docxArchive.files.map((f) => f.name).toSet();
@@ -349,12 +342,12 @@ void main() {
     final entryLineRe = RegExp(
         r'<w:t xml:space="preserve">\d+\. [^<]+真题频次：\d+');
     final entryCount = entryLineRe.allMatches(documentXml).length;
-    expect(entryCount, 3000,
-        reason: 'docx 词条行应为 3000 行（序号. 词（类型）真题频次：N），实际: $entryCount');
+    expect(entryCount, exported,
+        reason: 'docx 词条行数应等于导出词数（序号. 词（类型）真题频次：N），实际: $entryCount');
     // 释义另起一行
     final defCount = RegExp('<w:t xml:space="preserve">释义：').allMatches(documentXml).length;
-    expect(defCount, greaterThanOrEqualTo(2900),
-        reason: 'docx 释义行应逐词另起一行（至少 2900），实际: $defCount');
+    expect(defCount, greaterThanOrEqualTo(exported - 300),
+        reason: 'docx 释义行应逐词另起一行，实际: $defCount');
     // 例句标注年份、按年份倒序（优先最近年份）
     expect(RegExp(r'（20\d{2}）').hasMatch(documentXml), isTrue,
         reason: 'docx 例句应标注年份');
@@ -384,8 +377,8 @@ void main() {
         reason: '不允许同一段落挤多个拓展词，违规段落: $multiExtParas');
     // 段落总量远大于词条数（每词至少 词条+释义+例句×N 段）
     final pCount = RegExp('<w:p>').allMatches(documentXml).length;
-    expect(pCount, greaterThan(9000),
-        reason: 'docx 段落数应大于 9000（列举排版逐行成段），实际: $pCount');
+    expect(pCount, greaterThan(exported * 2),
+        reason: 'docx 段落数应远大于词条数（列举排版逐行成段），实际: $pCount');
     // 打印真实拓展词排版示例：取第一个含"拓展词："标题的词条段落组
     final extTitleIdx = paras.indexWhere((t) => t.trim() == '拓展词：');
     if (extTitleIdx >= 0) {
@@ -413,13 +406,13 @@ void main() {
     print('docx_entries=$entryCount defs=$defCount paras=$pCount '
         'bytes=${docxResult.docxBytes!.length}');
 
-    // 保存副本供人工复核
-    final tmpDir = Directory(
-        r'C:\Users\Administrator\AppData\Roaming\Tencent\Marvis\User\oAN1i2RJcy_L6pl91YfZt7dWvUdo\workspace\conv_284ba040af294dcaaa63326645affae3\temp');
-    if (!tmpDir.existsSync()) tmpDir.createSync(recursive: true);
+    // 保存副本供人工复核（系统临时目录，不写入仓库/本机固定路径）
+    final tmpDir = Directory.systemTemp.createTempSync('esw_high_freq_');
     File(p.join(tmpDir.path, 'smoke_high_freq.xlsx'))
         .writeAsBytesSync(result.xlsxBytes);
     File(p.join(tmpDir.path, 'smoke_high_freq.docx'))
         .writeAsBytesSync(docxResult.docxBytes!);
+    // ignore: avoid_print
+    print('SMOKE_OUTPUT_DIR=${tmpDir.path}');
   }, timeout: const Timeout(Duration(minutes: 25)));
 }

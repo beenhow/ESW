@@ -23,11 +23,11 @@ import 'dart:io';
 
 import 'package:archive/archive.dart';
 import 'package:excel/excel.dart';
-import 'package:fast_gbk/fast_gbk.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqlite3/sqlite3.dart' as sqlite3;
 
+import 'shared/doc_extractor.dart';
 import 'shared/export_word_style.dart';
 
 /// 导出结果统计信息
@@ -191,6 +191,7 @@ class HighFreqExporter {
     String? extendBaseMapRaw,
     String? extendWordsRaw,
     String format = 'xlsx',
+    Set<String>? onlyFileNames,
   }) async {
     // worker 返回纯 Map（Dart 3 自定义类默认不可跨 isolate 发送），
     // 在主 isolate 侧组装结果对象，彻底规避 "object is unsendable"。
@@ -201,6 +202,7 @@ class HighFreqExporter {
       'extendBaseMapRaw': extendBaseMapRaw ?? '',
       'extendWordsRaw': extendWordsRaw ?? '',
       'format': format == 'docx' ? 'docx' : 'xlsx',
+      'onlyFileNames': onlyFileNames?.toList(),
     });
     return HighFreqExportResult(
       format: m['format'] as String,
@@ -409,7 +411,7 @@ String _cleanPos(String pos) {
 }
 
 /// 从文件名提取年份（如 "2005 beijing.txt" → 2005），失败返回 -1。
-/// 注意：只对 basename 匹配，避免目录名（如"2005-2025真题TXT"）干扰。
+/// 注意：只对 basename 匹配，避免上级目录名中的数字干扰。
 int _yearFromName(String name) {
   final base = p.basenameWithoutExtension(name);
   final m = _yearRe.firstMatch(base);
@@ -664,6 +666,10 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
   final extendBaseMapRaw = (args['extendBaseMapRaw'] as String?) ?? '';
   final extendWordsRaw = (args['extendWordsRaw'] as String?) ?? '';
   final format = (args['format'] as String?) ?? 'xlsx';
+  final onlyRaw = args['onlyFileNames'];
+  final Set<String>? onlyFileNames = onlyRaw is List
+      ? onlyRaw.map((e) => '$e').toSet()
+      : null;
 
   // 界面"拓展词汇"列表完整集合（与列表页同一数据源：esw_config.json
   // extendWords 字段）。非空时作为拓展词白名单：stdExtMap / extendBaseMapRaw
@@ -713,7 +719,12 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
   final files = Directory(corpusDir)
       .listSync()
       .whereType<File>()
-      .where((f) => f.path.toLowerCase().endsWith('.txt'))
+      .where(
+        (f) =>
+            f.path.toLowerCase().endsWith('.txt') &&
+            (onlyFileNames == null ||
+                onlyFileNames.contains(f.uri.pathSegments.last)),
+      )
       .toList()
     ..sort((a, b) => a.path.compareTo(b.path));
 
@@ -735,11 +746,7 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
     final year = _yearFromName(f.path);
     String text;
     final bytes = f.readAsBytesSync();
-    try {
-      text = utf8.decode(bytes); // 严格 UTF-8（BOM 一并读入，不影响切句）
-    } catch (_) {
-      text = gbk.decode(bytes); // GBK 回退（真题语料多为 GBK/GB18030 编码）
-    }
+    text = decodeTextBytes(bytes);
     // 全角标点/弯引号归一化：早期试卷用全角标点（．，；：！？）会把整段
     // 粘成"超长句"导致例句候选被长度过滤；统一转半角后切句与词频统计更准。
     text = text

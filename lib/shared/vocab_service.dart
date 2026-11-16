@@ -2,6 +2,8 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'dart:convert';
 import 'dart:io';
 
+import 'doc_extractor.dart';
+
 /// 单词分类常量
 const wordCategories = ['真题词', '课标词', '拓展词', '超标词', '专有词'];
 
@@ -638,7 +640,11 @@ class VocabService {
   /// 返回 { "total": 总次数, "byYear": { "2023全国卷I": [{"text":..., "filePath":..., "offset":...}, ...], ... } }；
   /// 每个例句携带来源文件路径 filePath 与关键词在原文中的字符偏移 offset，供点击跳转定位。
   /// 若目录不存在或读取失败返回 null。
-  Future<Map<String, dynamic>?> getWordFrequency(String word, String corpusDirPath) async {
+  Future<Map<String, dynamic>?> getWordFrequency(
+    String word,
+    String corpusDirPath, {
+    Set<String>? onlyNames,
+  }) async {
     final dir = Directory(corpusDirPath);
     if (!await dir.exists()) return null;
 
@@ -650,14 +656,19 @@ class VocabService {
       final txtFiles = dir
           .listSync(recursive: true)
           .whereType<File>()
-          .where((f) => f.path.toLowerCase().endsWith('.txt'))
+          .where(
+            (f) =>
+                f.path.toLowerCase().endsWith('.txt') &&
+                (onlyNames == null ||
+                    onlyNames.contains(f.uri.pathSegments.last)),
+          )
           .toList()
         ..sort((a, b) => a.path.compareTo(b.path));
 
       for (final file in txtFiles) {
         final yearKey = file.uri.pathSegments.last
             .replaceAll(RegExp(r'\.txt$', caseSensitive: false), '');
-        final content = await file.readAsString();
+        final content = decodeTextBytes(await file.readAsBytes());
         final matches = wordPattern.allMatches(content).toList();
         if (matches.isNotEmpty) {
           byYear.putIfAbsent(yearKey, () => []);

@@ -22,7 +22,8 @@ import 'package:esw/shared/export_annotate_markup.dart';
 import 'package:esw/shared/export_word_style.dart';
 import 'package:esw/shared/inplace_docx_annotator.dart';
 
-/// 七类规范期望值：分类 -> (字色, 加粗, 底纹色)
+/// 规范表期望值：分类 -> (字色, 加粗, 底纹色)
+/// 加粗为规范表历史值（Android 沿用）；Windows 方案一导出时统一关闭加粗。
 const Map<String, (String, bool, String)> kExpect = {
   '初中课标词': ('000000', true, 'D9D9D9'),
   '必修课标词': ('0B3D91', true, 'D6E0F5'),
@@ -30,7 +31,6 @@ const Map<String, (String, bool, String)> kExpect = {
   '拓展词': ('006400', true, 'D6E9D7'),
   '超标词': ('FF0000', false, 'FFDBDB'),
   '专有词': ('800080', false, 'EBD9F0'),
-  '未筛选': ('A0522D', false, 'F0E0D6'),
 };
 
 /// 样例句：七类各一个词 + 一个真题词（不参与配色标注）。
@@ -139,7 +139,8 @@ void expectNoShading(String xml, String reason) {
 }
 
 void main() {
-  test('七类规范表：字色 / 字重 / 底纹色齐全且无漂移', () {
+  test('规范表：字色 / 字重 / 底纹色齐全且无漂移', () {
+    // 表内保留未筛选的历史样式（Android 与统计口径使用）；Windows 导出前会拦截
     expect(kExportWordStyles.length, 7);
     kExpect.forEach((cat, exp) {
       final spec = exportWordStyleOf(cat);
@@ -154,11 +155,12 @@ void main() {
     expect(exportShadeHexOf('真题词'), isNull);
   });
 
-  test('DOCX 重生成路径：七类字色 + 字重，无 w:shd / w:highlight', () {
-    final xml = docxAnnotatedParagraphXml(kSampleText, kSampleCatByLower);
+  test('DOCX 重生成路径：六类字色，无加粗 / w:shd / w:highlight', () {
+    final xml = docxAnnotatedParagraphXml(kSampleText, kSampleCatByLower,
+        colorBold: false, annotateUnfiltered: false);
     expectNoShading(xml, 'DOCX 重生成路径');
 
-    // 每类字色都必须出现，且加粗只出现在规范要求加粗的三类上
+    // 每类字色都必须出现
     kExpect.forEach((cat, exp) {
       expect(
         xml.contains('<w:color w:val="${exp.$1}"/>'),
@@ -166,18 +168,24 @@ void main() {
         reason: '$cat 字色 ${exp.$1} 未出现在导出标注中',
       );
     });
-    for (final cat in ['初中课标词', '必修课标词', '拓展词']) {
+    // 方案一不加粗：命中词 run 只带字色
+    for (final cat in kExpect.keys) {
       final word = kSampleWordOf[cat]!;
-      // 命中词的 run：字色 + 加粗相邻
-      final runXml = docxRunXml(word, kExpect[cat]!.$1, bold: true);
-      expect(xml.contains(runXml), isTrue, reason: '$cat 命中 run 未按规范加粗');
+      expect(
+        xml.contains(docxRunXml(word, kExpect[cat]!.$1)),
+        isTrue,
+        reason: '$cat 命中 run 应为“字色且不加粗”',
+      );
     }
-    // 真题词 / 普通文本：黑色不加粗（不参与配色标注）
-    expect(
-      xml.contains(docxRunXml('RealExamWord', '000000')),
-      isTrue,
-      reason: '真题词不应参与配色标注，需保持黑色不加粗',
-    );
+    expect(xml.contains('<w:b/>'), isFalse, reason: '方案一不得加粗');
+    // 未筛选词 / 真题词：黑色不加粗（不参与标注）
+    for (final w in ['UnfilteredWord', 'RealExamWord']) {
+      expect(
+        xml.contains(docxRunXml(w, '000000')),
+        isTrue,
+        reason: '$w 不应参与配色标注，需保持黑色不加粗',
+      );
+    }
 
     final bytes = buildDocx([
       docxAnnotatedParagraphXml(kSampleText, kSampleCatByLower),
@@ -187,7 +195,7 @@ void main() {
     expectNoShading(readDocumentXml(bytes), '落盘样例（重生成路径）');
   });
 
-  test('DOCX 原地标注路径：清除已有底纹 + 七类字色字重，且无 w:shd / w:highlight', () {
+  test('DOCX 原地标注路径：清除已有底纹 + 六类字色，且无加粗 / w:shd / w:highlight', () {
     // 源文档：被标注的单词所在 run 预置 w:highlight 与 w:shd 底纹（模拟历史导出残留），
     // 标注后该 run 应被重建为「只有字色 + 字重」，底纹标记全部消失。
     const head = 'JuniorWord CompulsoryWord ElectiveWord ';
@@ -212,8 +220,10 @@ void main() {
       srcBytes: srcBytes,
       catByLower: kSampleCatByLower,
       preambleParagraphsXml: [
-        docxRunXml('ESW 课标词检测导出（示例）', '000000', bold: true),
+        docxRunXml('ESW 课标词检测导出（示例）', '000000'),
       ],
+      colorBold: false,
+      annotateUnfiltered: false,
     );
     final xml = readDocumentXml(annotated);
     expectNoShading(xml, 'DOCX 原地标注路径');
@@ -224,24 +234,47 @@ void main() {
         reason: '$cat 字色未写入原地标注',
       );
     });
-    // 命中词加粗（初中 / 必修 / 拓展三类）
-    expect(xml.contains('<w:b/>'), isTrue);
+    // 方案一不加粗：整篇不得出现 w:b（标题段也不加粗）
+    expect(xml.contains('<w:b/>'), isFalse, reason: '方案一不得加粗');
+    // 未筛选词 / 真题词：黑色不加粗（不参与标注）
+    for (final w in ['UnfilteredWord', 'RealExamWord']) {
+      expect(xml.contains(docxRunXml(w, '000000')), isTrue,
+          reason: '$w 不应参与配色标注');
+    }
 
     final out = File('${_sampleDir().path}/样例2_Word导出_原地标注_无底纹.docx');
     out.writeAsBytesSync(annotated);
+  });
+
+  test('方案一原地标注：原文自带加粗保持原样，不被标注清除', () {
+    // 用户口径：方案一只着色不加粗，原文本身加粗必须保留，避免与原文混淆。
+    const srcPara = '<w:p><w:r><w:rPr><w:b/></w:rPr>'
+        '<w:t xml:space="preserve">ExtendWord</w:t></w:r></w:p>';
+    final annotated = annotateDocxBytes(
+      srcBytes: buildDocx([srcPara]),
+      catByLower: const {'extendword': '拓展词'},
+      colorBold: false,
+      annotateUnfiltered: false,
+    );
+    final xml = readDocumentXml(annotated);
+    expect(xml.contains('<w:b/>'), isTrue,
+        reason: '原文自带加粗必须原样保留');
+    expect(xml.contains('<w:color w:val="006400"/>'), isTrue,
+        reason: '拓展词仍应按规范色着色');
   });
 
   test('PDF 路径：原文标注带极淡同色底纹 + 规范字色字重', () async {
     final font = loadExportFont();
 
     // ① 结构层：逐类校验 span 的字色 / 字重 / 底纹（底纹 = BoxDecoration 同色）
-    final widget = pdfAnnotatedLine(kSampleText, kSampleCatByLower, font)
+    final widget = pdfAnnotatedLine(kSampleText, kSampleCatByLower, font,
+            colorBold: false, annotateUnfiltered: false)
         as pw.RichText;
     final spans =
         (widget.text as pw.TextSpan).children!.cast<pw.TextSpan>();
     for (final entry in kSampleCatByLower.entries) {
       final cat = entry.value;
-      if (cat == '真题词') continue; // 不参与配色标注
+      if (!kExpect.containsKey(cat)) continue; // 真题词 / 未筛选：不参与标注
       final word = kSampleWordOf[cat]!;
       final span = spans.firstWhere((s) => s.text == word);
       final exp = kExpect[cat]!;
@@ -252,8 +285,8 @@ void main() {
       );
       expect(
         span.style!.fontWeight == pw.FontWeight.bold,
-        exp.$2,
-        reason: '$cat PDF 字重漂移',
+        false,
+        reason: '$cat PDF 方案一不得加粗',
       );
       final bg = span.style!.background;
       expect(bg, isNotNull, reason: '$cat PDF 应带极淡同色底纹');
@@ -263,9 +296,11 @@ void main() {
         reason: '$cat PDF 底纹色漂移',
       );
     }
-    // 真题词：无底纹
-    final plainSpan = spans.firstWhere((s) => s.text == 'RealExamWord');
-    expect(plainSpan.style!.background, isNull, reason: '真题词不得加底纹');
+    // 未筛选词 / 真题词：无底纹（不参与标注）
+    for (final w in ['UnfilteredWord', 'RealExamWord']) {
+      final span = spans.firstWhere((s) => s.text == w);
+      expect(span.style!.background, isNull, reason: '$w 不得加底纹');
+    }
 
     // ② 产物层：真实渲染一份 PDF，正文流内应出现七类底纹填充色
     final doc = pw.Document(verbose: true, compress: false);
@@ -287,8 +322,7 @@ void main() {
             pdfAnnotatedLine(line, kSampleCatByLower, font),
           pw.SizedBox(height: 10),
           pw.Paragraph(
-            text: '注：Word（.docx/.doc）导出为同款字色与字重，但不加底纹；'
-                'TXT 为纯文本，不着色不加底纹。',
+            text: '注：Word（.docx）导出为同款字色，但不加底纹；方案一不使用加粗。',
             style: pw.TextStyle(font: font, fontSize: 9),
           ),
         ],
@@ -312,5 +346,158 @@ void main() {
     final out = File('${_sampleDir().path}/样例3_PDF导出_原文标注_带底纹.pdf');
     out.writeAsBytesSync(bytes);
     expect(out.lengthSync(), greaterThan(1000));
+  });
+
+  test('方案二（简化映射）：DOCX 加粗 / 单线 / 30% 灰底，未筛选不标注', () {
+    final xml = docxAnnotatedParagraphXml(
+      kSampleText,
+      kSampleCatByLower,
+      scheme: ExportAnnotateScheme.typography,
+    );
+    // 方案二专有词允许 30% 灰底纹，因此这里不做“全文无底纹”断言，
+    // 只断言底纹只出现在专有词上（下方逐 token 精确核对）。
+    // 全文单词（含真题词）统一 Times New Roman
+    for (final w in [
+      'JuniorWord',
+      'CompulsoryWord',
+      'ElectiveWord',
+      'RealExamWord',
+    ]) {
+      expect(xml.contains(docxRunXml(w, '000000', fontName: kExportTypographyFont)),
+          isTrue,
+          reason: '$w 应为 TNR');
+    }
+    // 拓展词：加粗；超标词：单线；专有词：30% 灰底
+    expect(
+      xml.contains(docxRunXml('ExtendWord', '000000',
+          fontName: kExportTypographyFont, bold: true)),
+      isTrue,
+      reason: '拓展词应加粗',
+    );
+    expect(
+      xml.contains(docxRunXml('OverLimitWord', '000000',
+          fontName: kExportTypographyFont, underline: 'single')),
+      isTrue,
+      reason: '超标词应单线下划线',
+    );
+    expect(
+      xml.contains(docxRunXml('ProperWord', '000000',
+          fontName: kExportTypographyFont, shadeFill: 'B3B3B3')),
+      isTrue,
+      reason: '专有词应 30% 灰底纹',
+    );
+    // 未筛选不再标注：与课标词同为纯 TNR
+    expect(
+      xml.contains(docxRunXml('UnfilteredWord', '000000',
+          fontName: kExportTypographyFont)),
+      isTrue,
+      reason: '未筛选词应只保留 TNR，不带任何标记',
+    );
+    // 课标词与真题词保持默认：无加粗 / 下划线 / 底纹
+    for (final w in [
+      'JuniorWord',
+      'CompulsoryWord',
+      'ElectiveWord',
+      'RealExamWord',
+    ]) {
+      expect(
+        xml.contains(docxRunXml(w, '000000', fontName: kExportTypographyFont)),
+        isTrue,
+        reason: '$w 不应带任何标记',
+      );
+    }
+    // 不再插入任何编号 / 斜体
+    for (final m in ['①', '②', '③', '④', '⑤', '⑥', '⑦']) {
+      expect(xml.contains(m), isFalse, reason: '方案二不应出现编号 $m');
+    }
+    expect(xml.contains('<w:i/>'), isFalse);
+    // 不得残留方案一的分类色（黑色是方案二统一字色，排除）
+    for (final hex in exportPaletteHex().where((h) => h != '000000')) {
+      expect(xml.contains('<w:color w:val="$hex"/>'), isFalse,
+          reason: '方案二正文不应出现方案一配色 $hex');
+    }
+
+    // 原地标注路径：覆盖源字体 / 斜体 / 下划线，重写为方案二标记
+    final srcPara = '<w:p>'
+        '<w:r><w:rPr><w:rFonts w:ascii="Courier New"/><w:i/>'
+        '<w:u w:val="single"/></w:rPr>'
+        '<w:t xml:space="preserve">ExtendWord</w:t></w:r>'
+        '<w:r><w:rPr><w:rFonts w:ascii="Courier New"/>'
+        '<w:u w:val="single"/></w:rPr>'
+        '<w:t xml:space="preserve">ProperWord</w:t></w:r>'
+        '</w:p>';
+    final annotated = annotateDocxBytes(
+      srcBytes: buildDocx([srcPara]),
+      catByLower: kSampleCatByLower,
+      scheme: ExportAnnotateScheme.typography,
+    );
+    final annotatedXml = readDocumentXml(annotated);
+    expect(annotatedXml.contains('Courier New'), isFalse,
+        reason: '命中词字体应被覆盖为 Times New Roman');
+    expect(annotatedXml.contains('<w:i/>'), isFalse,
+        reason: '命中词应清除斜体');
+    expect(annotatedXml.contains('<w:b/>'), isTrue, reason: '拓展词应加粗');
+    expect(annotatedXml.contains('<w:shd w:val="clear" w:color="auto" '
+        'w:fill="B3B3B3"/>'), isTrue, reason: '专有词应写入 30% 灰底纹');
+
+    final out = File('${_sampleDir().path}/样例4_Word导出_简化映射方案.docx');
+    out.writeAsBytesSync(
+      buildDocx([
+        docxAnnotatedParagraphXml(
+          kSampleText,
+          kSampleCatByLower,
+          scheme: ExportAnnotateScheme.typography,
+        ),
+      ]),
+    );
+    expect(out.lengthSync(), greaterThan(1000));
+  });
+
+  test('方案二（简化映射）：PDF 加粗 / 单线 / 灰底，未筛选不标注', () {
+    final font = loadExportFont();
+    final wordFont = pw.Font.times();
+    final boldFont = pw.Font.timesBold();
+    final widget = pdfAnnotatedLine(
+      kSampleText,
+      kSampleCatByLower,
+      font,
+      scheme: ExportAnnotateScheme.typography,
+      wordFont: wordFont,
+      boldFont: boldFont,
+    ) as pw.RichText;
+    final spans = (widget.text as pw.TextSpan).children!.cast<pw.TextSpan>();
+
+    pw.TextSpan spanOf(String text) => spans.firstWhere((s) => s.text == text);
+
+    // 课标词：默认 TNR，无标记
+    for (final w in [
+      'JuniorWord',
+      'CompulsoryWord',
+      'ElectiveWord',
+      'RealExamWord',
+    ]) {
+      final style = spanOf(w).style!;
+      expect(style.font, wordFont, reason: '$w 应为 TNR');
+      expect(style.decoration, isNull, reason: '$w 不应有下划线');
+      expect(style.background, isNull, reason: '$w 不应有底纹');
+    }
+    // 拓展词：加粗字体
+    expect(spanOf('ExtendWord').style!.font, boldFont, reason: '拓展词应加粗');
+    // 超标词：单线
+    final over = spanOf('OverLimitWord').style!;
+    expect(over.decoration, pw.TextDecoration.underline);
+    expect(over.decorationStyle, pw.TextDecorationStyle.solid);
+    // 专有词：30% 灰底纹
+    expect(spanOf('ProperWord').style!.background, isNotNull,
+        reason: '专有词应有底纹');
+    // 未筛选：不标注（与课标词同为纯 TNR）
+    final unfiltered = spanOf('UnfilteredWord').style!;
+    expect(unfiltered.font, wordFont);
+    expect(unfiltered.decoration, isNull);
+    expect(unfiltered.background, isNull);
+    // 不插入任何编号
+    for (final m in ['①', '②', '③', '④', '⑤', '⑥', '⑦']) {
+      expect(spans.any((s) => s.text == m), isFalse, reason: 'PDF 不应插入编号 $m');
+    }
   });
 }

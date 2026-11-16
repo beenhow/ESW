@@ -9,6 +9,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../theme/esw_tokens.dart';
 import '../theme/responsive.dart';
 import '../widgets/esw_widgets.dart';
+import '../widgets/esw_app_dialog.dart';
 import '../shared/vocab_service.dart';
 import '../shared/word_sync_service.dart';
 import '../shared/app_snack_bar.dart';
@@ -57,8 +58,10 @@ Future<Directory> _downloadDir() async {
 
 /// 选择导出目录：直接弹出系统目录选择器，选择后记忆路径。
 /// 用户取消选择时，若有记忆路径则使用记忆路径，否则回退到默认 Download/esw_exports。
-Future<Directory> _pickExportDir(BuildContext context,
-    {required bool isVocab}) async {
+Future<Directory> _pickExportDir(
+  BuildContext context, {
+  required bool isVocab,
+}) async {
   final picked = await FilePicker.getDirectoryPath();
   if (picked != null && picked.isNotEmpty) {
     if (isVocab) {
@@ -91,7 +94,7 @@ class WordBankPage extends StatefulWidget {
   final VocabService vocab;
   final VoidCallback onSaveConfig;
   final Future<void> Function(String word, VoidCallback onAdded)
-      showBaseWordDialog;
+  showBaseWordDialog;
   final ValueChanged<String>? onWordTap;
   final VoidCallback onSyncVocab;
   final VoidCallback onCheckUpdate;
@@ -99,6 +102,13 @@ class WordBankPage extends StatefulWidget {
   final Future<void> Function() onImportTextbook;
   final bool syncing;
   final WordSyncService wordSyncService;
+
+  /// 当前生效的真题文件名（内置 + 本次主动导入）。
+  /// 为空/null 时保持旧行为（扫描 corpus 下全部 txt）。
+  final Set<String>? corpusNames;
+
+  /// 动态取当前生效文件名：用户刚导入后无需等待页面重建即可看到新文件。
+  final Future<Set<String>> Function()? corpusNamesProvider;
 
   const WordBankPage({
     super.key,
@@ -112,7 +122,14 @@ class WordBankPage extends StatefulWidget {
     required this.onImportTextbook,
     required this.syncing,
     required this.wordSyncService,
+    this.corpusNames,
+    this.corpusNamesProvider,
   });
+
+  Future<Set<String>?> resolveCorpusNames() async {
+    if (corpusNamesProvider != null) return corpusNamesProvider!();
+    return corpusNames;
+  }
 
   @override
   State<WordBankPage> createState() => _WordBankPageState();
@@ -170,16 +187,18 @@ class _WordBankPageState extends State<WordBankPage> {
 
   /// 打开某类词库详情页
   void _openWordList(String category) {
-    Navigator.of(context).push(CupertinoPageRoute<void>(
-      builder: (_) => WordListPage(
-        category: category,
-        vocab: widget.vocab,
-        onSaveConfig: widget.onSaveConfig,
-        showBaseWordDialog: widget.showBaseWordDialog,
-        wordSyncService: widget.wordSyncService,
-        onWordTap: widget.onWordTap,
+    Navigator.of(context).push(
+      CupertinoPageRoute<void>(
+        builder: (_) => WordListPage(
+          category: category,
+          vocab: widget.vocab,
+          onSaveConfig: widget.onSaveConfig,
+          showBaseWordDialog: widget.showBaseWordDialog,
+          wordSyncService: widget.wordSyncService,
+          onWordTap: widget.onWordTap,
+        ),
       ),
-    ));
+    );
   }
 
   /// 导出词库为 JSON 备份到下载目录。
@@ -247,14 +266,20 @@ class _WordBankPageState extends State<WordBankPage> {
     }
   }
 
-  /// 应用文档目录/corpus 下是否已有真题 txt（真题语料可用）。
+  /// 应用文档目录/corpus 下是否已有当前生效的真题 txt。
   Future<bool> _hasRealCorpus() async {
+    final names = await widget.resolveCorpusNames();
+    if (names != null && names.isEmpty) return false;
     try {
       final dir = await _appDocDir();
       final d = Directory('$dir/corpus');
       if (!await d.exists()) return false;
       await for (final e in d.list()) {
-        if (e is File && e.path.toLowerCase().endsWith('.txt')) return true;
+        if (e is File &&
+            e.path.toLowerCase().endsWith('.txt') &&
+            (names == null || names.contains(e.uri.pathSegments.last))) {
+          return true;
+        }
       }
     } catch (_) {}
     return false;
@@ -265,29 +290,18 @@ class _WordBankPageState extends State<WordBankPage> {
   Future<bool> _promptCorpusImport() async {
     if (await _hasRealCorpus()) return true;
     if (!mounted) return false;
-    final choice = await showDialog<String>(
-      context: context,
-      builder: (dctx) => AlertDialog(
-        title: const Text('需要真题/教材语料'),
-        content: const Text(
+    final choice = await showEswChoice<String>(
+      context,
+      title: '需要真题/教材语料',
+      message:
           '真题单词检测需要真题或教材语料支撑。请先导入真题或教材；'
           '若不导入，将无法完成真题单词检测。',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dctx, 'textbook'),
-            child: const Text('导入教材'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(dctx, 'exam'),
-            child: const Text('导入真题'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(dctx, 'later'),
-            child: const Text('暂不'),
-          ),
-        ],
-      ),
+      icon: Icons.folder_open_rounded,
+      choices: const [
+        EswDialogChoice(label: '导入真题', value: 'exam', primary: true),
+        EswDialogChoice(label: '导入教材', value: 'textbook'),
+        EswDialogChoice(label: '暂不', value: 'later'),
+      ],
     );
     if (choice == 'exam') {
       await widget.onImportCorpus();
@@ -296,8 +310,11 @@ class _WordBankPageState extends State<WordBankPage> {
     }
     if (await _hasRealCorpus()) return true;
     if (mounted) {
-      showAppSnackBar(context, '无法完成真题单词检测：请先导入真题或教材语料',
-          type: AppSnackBarType.error);
+      showAppSnackBar(
+        context,
+        '无法完成真题单词检测：请先导入真题或教材语料',
+        type: AppSnackBarType.error,
+      );
     }
     return false;
   }
@@ -309,26 +326,15 @@ class _WordBankPageState extends State<WordBankPage> {
   /// 精确匹配、双格式生成），保存到 Download/esw_exports 并提示完整路径。
   Future<void> _exportHighFreq() async {
     if (_exportingHighFreq) return;
-    final format = await showDialog<String>(
-      context: context,
-      builder: (dctx) => AlertDialog(
-        title: const Text('选择导出格式'),
-        content: const Text('请选择高频词表的导出格式：'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dctx, 'docx'),
-            child: const Text('Word(docx)'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(dctx, 'xlsx'),
-            child: const Text('Excel(xlsx)'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(dctx),
-            child: const Text('取消'),
-          ),
-        ],
-      ),
+    final format = await showEswChoice<String>(
+      context,
+      title: '选择导出格式',
+      message: '请选择高频词表的导出格式：',
+      icon: Icons.table_chart_rounded,
+      choices: const [
+        EswDialogChoice(label: 'Word(docx)', value: 'docx', primary: true),
+        EswDialogChoice(label: 'Excel(xlsx)', value: 'xlsx'),
+      ],
     );
     if (format == null) return;
     _exportingHighFreq = true;
@@ -342,26 +348,34 @@ class _WordBankPageState extends State<WordBankPage> {
         if (!imported) return;
         if (!await _hasRealCorpus()) {
           if (mounted) {
-            showAppSnackBar(context,
-                '未找到真题语料目录（应用文档目录/corpus），请先导入真题语料',
-                type: AppSnackBarType.error);
+            showAppSnackBar(
+              context,
+              '未找到真题语料目录（应用文档目录/corpus），请先导入真题语料',
+              type: AppSnackBarType.error,
+            );
           }
           return;
         }
       }
       // 预估导出耗时（对齐 Windows 版）：按 corpus 目录 .txt 总字节数估算（约 7 秒/MB）
+      final activeNames = await widget.resolveCorpusNames();
       int corpusBytes = 0;
       try {
         final cDir = Directory(corpusDir);
         if (cDir.existsSync()) {
+          final names = activeNames;
           for (final f in cDir.listSync().whereType<File>()) {
-            if (f.path.toLowerCase().endsWith('.txt')) {
+            if (f.path.toLowerCase().endsWith('.txt') &&
+                (names == null || names.contains(f.uri.pathSegments.last))) {
               corpusBytes += f.lengthSync();
             }
           }
         }
       } catch (_) {}
-      final estMin = ((corpusBytes / 1024 / 1024) * 7 / 60).ceil().clamp(1, 999);
+      final estMin = ((corpusBytes / 1024 / 1024) * 7 / 60).ceil().clamp(
+        1,
+        999,
+      );
       if (!mounted) return;
       // 统一导出等待提示：延迟 500ms 未完成才浮出，保留原「预计用时」信息
       progress = ExportProgressOverlay.begin(
@@ -370,16 +384,19 @@ class _WordBankPageState extends State<WordBankPage> {
         hint: '预计用时约$estMin 分钟，请耐心等待',
       );
 
-      final standardWordsRaw =
-          await rootBundle.loadString('assets/standard_words.json');
+      final standardWordsRaw = await rootBundle.loadString(
+        'assets/standard_words.json',
+      );
       // 词典库须走 DictionaryService 统一部署路径（应用文档目录/ESW/ecdict.db）
       final dbPath = await DictionaryService.ensureDeployedDbPath();
-      final extendWordsLower =
-          widget.vocab.extendWords.map((w) => w.toLowerCase()).toList();
+      final extendWordsLower = widget.vocab.extendWords
+          .map((w) => w.toLowerCase())
+          .toList();
       final extendBaseMapRaw = jsonEncode(
         Map<String, String>.fromEntries(
-          widget.vocab.extendBaseMap.entries
-              .where((e) => extendWordsLower.contains(e.key.toLowerCase())),
+          widget.vocab.extendBaseMap.entries.where(
+            (e) => extendWordsLower.contains(e.key.toLowerCase()),
+          ),
         ),
       );
       final extendWordsRaw = jsonEncode(extendWordsLower);
@@ -391,9 +408,11 @@ class _WordBankPageState extends State<WordBankPage> {
         extendBaseMapRaw: extendBaseMapRaw,
         extendWordsRaw: extendWordsRaw,
         format: format,
+        onlyFileNames: activeNames,
       );
-      final outBytes =
-          result.format == 'docx' ? result.docxBytes! : result.xlsxBytes;
+      final outBytes = result.format == 'docx'
+          ? result.docxBytes!
+          : result.xlsxBytes;
       // 统计与文档生成已结束：先收起提示层，避免遮挡随后的目录选择器
       progress.close();
       progress = null;
@@ -439,15 +458,18 @@ class _WordBankPageState extends State<WordBankPage> {
 
     final allMap = _allWordsWithCategory();
     final q = _searchCtrl.text.trim().toLowerCase();
-    final filtered = q.isEmpty
-        ? <MapEntry<String, String>>[]
-        : allMap.entries.where((e) => e.key.toLowerCase().contains(q)).toList()
+    final filtered =
+        q.isEmpty
+              ? <MapEntry<String, String>>[]
+              : allMap.entries
+                    .where((e) => e.key.toLowerCase().contains(q))
+                    .toList()
           ..sort((a, b) => a.key.compareTo(b.key));
 
     final Widget searchField = EswSearchField(
       controller: _searchCtrl,
       focusNode: _searchFocus,
-      hintText: '搜索已添加的单词来源',
+      hintText: '搜索词库单词',
       onChanged: (_) => setState(() {}),
       onSubmitted: (_) {},
     );
@@ -473,10 +495,7 @@ class _WordBankPageState extends State<WordBankPage> {
         itemBuilder: (context, i) {
           final e = filtered[i];
           return EswListTile(
-            leading: EswLetterChip(
-              letter: e.key,
-              color: _catColor(e.value),
-            ),
+            leading: EswLetterChip(letter: e.key, color: _catColor(e.value)),
             title: e.key,
             subtitle: e.value,
             onTap: widget.onWordTap == null
@@ -523,49 +542,66 @@ class _WordBankPageState extends State<WordBankPage> {
       );
     }
 
-    // 2×2 四宫格：宫格高度按剩余空间实时反算，始终单屏铺满、不产生滚动
+    // 词库总览恢复为简洁的 2×2 统计卡：课标 / 拓展 / 超标 / 专有各一张，
+    // 点卡片直接进入对应词库列表，一眼看清四类规模，不再用「大卡 + 三个按钮」。
     Widget statGrid(double f) {
-      return LayoutBuilder(
-        builder: (context, c) {
-          final spacing = EswSpace.sm * f;
-          final cellW = (c.maxWidth - spacing) / 2;
-          final cellH = (c.maxHeight - spacing) / 2;
-          final ratio = cellH > 0 ? cellW / cellH : 1.55;
-          return GridView.count(
-            crossAxisCount: 2,
-            physics: const NeverScrollableScrollPhysics(),
-            padding: EdgeInsets.zero,
-            crossAxisSpacing: spacing,
-            mainAxisSpacing: spacing,
-            childAspectRatio: ratio,
+      Widget cell({
+        required String label,
+        required int count,
+        required Color color,
+        required String category,
+      }) {
+        return Expanded(
+          child: SizedBox(
+            height: 92 * f,
+            child: EswStatCard(
+              label: label,
+              countText: '$count',
+              color: color,
+              onTap: () => _openWordList(category),
+            ),
+          ),
+        );
+      }
+
+      return Column(
+        children: [
+          Row(
             children: [
-              EswStatCard(
+              cell(
                 label: '课标词',
-                countText: '$totalStandard',
+                count: totalStandard,
                 color: EswColors.blue,
-                onTap: () => _openWordList('课标词'),
+                category: '课标词',
               ),
-              EswStatCard(
+              SizedBox(width: EswSpace.sm * f),
+              cell(
                 label: '拓展词',
-                countText: '$totalExtend',
+                count: totalExtend,
                 color: EswColors.green,
-                onTap: () => _openWordList('拓展词'),
-              ),
-              EswStatCard(
-                label: '超标词',
-                countText: '$totalChaoGang',
-                color: EswColors.red,
-                onTap: () => _openWordList('超标词'),
-              ),
-              EswStatCard(
-                label: '专有词',
-                countText: '$totalExtra',
-                color: EswColors.grey,
-                onTap: () => _openWordList('专有词'),
+                category: '拓展词',
               ),
             ],
-          );
-        },
+          ),
+          SizedBox(height: EswSpace.sm * f),
+          Row(
+            children: [
+              cell(
+                label: '超标词',
+                count: totalChaoGang,
+                color: EswColors.red,
+                category: '超标词',
+              ),
+              SizedBox(width: EswSpace.sm * f),
+              cell(
+                label: '专有词',
+                count: totalExtra,
+                color: EswColors.grey,
+                category: '专有词',
+              ),
+            ],
+          ),
+        ],
       );
     }
 
@@ -592,9 +628,7 @@ class _WordBankPageState extends State<WordBankPage> {
               icon: Icons.description_outlined,
               title: '使用说明',
               onTap: () => Navigator.of(context).push(
-                CupertinoPageRoute<void>(
-                  builder: (_) => const HelpPage(),
-                ),
+                CupertinoPageRoute<void>(builder: (_) => const HelpPage()),
               ),
             ),
             Divider(
@@ -642,7 +676,7 @@ class _WordBankPageState extends State<WordBankPage> {
             }
           },
           child: Text(
-            'V1.5.8 · github.com/beenhow/ESW',
+            'V1.6.0 · github.com/beenhow/ESW',
             style: EswText.caption.copyWith(color: EswColors.textSecondary),
           ),
         ),
@@ -659,33 +693,32 @@ class _WordBankPageState extends State<WordBankPage> {
               child: LayoutBuilder(
                 builder: (context, constraints) {
                   final f = EswResponsive.factorOf(context);
+                  // ── 结构恒定原则（搜索框可输入的关键）──
+                  // 搜索框必须是整棵树里位置固定、永不重建的节点：
+                  //   ① 结构不随「键盘是否弹出」切换（旧版用 if (!keyboardOpen) 增删
+                  //      下方区块，键盘一弹整段子树被更换）；
+                  //   ② 搜索态/非搜索态也不切换外层结构（旧版把搜索框从「固定 Column」
+                  //      搬到「Padding>Column>Expanded 列表」里，输入第一个字符就重建
+                  //      TextField，焦点立刻丢失，表现为「打不进字」）。
+                  // 现在：整页常驻滚动视图，中间区块固定高度容器内只替换内容。
                   final hPad = EdgeInsets.fromLTRB(
                     EswSpace.lg * f,
                     0,
                     EswSpace.lg * f,
                     EswSpace.sm * f,
                   );
+                  final searching = q.isNotEmpty;
+                  final avail = constraints.maxHeight;
+                  // 中间区高度：搜索结果列表需要可滚动的高度；非搜索态的四宫格
+                  // 改为固定格高、由内容自身决定高度（不再撑满整屏），
+                  // 这样下方「导入/导出/设置/版本」区块能在一屏内看全。
+                  final searchH = (avail - 110 * f)
+                      .clamp(160 * f, 900 * f)
+                      .toDouble();
 
-                  // 搜索态：搜索框 + 结果列表（列表内部滚动）
-                  if (q.isNotEmpty) {
-                    return Padding(
-                      padding: hPad,
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.stretch,
-                        children: [
-                          searchField,
-                          SizedBox(height: EswSpace.sm * f),
-                          EswSectionHeader(title: '搜索结果 (${filtered.length})'),
-                          SizedBox(height: EswSpace.sm * f),
-                          Expanded(child: searchResults(f)),
-                        ],
-                      ),
-                    );
-                  }
-
-                  // 极小屏 / 超大字体：整体滚动兜底，绝不溢出
-                  if (constraints.maxHeight < 460 * f) {
-                    return SingleChildScrollView(
+                  return SingleChildScrollView(
+                    child: ConstrainedBox(
+                      constraints: BoxConstraints(minHeight: avail),
                       child: Padding(
                         padding: hPad,
                         child: Column(
@@ -693,39 +726,28 @@ class _WordBankPageState extends State<WordBankPage> {
                           children: [
                             searchField,
                             SizedBox(height: EswSpace.sm * f),
-                            actionRow(f),
-                            SizedBox(height: EswSpace.sm * f),
-                            SizedBox(height: 240 * f, child: statGrid(f)),
-                            SizedBox(height: EswSpace.sm * f),
-                            exportPrimary(f),
-                            SizedBox(height: EswSpace.sm * f),
-                            settingsCard(f),
-                            SizedBox(height: EswSpace.xs * f),
-                            versionFooter(f),
+                            if (searching)
+                              EswSectionHeader(
+                                title: '搜索结果 (${filtered.length})',
+                              ),
+                            if (searching) SizedBox(height: EswSpace.sm * f),
+                            SizedBox(
+                              height: searching ? searchH : null,
+                              child: searching ? searchResults(f) : statGrid(f),
+                            ),
+                            if (!searching) ...[
+                              SizedBox(height: EswSpace.sm * f),
+                              actionRow(f),
+                              SizedBox(height: EswSpace.sm * f),
+                              exportPrimary(f),
+                              SizedBox(height: EswSpace.sm * f),
+                              settingsCard(f),
+                              SizedBox(height: EswSpace.xs * f),
+                              versionFooter(f),
+                            ],
                           ],
                         ),
                       ),
-                    );
-                  }
-
-                  // 常规屏幕：固定 Column + 中段网格自适应填满，单屏不滚动
-                  return Padding(
-                    padding: hPad,
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        searchField,
-                        SizedBox(height: EswSpace.sm * f),
-                        actionRow(f),
-                        SizedBox(height: EswSpace.sm * f),
-                        Expanded(child: statGrid(f)),
-                        SizedBox(height: EswSpace.sm * f),
-                        exportPrimary(f),
-                        SizedBox(height: EswSpace.sm * f),
-                        settingsCard(f),
-                        SizedBox(height: EswSpace.xs * f),
-                        versionFooter(f),
-                      ],
                     ),
                   );
                 },
@@ -747,7 +769,7 @@ class WordListPage extends StatefulWidget {
   final VocabService vocab;
   final VoidCallback onSaveConfig;
   final Future<void> Function(String word, VoidCallback onAdded)
-      showBaseWordDialog;
+  showBaseWordDialog;
   final ValueChanged<String>? onWordTap;
   final WordSyncService wordSyncService;
 
@@ -834,7 +856,9 @@ class _WordListPageState extends State<WordListPage> {
     widget.vocab.extendWords.removeWhere((e) => e.toLowerCase() == lower);
     widget.vocab.extendBaseMap.remove(word);
     widget.vocab.extendReverseIndex.remove(lower);
-    widget.vocab.manualChaoGangWords.removeWhere((e) => e.toLowerCase() == lower);
+    widget.vocab.manualChaoGangWords.removeWhere(
+      (e) => e.toLowerCase() == lower,
+    );
     widget.vocab.manualExtraWords.removeWhere((e) => e.toLowerCase() == lower);
   }
 
@@ -844,7 +868,8 @@ class _WordListPageState extends State<WordListPage> {
     final words = _selected.toList();
     if (words.isEmpty) return false;
     if (words.length > 10) {
-      final total = widget.vocab.extendWords.length +
+      final total =
+          widget.vocab.extendWords.length +
           widget.vocab.manualChaoGangWords.length +
           widget.vocab.manualExtraWords.length;
       final backedUp = words.length > 50
@@ -881,32 +906,18 @@ class _WordListPageState extends State<WordListPage> {
     bool backedUp,
   ) async {
     final backupMsg = delCount > 50
-        ? (backedUp
-            ? '已自动在云端备份全部词库。'
-            : '警告：云端备份失败，请确认网络正常后再操作！')
+        ? (backedUp ? '已自动在云端备份全部词库。' : '警告：云端备份失败，请确认网络正常后再操作！')
         : '';
-    final res = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        title: const Text('删除确认'),
-        content: Text(
+    return showEswConfirm(
+      context,
+      title: '删除确认',
+      message:
           '本次操作将删除 $delCount 个单词（词库当前共 $total 个）。\n\n$backupMsg\n\n确认要继续执行该删除操作吗？',
-          textAlign: TextAlign.left,
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('确认删除'),
-          ),
-        ],
-      ),
+      icon: Icons.delete_outline_rounded,
+      danger: true,
+      okLabel: '确认删除',
+      dismissible: false,
     );
-    return res ?? false;
   }
 
   void _toggleWord(String w, bool? v) {
@@ -976,7 +987,8 @@ class _WordListPageState extends State<WordListPage> {
                         ),
                       ),
                       Checkbox(
-                        value: _words.isNotEmpty &&
+                        value:
+                            _words.isNotEmpty &&
                             _selected.length == _words.length,
                         activeColor: color,
                         onChanged: _toggleAll,
@@ -1013,8 +1025,7 @@ class _WordListPageState extends State<WordListPage> {
                 : ListView.separated(
                     padding: const EdgeInsets.all(EswSpace.md),
                     itemCount: _words.length,
-                    separatorBuilder: (_, __) =>
-                        const Divider(height: 1),
+                    separatorBuilder: (_, __) => const Divider(height: 1),
                     itemBuilder: (_, i) {
                       final w = _words[i];
                       return ListTile(
@@ -1026,8 +1037,7 @@ class _WordListPageState extends State<WordListPage> {
                               )
                             : CircleAvatar(
                                 radius: 16,
-                                backgroundColor:
-                                    color.withValues(alpha: 0.15),
+                                backgroundColor: color.withValues(alpha: 0.15),
                                 child: Text(
                                   '${i + 1}',
                                   style: EswText.bodySmall.copyWith(
@@ -1067,9 +1077,7 @@ class _WordListPageState extends State<WordListPage> {
               child: Container(
                 decoration: BoxDecoration(
                   color: EswColors.card,
-                  border: Border(
-                    top: BorderSide(color: EswColors.border),
-                  ),
+                  border: Border(top: BorderSide(color: EswColors.border)),
                 ),
                 padding: const EdgeInsets.symmetric(
                   horizontal: EswSpace.md,
@@ -1083,10 +1091,7 @@ class _WordListPageState extends State<WordListPage> {
                           onPressed: () => _applyBatchReclassify(t),
                           child: FittedBox(
                             fit: BoxFit.scaleDown,
-                            child: Text(
-                              '转为$t',
-                              style: EswText.bodySmall,
-                            ),
+                            child: Text('转为$t', style: EswText.bodySmall),
                           ),
                         ),
                       ),
@@ -1099,10 +1104,7 @@ class _WordListPageState extends State<WordListPage> {
                         },
                         child: const FittedBox(
                           fit: BoxFit.scaleDown,
-                          child: Text(
-                            '删除所选单词',
-                            style: EswText.bodySmall,
-                          ),
+                          child: Text('删除所选单词', style: EswText.bodySmall),
                         ),
                       ),
                     ),
@@ -1112,10 +1114,7 @@ class _WordListPageState extends State<WordListPage> {
                         onPressed: _doCancelSelect,
                         child: const FittedBox(
                           fit: BoxFit.scaleDown,
-                          child: Text(
-                            '取消选择',
-                            style: EswText.bodySmall,
-                          ),
+                          child: Text('取消选择', style: EswText.bodySmall),
                         ),
                       ),
                     ),
@@ -1159,12 +1158,14 @@ class HelpPage extends StatelessWidget {
       _HelpItem(
         icon: Icons.analytics_outlined,
         title: '文本检测',
-        content: '在「检测页」粘贴文本或导入 TXT/DOCX/PDF 文件，点击「开始分析」即可比对词库，输出课标词/拓展词/超标词/专有词四类词的覆盖统计与占比。',
+        content:
+            '在「检测页」粘贴文本或导入 TXT/DOCX/PDF 文件，点击「开始分析」即可比对词库，输出课标词/拓展词/超标词/专有词四类词的覆盖统计与占比。',
       ),
       _HelpItem(
         icon: Icons.library_books_outlined,
         title: '真题/教材导入',
-        content: '在「检测页」点击「导入真题」「导入教材」选择 TXT 文件，语料将存入应用文档目录，用于真题查词例句展示、高频词统计与按年份命中统计。',
+        content:
+            '在「检测页」点击「导入真题」「导入教材」选择 TXT 文件，语料将存入应用文档目录，用于真题查词例句展示、高频词统计与按年份命中统计。',
       ),
       _HelpItem(
         icon: Icons.sync_rounded,
@@ -1184,7 +1185,8 @@ class HelpPage extends StatelessWidget {
       _HelpItem(
         icon: Icons.insert_chart_outlined_rounded,
         title: '导出高频',
-        content: '在词库页点击「导出高频」，按真题语料统计词频并导出为 Word(docx) 或 Excel(xlsx) 文件，词频统计口径与桌面版完全一致。',
+        content:
+            '在词库页点击「导出高频」，按真题语料统计词频并导出为 Word(docx) 或 Excel(xlsx) 文件，词频统计口径与桌面版完全一致。',
       ),
     ];
     return Scaffold(

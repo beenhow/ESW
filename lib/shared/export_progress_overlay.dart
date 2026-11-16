@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../theme/esw_tokens.dart';
+import '../theme/responsive.dart';
 
 /// 安卓端导出等待提示（浮动进度层）：延迟浮现 + 阶段文案 + 实时已用时。
 ///
@@ -60,10 +61,7 @@ class ExportProgressOverlay {
   }
 
   void _start(Duration delay) {
-    _ticker = Timer.periodic(
-      const Duration(milliseconds: 500),
-      (_) => _tick(),
-    );
+    _ticker = Timer.periodic(const Duration(milliseconds: 500), (_) => _tick());
     if (delay <= Duration.zero) {
       _show();
       return;
@@ -150,6 +148,9 @@ class _ExportProgressLayer extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final hintText = hint;
+    // 浮层挂在 root Overlay 上，拿不到页面的 EswResponsive.wrap，
+    // 因此这里的尺寸与字号必须自己乘缩放因子，否则在大小屏上会和页面脱节。
+    final f = EswResponsive.factorOf(context);
     return Stack(
       children: [
         // 遮罩：吸收全部点击与滑动，导出期间界面不可操作、提示无法被点掉
@@ -162,62 +163,65 @@ class _ExportProgressLayer extends StatelessWidget {
         ),
         Center(
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: EswSpace.xxxl),
+            padding: EdgeInsets.symmetric(horizontal: EswSpace.xxxl * f),
             child: Material(
               color: Colors.transparent,
               child: Container(
-                constraints: const BoxConstraints(maxWidth: 320),
-                padding: const EdgeInsets.symmetric(
-                  horizontal: EswSpace.xxl,
-                  vertical: EswSpace.xl,
+                constraints: BoxConstraints(maxWidth: 320 * f),
+                padding: EdgeInsets.symmetric(
+                  horizontal: EswSpace.xxl * f,
+                  vertical: EswSpace.xl * f,
                 ),
                 decoration: BoxDecoration(
                   color: EswColors.card,
-                  borderRadius: BorderRadius.circular(EswRadius.card),
+                  borderRadius: BorderRadius.circular(EswRadius.card * f),
                   boxShadow: EswShadow.card,
                 ),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const SizedBox(
-                      width: 32,
-                      height: 32,
-                      child: CircularProgressIndicator(
+                    SizedBox(
+                      width: 32 * f,
+                      height: 32 * f,
+                      child: const CircularProgressIndicator(
                         strokeWidth: 3,
                         color: EswColors.primary,
                         backgroundColor: EswColors.primarySoft,
                       ),
                     ),
-                    const SizedBox(height: EswSpace.lg),
+                    SizedBox(height: EswSpace.lg * f),
                     ValueListenableBuilder<String>(
                       valueListenable: stage,
                       builder: (_, text, __) => Text(
                         text,
                         textAlign: TextAlign.center,
                         style: EswText.bodyMedium.copyWith(
+                          fontSize: 13 * f,
                           color: EswColors.textPrimary,
                           fontWeight: FontWeight.w600,
                         ),
                       ),
                     ),
-                    const SizedBox(height: EswSpace.sm),
+                    SizedBox(height: EswSpace.sm * f),
                     ValueListenableBuilder<int>(
                       valueListenable: elapsedSeconds,
                       builder: (_, sec, __) => Text(
                         '已用时 $sec 秒',
                         textAlign: TextAlign.center,
                         style: EswText.bodySmall.copyWith(
+                          fontSize: 12 * f,
                           color: EswColors.primary,
                           fontWeight: FontWeight.w600,
                         ),
                       ),
                     ),
                     if (hintText != null) ...[
-                      const SizedBox(height: EswSpace.xs),
+                      SizedBox(height: EswSpace.xs * f),
                       Text(
                         hintText,
                         textAlign: TextAlign.center,
                         style: EswText.bodySmall.copyWith(
+                          fontSize: 12 * f,
                           color: EswColors.textSecondary,
                         ),
                       ),

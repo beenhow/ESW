@@ -56,6 +56,17 @@ $tesseractJunk = @(
 )
 $excludePatterns += $tesseractJunk
 
+# Windows 包不需要、且会显著增大体积的内容（本机运行残留 / Android 专用资源）：
+#   corpus/                          —— 应用首次运行时从 assets/gaokao 解出的内置真题副本，
+#                                       与包内 assets/gaokao 完全重复，属本机运行残留，不进包
+#   data/flutter_assets/assets/fonts —— NotoSansSC 两套中文字体共约 20MB，仅 Android 端 PDF
+#                                       导出使用；Windows 导出走系统字体（simhei/times），不加载它们
+$windowsJunk = @(
+    'corpus', './corpus',
+    'data/flutter_assets/assets/fonts', './data/flutter_assets/assets/fonts'
+)
+$excludePatterns += $windowsJunk
+
 $requiredFiles = @(
     # VC 运行库三件套（缺一即 0xc0000135 / 0xc000007b 无法启动）
     'vcruntime140.dll',
@@ -87,7 +98,9 @@ $requiredPaths = @(
 )
 
 # ---------- 3. 打 zip（直接从构建产物目录，带 --exclude，无需中转目录） ----------
-$exe = Get-ChildItem $buildDir -Filter '*.exe' | Where-Object { $_.DirectoryName -eq $buildDir } | Select-Object -First 1
+# 取最新生成的 exe：改版本号后构建目录里可能残留旧产物，
+# 不能按名字排序取第一个，否则会把旧 exe 打进包。
+$exe = Get-ChildItem $buildDir -Filter '*.exe' | Where-Object { $_.DirectoryName -eq $buildDir } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $exe) { throw "No exe found in $buildDir (root level)" }
 $exeName = $exe.Name
 $zipName = "$([IO.Path]::GetFileNameWithoutExtension($exeName))-Windows.zip"

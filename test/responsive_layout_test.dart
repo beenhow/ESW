@@ -2,7 +2,7 @@
 //
 // 目的：在多种窗口尺寸下渲染真实主界面（WinEswApp → MainWindow），断言
 //   1) 不产生任何 RenderFlex overflow / 渲染异常（缩小窗口不得显示不全）；
-//   2) 9 个 region 全部存在、尺寸为正、且完全落在窗口可视区内（不被裁掉）；
+//   2) 8 个 region 全部存在、尺寸为正、且完全落在窗口可视区内（不被裁掉）；
 //   3) 缩放系数 GlassTheme.uiScale 与窗口尺寸的换算关系正确（基准 1200×680、
 //      下限 0.75、超过基准不放大）。
 // 生产可达尺寸区间为 900×600 ~ 任意大（window_manager 最小窗口尺寸 900×600），
@@ -19,7 +19,6 @@ const List<String> kRegionKeys = [
   'region-side',
   'region-content',
   'region-srow',
-  'region-stats',
   'region-filters',
   'region-freq',
   'region-table',
@@ -94,7 +93,7 @@ void main() {
     Size(1000, 620),
     Size(900, 600),
   ]) {
-    testWidgets('自适应守卫 ${size.width.toInt()}×${size.height.toInt()}：无溢出且 9 区域完整可见',
+    testWidgets('自适应守卫 ${size.width.toInt()}×${size.height.toInt()}：无溢出且 8 区域完整可见',
         (tester) async {
       addTearDown(tester.view.reset);
       final errors = await pumpAppAt(tester, size);

@@ -1,21 +1,21 @@
 // 结构守卫测试（《ESW玻璃效果UI设计规范.md》§3.3 原样 + 区域顺序/尺寸断言）
 //
-// 以 esw-ui-flutter骨架.dart 为结构模板：9 个 region key 必须全部存在，
+// 以 esw-ui-flutter骨架.dart 为结构模板：8 个 region key 必须全部存在，
 // 顺序与尺寸严格一致。跑不过 = 结构没搭对，禁止进入样式阶段。
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:esw/theme/glass_theme.dart';
 import 'package:esw/windows_app.dart';
+import 'package:esw/windows/year_filter_bar.dart';
 
-/// 骨架 9 区域（顺序即骨架中的自上而下 / 自左而右顺序）
+/// 骨架 8 区域（顺序即骨架中的自上而下 / 自左而右顺序）
 const List<String> kRegionKeys = [
   'region-titlebar',
   'region-toolbar',
   'region-side',
   'region-content',
   'region-srow',
-  'region-stats',
   'region-filters',
   'region-freq',
   'region-table',
@@ -51,7 +51,7 @@ double _left(WidgetTester tester, String key) =>
 
 void main() {
   // ── §3.3 原样断言 ──
-  testWidgets('布局结构守卫：9 个区域必须全部存在且可定位', (tester) async {
+  testWidgets('布局结构守卫：8 个区域必须全部存在且可定位', (tester) async {
     await pumpRealApp(tester);
     for (final k in kRegionKeys) {
       expect(find.byKey(ValueKey(k)), findsOneWidget, reason: '缺少区域 $k');
@@ -59,7 +59,7 @@ void main() {
   });
 
   // ── 尺寸守卫：region-titlebar 42 / toolbar 44 / side 248 / srow 40 /
-  //              stats 72 / filters 30 / freq 146 / table flex ──
+  //              filters 自适应 / freq 146 / table flex ──
   testWidgets('尺寸守卫：各区域高度/宽度与骨架一致', (tester) async {
     await pumpRealApp(tester);
 
@@ -70,18 +70,18 @@ void main() {
     expect(_w(tester, 'region-side'), 248.0, reason: '左栏必须宽 248');
     expect(_h(tester, 'region-srow'), GlassTheme.hSearchRow, // 40
         reason: '搜索行必须 h40');
-    expect(_h(tester, 'region-stats'), GlassTheme.hStatCard, // 72
-        reason: '统计卡必须 h72');
-    expect(_h(tester, 'region-filters'), GlassTheme.hFilterRow, // 30
-        reason: '筛选行必须 h30');
+    // 筛选行改为内容自适应高度：单行时保持设计高度，换行时随内容增高
+    expect(_h(tester, 'region-filters'),
+        greaterThanOrEqualTo(GlassTheme.hFilterRow),
+        reason: '筛选行不得低于 h30，且可随 chips 换行自适应增高');
     expect(_h(tester, 'region-freq'), GlassTheme.hWordPanel, // 146
-        reason: '词频面板必须 h146（规范 §4.7 偏差 10）');
+        reason: '词频面板在基准窗口下保持 h146（规范 §4.7 偏差 10）');
     expect(_h(tester, 'region-table'), greaterThan(0),
         reason: '结果表必须是唯一 flex:1 区域');
   });
 
-  // ── 顺序守卫：窗口第1行=标题栏，第2行=工具栏；右栏 5 块自上而下 ──
-  testWidgets('顺序守卫：9 区域层级与从属关系正确', (tester) async {
+  // ── 顺序守卫：窗口第1行=标题栏，第2行=工具栏；右栏 4 块自上而下 ──
+  testWidgets('顺序守卫：8 区域层级与从属关系正确', (tester) async {
     await pumpRealApp(tester);
 
     // 标题栏在工具栏上方，两者都在左栏/内容区上方
@@ -92,10 +92,9 @@ void main() {
     // 左栏在内容区左侧
     expect(_left(tester, 'region-side'), lessThan(_left(tester, 'region-content')));
 
-    // 内容区 5 块自上而下：srow → stats → filters → freq → table
+    // 内容区 4 块自上而下：srow → filters → freq → table
     final order = [
       'region-srow',
-      'region-stats',
       'region-filters',
       'region-freq',
       'region-table',
@@ -125,13 +124,13 @@ void main() {
       );
     }
 
-    // 右栏 5 块必须真正位于右栏（左边界在左栏右侧）
+    // 右栏 4 块必须真正位于右栏（左边界在左栏右侧）
     expect(_left(tester, 'region-srow'),
         greaterThan(_left(tester, 'region-side') + 248 - 1));
   });
 
-  // ── 左栏守卫（偏差 12）：两张导入卡必须撑满栏高，底部不留白 ──
-  testWidgets('左栏守卫：导入卡撑满栏高（无底部留白）', (tester) async {
+  // ── 左栏守卫（偏差 12）：单栏形态，一张导入卡撑满栏高，底部不留白 ──
+  testWidgets('左栏守卫：单栏导入卡撑满栏高（无底部留白）', (tester) async {
     await pumpRealApp(tester);
 
     final side = tester.getRect(find.byKey(const ValueKey('region-side')));
@@ -139,13 +138,61 @@ void main() {
       of: find.byKey(const ValueKey('region-side')),
       matching: find.byType(GlassPanel),
     );
-    expect(cards, findsNWidgets(2), reason: '左栏应为真题导入卡 + 教材导入卡两张玻璃卡');
+    expect(cards, findsOneWidget,
+        reason: '左栏为单栏形态：真题 / 教材互斥，只渲染一张玻璃卡');
 
-    final r1 = tester.getRect(cards.at(0));
-    final r2 = tester.getRect(cards.at(1));
-    expect(r1.top - side.top, lessThanOrEqualTo(20),
-        reason: '第一张卡必须贴近栏顶，不得留白');
-    expect(side.bottom - r2.bottom, lessThanOrEqualTo(20),
-        reason: '第二张卡必须撑到栏底，不得底部留白');
+    final r = tester.getRect(cards);
+    expect(r.top - side.top, lessThanOrEqualTo(20),
+        reason: '导入卡必须贴近栏顶，不得留白');
+    expect(side.bottom - r.bottom, lessThanOrEqualTo(20),
+        reason: '导入卡必须撑到栏底，不得底部留白');
+  });
+
+  // ── 拆分守卫：词频面板必须是独立组件 YearFilterBar（不允许退回内联巨型方法） ──
+  testWidgets('拆分守卫：region-freq 由 YearFilterBar 渲染', (tester) async {
+    await pumpRealApp(tester);
+
+    expect(
+      find.ancestor(
+        of: find.byKey(const ValueKey('region-freq')),
+        matching: find.byType(YearFilterBar),
+      ),
+      findsOneWidget,
+      reason: '词频年份/教材分布必须由 lib/windows/year_filter_bar.dart 渲染',
+    );
+    // 面板高度语义不变，且只允许一层玻璃面板
+    expect(_h(tester, 'region-freq'), GlassTheme.hWordPanel);
+    expect(
+      find.descendant(
+        of: find.byKey(const ValueKey('region-freq')),
+        matching: find.byType(GlassPanel),
+      ),
+      findsOneWidget,
+      reason: '词频面板内只应有一层 GlassPanel',
+    );
+  });
+
+  // ── 工具栏守卫：七个操作项必须是常驻文字按钮（不做图标化收纳） ──
+  testWidgets('工具栏守卫：七个操作项以文字按钮常驻显示', (tester) async {
+    await pumpRealApp(tester);
+
+    for (final label in [
+      '使用说明',
+      '同步词库',
+      '导出高频',
+      '拓展词库',
+      '超标词库',
+      '专有词库',
+      '检查更新',
+    ]) {
+      expect(
+        find.descendant(
+          of: find.byKey(const ValueKey('region-toolbar')),
+          matching: find.text(label),
+        ),
+        findsOneWidget,
+        reason: '工具栏「$label」必须以文字按钮常驻显示',
+      );
+    }
   });
 }

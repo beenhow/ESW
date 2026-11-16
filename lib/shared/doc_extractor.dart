@@ -2,6 +2,52 @@ import 'dart:convert';
 import 'dart:typed_data';
 import 'package:fast_gbk/fast_gbk.dart' as gbk_pkg;
 
+import 'text_normalize.dart';
+
+/// 纯文本字节解码（Windows / Android 共用）：
+/// 优先处理 UTF-16 BOM，其次 UTF-8（去 BOM、严格校验），失败回退 GBK。
+///
+/// 旧实现只试 UTF-8/GBK，Windows「另存为 Unicode 文本」的 UTF-16 txt 会被
+/// 当成 GBK 解出乱码，表现就是整篇单词缺失或只剩零散字母。
+String decodeTextBytes(List<int> bytes) {
+  if (bytes.isEmpty) return '';
+  if (bytes.length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) {
+    return _decodeUtf16Bytes(bytes, 2, littleEndian: true);
+  }
+  if (bytes.length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) {
+    return _decodeUtf16Bytes(bytes, 2, littleEndian: false);
+  }
+  var start = 0;
+  if (bytes.length >= 3 &&
+      bytes[0] == 0xEF &&
+      bytes[1] == 0xBB &&
+      bytes[2] == 0xBF) {
+    start = 3;
+  }
+  final body = start == 0 ? bytes : bytes.sublist(start);
+  try {
+    final s = utf8.decode(body);
+    if (!s.contains('\uFFFD')) return s;
+  } catch (_) {}
+  return gbk_pkg.gbk.decode(body);
+}
+
+String _decodeUtf16Bytes(
+  List<int> bytes,
+  int start, {
+  required bool littleEndian,
+}) {
+  final buf = StringBuffer();
+  for (var i = start; i + 1 < bytes.length; i += 2) {
+    final c = littleEndian
+        ? (bytes[i] | (bytes[i + 1] << 8))
+        : ((bytes[i] << 8) | bytes[i + 1]);
+    if (c == 0) continue; // 去掉 UTF-16 文本中的 NUL 填充
+    buf.writeCharCode(c);
+  }
+  return buf.toString();
+}
+
 /// 从 Word 97-2003 二进制格式（.doc，OLE2 复合文档）中提取正文纯文本。
 ///
 /// 提取策略（按优先级）：
@@ -15,6 +61,15 @@ import 'package:fast_gbk/fast_gbk.dart' as gbk_pkg;
 /// 若不做归一化，按 \n 切行的下游渲染（如检测页原文查看器按行渲染）
 /// 会把整段内容粘成超长行，导致长按修改单词时 Text.rich 布局卡顿。
 String extractDocText(List<int> bytes) {
+  // .docx 实为 zip 包：统一走 text_normalize 的 docx 提取 + 规范化，
+  // 与运行时解析保持同一实现（避免制表符/软换行在两处行为不同）。
+  if (bytes.length > 4 &&
+      bytes[0] == 0x50 &&
+      bytes[1] == 0x4B &&
+      bytes[2] == 0x03 &&
+      bytes[3] == 0x04) {
+    return extractDocxText(bytes).replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+  }
   final t = _extractDocTextInner(bytes);
   return t.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
 }

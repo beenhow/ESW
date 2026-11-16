@@ -122,6 +122,7 @@ class _EswSearchFieldState extends State<EswSearchField> {
   }
 
   void _onFocusChanged() {
+    debugPrint('[PROBE] focus changed -> ${widget.focusNode.hasFocus}');
     if (mounted) setState(() {});
   }
 
@@ -129,70 +130,79 @@ class _EswSearchFieldState extends State<EswSearchField> {
   Widget build(BuildContext context) {
     final focused = widget.focusNode.hasFocus;
     final f = EswResponsive.factorOf(context);
-    return AnimatedContainer(
-      duration: const Duration(milliseconds: 160),
-      curve: Curves.easeOut,
-      height: widget.height * f,
-      decoration: BoxDecoration(
-        color: EswColors.card,
-        borderRadius: BorderRadius.circular(EswRadius.control),
-        border: Border.all(
-          color: focused ? EswColors.primary : EswColors.border,
-          width: 1.5,
-        ),
-        boxShadow: focused ? EswShadow.glow : EswShadow.card,
-      ),
-      child: TextField(
-        controller: widget.controller,
-        focusNode: widget.focusNode,
-        style: EswText.body.copyWith(color: EswColors.textPrimary),
-        textInputAction: TextInputAction.search,
-        decoration: InputDecoration(
-          hintText: widget.hintText,
-          hintStyle: EswText.body.copyWith(color: EswColors.textSecondary),
-          prefixIcon: Icon(
-            Icons.search_rounded,
-            size: 22,
-            color: focused ? EswColors.primary : EswColors.textSecondary,
+    return GestureDetector(
+      // 整框可点：点在外框内边距 / 图标上也能直接唤起键盘
+      behavior: HitTestBehavior.opaque,
+      onTap: () {
+        debugPrint('[PROBE] field card tapped');
+        if (!widget.focusNode.hasFocus) widget.focusNode.requestFocus();
+      },
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 160),
+        curve: Curves.easeOut,
+        height: widget.height * f,
+        decoration: BoxDecoration(
+          color: EswColors.card,
+          borderRadius: BorderRadius.circular(EswRadius.control),
+          border: Border.all(
+            color: focused ? EswColors.primary : EswColors.border,
+            width: 1.5,
           ),
-          suffixIcon: ValueListenableBuilder<TextEditingValue>(
-            valueListenable: widget.controller,
-            builder: (context, value, _) => value.text.isEmpty
-                ? const SizedBox.shrink()
-                : IconButton(
-                    icon: Icon(
-                      Icons.cancel_rounded,
-                      size: 20,
-                      color: EswColors.textSecondary,
+          boxShadow: focused ? EswShadow.glow : EswShadow.card,
+        ),
+        child: TextField(
+          controller: widget.controller,
+          focusNode: widget.focusNode,
+          style: EswText.body.copyWith(color: EswColors.textPrimary),
+          textInputAction: TextInputAction.search,
+          decoration: InputDecoration(
+            hintText: widget.hintText,
+            hintStyle: EswText.body.copyWith(color: EswColors.textSecondary),
+            prefixIcon: Icon(
+              Icons.search_rounded,
+              size: 22,
+              color: focused ? EswColors.primary : EswColors.textSecondary,
+            ),
+            suffixIcon: ValueListenableBuilder<TextEditingValue>(
+              valueListenable: widget.controller,
+              builder: (context, value, _) => value.text.isEmpty
+                  ? const SizedBox.shrink()
+                  : IconButton(
+                      icon: Icon(
+                        Icons.cancel_rounded,
+                        size: 20,
+                        color: EswColors.textSecondary,
+                      ),
+                      onPressed: () {
+                        widget.controller.clear();
+                        widget.onChanged('');
+                      },
                     ),
-                    onPressed: () {
-                      widget.controller.clear();
-                      widget.onChanged('');
-                    },
-                  ),
+            ),
+            filled: true,
+            fillColor: EswColors.card,
+            isDense: true,
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: EswSpace.lg,
+              vertical: EswSpace.md,
+            ),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(EswRadius.control),
+              borderSide: BorderSide.none,
+            ),
+            enabledBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(EswRadius.control),
+              borderSide: BorderSide.none,
+            ),
+            focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(EswRadius.control),
+              borderSide: BorderSide.none,
+            ),
           ),
-          filled: true,
-          fillColor: EswColors.card,
-          isDense: true,
-          contentPadding: const EdgeInsets.symmetric(
-            horizontal: EswSpace.lg,
-            vertical: EswSpace.md,
-          ),
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(EswRadius.control),
-            borderSide: BorderSide.none,
-          ),
-          enabledBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(EswRadius.control),
-            borderSide: BorderSide.none,
-          ),
-          focusedBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(EswRadius.control),
-            borderSide: BorderSide.none,
-          ),
+          onTap: () => debugPrint('[PROBE] TextField tapped'),
+          onChanged: widget.onChanged,
+          onSubmitted: widget.onSubmitted,
         ),
-        onChanged: widget.onChanged,
-        onSubmitted: widget.onSubmitted,
       ),
     );
   }
@@ -232,7 +242,9 @@ class EswSectionHeader extends StatelessWidget {
               ),
               child: Text(
                 actionLabel!,
-                style: EswText.bodySmall.copyWith(color: EswColors.textSecondary),
+                style: EswText.bodySmall.copyWith(
+                  color: EswColors.textSecondary,
+                ),
               ),
             ),
           ),
@@ -283,11 +295,7 @@ class EswLetterChip extends StatelessWidget {
   final String letter;
   final Color color;
 
-  const EswLetterChip({
-    super.key,
-    required this.letter,
-    required this.color,
-  });
+  const EswLetterChip({super.key, required this.letter, required this.color});
 
   @override
   Widget build(BuildContext context) {
@@ -301,10 +309,7 @@ class EswLetterChip extends StatelessWidget {
         color: color.withValues(alpha: 0.16),
         shape: BoxShape.circle,
       ),
-      child: Text(
-        first,
-        style: EswText.titleSmall.copyWith(color: color),
-      ),
+      child: Text(first, style: EswText.titleSmall.copyWith(color: color)),
     );
   }
 }
@@ -337,7 +342,8 @@ class EswListTile extends StatelessWidget {
       onTap: onTap,
       borderRadius: BorderRadius.circular(EswRadius.card),
       child: Padding(
-        padding: padding ??
+        padding:
+            padding ??
             EdgeInsets.symmetric(
               horizontal: EswSpace.lg * f,
               vertical: EswSpace.md * f,
@@ -352,7 +358,9 @@ class EswListTile extends StatelessWidget {
                 children: [
                   Text(
                     title,
-                    style: EswText.bodyMedium.copyWith(color: EswColors.textPrimary),
+                    style: EswText.bodyMedium.copyWith(
+                      color: EswColors.textPrimary,
+                    ),
                   ),
                   if (subtitle != null && subtitle!.isNotEmpty) ...[
                     const SizedBox(height: 2),
@@ -360,7 +368,9 @@ class EswListTile extends StatelessWidget {
                       subtitle!,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: EswText.bodySmall.copyWith(color: EswColors.textSecondary),
+                      style: EswText.bodySmall.copyWith(
+                        color: EswColors.textSecondary,
+                      ),
                     ),
                   ],
                 ],
@@ -643,10 +653,7 @@ class _DashedBorderPainter extends CustomPainter {
     for (final metric in metrics) {
       var distance = 0.0;
       while (distance < metric.length) {
-        canvas.drawPath(
-          metric.extractPath(distance, distance + dash),
-          paint,
-        );
+        canvas.drawPath(metric.extractPath(distance, distance + dash), paint);
         distance += dash + gap;
       }
     }
@@ -684,9 +691,7 @@ class EswPrimaryButton extends StatelessWidget {
       ),
       child: FilledButton.icon(
         onPressed: onPressed,
-        icon: icon == null
-            ? const SizedBox.shrink()
-            : Icon(icon, size: 20 * f),
+        icon: icon == null ? const SizedBox.shrink() : Icon(icon, size: 20 * f),
         label: Text(label),
         style: FilledButton.styleFrom(
           backgroundColor: EswColors.primary,
@@ -743,7 +748,11 @@ class EswSettingsTile extends StatelessWidget {
                 color: EswColors.primarySoft,
                 borderRadius: BorderRadius.circular(EswRadius.small),
               ),
-              child: Icon(icon, size: (dense ? 17 : 19) * f, color: EswColors.primary),
+              child: Icon(
+                icon,
+                size: (dense ? 17 : 19) * f,
+                color: EswColors.primary,
+              ),
             ),
             SizedBox(width: EswSpace.md * f),
             Expanded(
@@ -758,7 +767,9 @@ class EswSettingsTile extends StatelessWidget {
                     const SizedBox(height: 2),
                     Text(
                       subtitle!,
-                      style: EswText.bodySmall.copyWith(color: EswColors.textSecondary),
+                      style: EswText.bodySmall.copyWith(
+                        color: EswColors.textSecondary,
+                      ),
                     ),
                   ],
                 ],

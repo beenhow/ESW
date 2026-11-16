@@ -47,8 +47,8 @@ class GlassTheme {
 
   // ── 颜色令牌 ──
   static const Color bg = Color(0xFFFAFAFA); // 窗口基色（规范 #FAFAFA）
-  static const Color panel = Color(0x94FFFFFF); // 玻璃面板底色 rgba(255,255,255,0.58)
-  static const Color panelSolid = Color(0xB8FFFFFF); // 输入框等局部 rgba(255,255,255,0.72)
+  static const Color panel = Color(0xA8FFFFFF); // 玻璃面板底色 rgba(255,255,255,0.66)
+  static const Color panelSolid = Color(0xCCFFFFFF); // 输入框等局部 rgba(255,255,255,0.80)
   static const Color line = Color(0x1418181B); // 描边 rgba(24,24,27,0.08)（规范 §3.1）
   static const Color lineHi = Color(0xBFFFFFFF); // 顶部高光 rgba(255,255,255,0.75)
   static const Color ink = Color(0xFF18181B); // 主文字
@@ -68,11 +68,11 @@ class GlassTheme {
   );
 
   // ── 字号层级（全站仅 5 档） ──
-  static const double fMicro = 11; // 表头、徽标
-  static const double fSmall = 12; // 胶囊、辅助说明
-  static const double fBody = 12.5; // 列表项、按钮
-  static const double fInput = 13; // 输入框
-  static const double fNum = 24; // 统计大数字
+  static const double fMicro = 11.5; // 表头、徽标
+  static const double fSmall = 12.5; // 胶囊、辅助说明
+  static const double fBody = 13; // 列表项、按钮
+  static const double fInput = 13.5; // 输入框
+  static const double fNum = 26; // 统计大数字
 
   // ── 圆角 ──
   // 基准来源：主界面设计示意图逐板块量取（角区四角内缩法，示意图与应用 1:1 对应——
@@ -84,13 +84,13 @@ class GlassTheme {
   //       输入框与小徽标保持 r6。
   // V8 复查：用户反馈"整体圆角偏小"，在全站统一的基础上整体上调 2px，
   //   面板/大卡/按钮/中卡统一 r10，输入框与小徽标 r8（保持"更方一点"的层级差）。
-  static const double rSm = 8; // 小徽标/标签/搜索输入框
-  static const double rMd = 10; // 中卡/年份格/列表行/chip
-  static const double rLg = 10; // 按钮
+  static const double rSm = 10; // 小徽标/标签/搜索输入框
+  static const double rMd = 12; // 中卡/年份格/列表行/chip
+  static const double rLg = 12; // 按钮
   // 第三关 ②：面板圆角回到 12（规范 §1.2 玻璃配方 border-radius:12px、
   // esw-ui-flutter骨架.dart GlassPanel 默认 radius: 12）。按钮/年份格/列表行仍为 r10，
   // 保持“面板 > 控件”的圆角层级。
-  static const double rXl = 12; // 玻璃面板/大卡/统计卡
+  static const double rXl = 16; // 玻璃面板/大卡/统计卡
 
   // ── 间距刻度 ──
   // 统一指向文件顶部的 kGap 常量（规范 §4.9 唯一定义处），
@@ -403,7 +403,10 @@ class GlassPanel extends StatelessWidget {
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(radius),
         boxShadow: const [
-          BoxShadow(color: Color(0x0D18181B), blurRadius: 2, offset: Offset(0, 1)),
+          // 面板层次：比 1.5.x 更明显的一点外投影 + 贴边浅影，
+          // 让白卡从柔光背景上"浮"起来（不再是纯平涂）。
+          BoxShadow(color: Color(0x0F18181B), blurRadius: 14, offset: Offset(0, 2)),
+          BoxShadow(color: Color(0x0A18181B), blurRadius: 3, offset: Offset(0, 1)),
         ],
       ),
       child: ClipRRect(

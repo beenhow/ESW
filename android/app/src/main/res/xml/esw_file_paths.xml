@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider 可共享路径白名单：仅开放外部存储与 App 私有目录下导出的检测结果文档 -->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <external-path name="esw_external" path="." />
+    <external-files-path name="esw_ext_files" path="." />
+    <files-path name="esw_files" path="." />
+    <cache-path name="esw_cache" path="." />
+</paths>

@@ -55,11 +55,15 @@ da_out.txt
 *.repaired
 *.pre_glass*
 *.bak4
+*.hprof
 legacy_unused_dart/
 release/
 release_pkg/
 output/
 temp/
+
+# 其它工程 / 本地临时目录（非本项目源码，禁止入库）
+TCSV/
 
 # large local data / web build output
 scripts/*_state*.json

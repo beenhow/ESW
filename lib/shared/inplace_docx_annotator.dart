@@ -26,35 +26,57 @@ import 'dart:convert';
 import 'package:archive/archive.dart';
 import 'package:xml/xml.dart';
 
+import 'export_word_style.dart';
+
 const String _wordNs =
     'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
 
-/// 单个词的标注样式（仅字色 + 字重；Word 导出不使用底纹）。
+/// 单个词的标注样式。
+///
+/// 方案一只用 [color] + [bold]；方案二用 [fontName]（统一 TNR）+
+/// [bold] / [underline] / [shadeFill]（[color] 固定黑色，不依赖颜色）。
 class AnnotateStyle {
   final String color; // w:color 值（无 # 前缀）
   final bool bold;
-  const AnnotateStyle({required this.color, this.bold = false});
+  final String? fontName; // 非空时写入 w:rFonts（方案二）
+  final String? underline; // 方案二的 w:u 值（single）
+  final String? shadeFill; // 方案二的 w:shd 填充色
+  const AnnotateStyle({
+    required this.color,
+    this.bold = false,
+    this.fontName,
+    this.underline,
+    this.shadeFill,
+  });
 }
 
 /// 分类 -> 标注样式（双端统一）。
 ///
-/// 颜色与字重取自 shared/export_word_style.dart 的七类规范表；
-/// 刻意不含任何底纹/高亮字段：Word 导出结果不得出现 w:shd / w:highlight。
-Map<String, AnnotateStyle> defaultAnnotateStyles() => const {
-      // 初中课标词：黑色加粗
-      '初中课标词': AnnotateStyle(color: '000000', bold: true),
-      // 必修课标词：深蓝色加粗
-      '必修课标词': AnnotateStyle(color: '0B3D91', bold: true),
-      // 选修课标词：浅蓝色（不加粗）
-      '选修课标词': AnnotateStyle(color: '00B0F0'),
-      // 拓展词：深绿色加粗
-      '拓展词': AnnotateStyle(color: '006400', bold: true),
-      // 超标词：红色（不加粗）
-      '超标词': AnnotateStyle(color: 'FF0000'),
-      // 专有词：紫色（不加粗）
-      '专有词': AnnotateStyle(color: '800080'),
-      // 未筛选：土红色（不加粗）
-      '未筛选': AnnotateStyle(color: 'A0522D'),
+/// 直接取自 shared/export_word_style.dart 的六类规范表：
+/// 方案一只靠颜色区分，不加粗；未筛选 / 真题词不参与标注。
+/// 刻意不含任何底纹/高亮字段：方案一的 Word 导出不得出现 w:shd / w:highlight。
+Map<String, AnnotateStyle> defaultAnnotateStyles({bool colorBold = true}) => {
+      for (final e in kExportWordStyles.entries)
+        e.key: AnnotateStyle(
+          color: e.value.colorHex,
+          bold: e.value.bold && colorBold,
+        ),
+    };
+
+/// 方案二（简化映射）的分类 -> 标注样式表。
+///
+/// 与 [kExportScheme2Styles] 同源：全文统一 Times New Roman，
+/// 拓展词加粗、超标词单线下划线、专有词 30% 灰底纹、未筛选点线下划线；
+/// 课标词保持默认，真题词不参与（不在样式表内）。
+Map<String, AnnotateStyle> typographyAnnotateStyles() => {
+      for (final e in kExportScheme2Styles.entries)
+        e.key: AnnotateStyle(
+          color: '000000',
+          bold: e.value.bold,
+          fontName: kExportTypographyFont,
+          underline: e.value.underline,
+          shadeFill: e.value.shadeFill,
+        ),
     };
 
 /// OOXML CT_RPr 子元素规范顺序（用于把 b/color/highlight 插入正确位置，
@@ -77,11 +99,15 @@ final RegExp _rPrChildTagRe = RegExp(r'<w:([a-zA-Z]+)(?:[^>]*)?/>');
 /// 可为空；非空时插到 body 最前（如“ESW 课标词检测导出/文件名/统计/标注说明”汇总块）。
 /// [appendixParagraphsXml]：要追加到文末的段落 XML（Word 命名空间 w:），
 /// 可为空；非空时在正文末尾（sectPr 之前）追加一节，用于“拓展词明细/超标词”等。
+/// [scheme]：原文标注方案（方案一配色 / 方案二字体格式），默认方案一。
 List<int> annotateDocxBytes({
   required List<int> srcBytes,
   required Map<String, String> catByLower,
   List<String> preambleParagraphsXml = const [],
   List<String> appendixParagraphsXml = const [],
+  ExportAnnotateScheme scheme = ExportAnnotateScheme.color,
+  bool colorBold = true,
+  bool annotateUnfiltered = true,
 }) {
   final archive = ZipDecoder().decodeBytes(srcBytes);
   final docEntry = archive.findFile('word/document.xml');
@@ -91,7 +117,8 @@ List<int> annotateDocxBytes({
   // 直接引用条目解压字节，避免 Uint8List.fromList 额外复制一份（大文档时多副本推高峰值）。
   final document = XmlDocument.parse(
       utf8.decode(docEntry.content as List<int>, allowMalformed: true));
-  _annotateDocument(document, catByLower);
+  _annotateDocument(document, catByLower, scheme,
+      colorBold: colorBold, annotateUnfiltered: annotateUnfiltered);
   if (preambleParagraphsXml.isNotEmpty) {
     _insertPreamble(document, preambleParagraphsXml);
   }
@@ -120,9 +147,18 @@ List<int> annotateDocxBytes({
 }
 
 /// 遍历 document.xml 所有 `<w:t>`，把命中分类的单词拆分为独立 run 并追加标注属性。
-void _annotateDocument(XmlDocument document, Map<String, String> catByLower) {
+void _annotateDocument(
+  XmlDocument document,
+  Map<String, String> catByLower,
+  ExportAnnotateScheme scheme, {
+  bool colorBold = true,
+  bool annotateUnfiltered = true,
+}) {
   if (catByLower.isEmpty) return;
-  final styles = defaultAnnotateStyles();
+  final styles = scheme == ExportAnnotateScheme.typography
+      ? typographyAnnotateStyles()
+      : defaultAnnotateStyles(colorBold: colorBold);
+  if (!annotateUnfiltered) styles.remove(ExportCategory.unfiltered);
   // 收集需要替换的 w:r（引用原节点），统一从后往前替换，避免索引失效
   final replacements = <(XmlElement, String)>[];
   for (final t in document.findAllElements('w:t')) {
@@ -178,23 +214,28 @@ String _runXml(String text, String rPrXml, AnnotateStyle? style) {
   return '<w:r>$props<w:t xml:space="preserve">$escaped</w:t></w:r>';
 }
 
-/// 在原 rPr XML 基础上按规范顺序追加 b/color（仅字色 + 字重，不加底纹）。
+/// 在原 rPr XML 基础上按规范顺序追加标注属性。
 ///
+/// 方案一注入 b/color；方案二注入 rFonts/b/color/u/shd（统一 TNR，
+/// 按简化映射加粗 / 单线 / 点线 / 灰底纹），并移除原有的 b/i/u/shd
+/// （避免源文档格式干扰类型辨识）。
 /// 原 rPr 为空时直接构造最小 rPr。原 rPr 各子元素解析后与注入属性合并，
 /// 统一按 [_rPrOrder] 排序输出；解析失败或含非自闭合子元素（极罕见）时
 /// 退回“仅注入属性”的最小 rPr（宁可丢罕见格式，绝不生成嵌套 rPr——
 /// 嵌套 rPr 会使 Word/WPS 忽略内层 rFonts/sz，导致命中词字体丢失）。
-///
-/// 底纹口径（用户要求）：Word 导出结果不加底纹/高亮，因此这里既不注入
-/// `<w:shd>`，也不注入 `<w:highlight>`；命中 run 上原有的 highlight/shd
-/// 会被一并移除（见下方 removeWhere），确保导出的 Word 无底纹。
 String _rebuildRPr(String rPrXml, AnnotateStyle style) {
-  final props = <String>[
+  final pros = <String>[
+    if (style.fontName != null)
+      '<w:rFonts w:ascii="${style.fontName}" w:hAnsi="${style.fontName}" '
+          'w:cs="${style.fontName}"/>',
     if (style.bold) '<w:b/>',
     '<w:color w:val="${style.color}"/>',
+    if (style.underline != null) '<w:u w:val="${style.underline}"/>',
+    if (style.shadeFill != null)
+      '<w:shd w:val="clear" w:color="auto" w:fill="${style.shadeFill}"/>',
   ];
   if (rPrXml.isEmpty) {
-    return '<w:rPr>${props.join()}</w:rPr>';
+    return '<w:rPr>${pros.join()}</w:rPr>';
   }
   // 去掉外层 <w:rPr> 包裹，只看内部子元素
   final content = rPrXml
@@ -202,20 +243,32 @@ String _rebuildRPr(String rPrXml, AnnotateStyle style) {
       .replaceFirst(RegExp(r'</w:rPr>$'), '');
   if (content.contains('</')) {
     // 含非自闭合子元素：退回最小 rPr（仅注入属性），避免嵌套
-    return '<w:rPr>${props.join()}</w:rPr>';
+    return '<w:rPr>${pros.join()}</w:rPr>';
   }
   final children = <String>[];
   for (final m in _rPrChildTagRe.allMatches(content)) {
     children.add(m.group(0)!);
   }
-  // 移除已有 b/color/highlight/shd，避免重复
+  // 移除已有 b/color/highlight/shd，避免重复；
+  // 方案二命中词还需覆盖原字体、斜体与原下划线（否则源文档自带格式
+  // 会盖过标注语义）。
   children.removeWhere((x) {
     final m = _rPrChildTagRe.firstMatch(x);
     if (m == null) return false;
     final tag = m.group(1)!;
-    return tag == 'b' || tag == 'color' || tag == 'highlight' || tag == 'shd';
+    // 方案一（colorBold=false）只着色、不加粗：原文自带的加粗必须原样保留，
+    // 不能因为标注把用户文档里的加粗抹掉；需要由分类决定字重时才重建 b。
+    if (tag == 'b' || tag == 'bCs') {
+      return style.fontName != null || style.bold;
+    }
+    if (tag == 'color' || tag == 'highlight' || tag == 'shd') {
+      return true;
+    }
+    if (style.fontName != null && (tag == 'rFonts' || tag == 'u')) return true;
+    if (style.fontName != null && tag == 'i') return true;
+    return false;
   });
-  final all = <String>[...children, ...props];
+  final all = <String>[...children, ...pros];
   all.sort((a, b) {
     final na = _rPrChildTagRe.firstMatch(a)?.group(1) ?? '';
     final nb = _rPrChildTagRe.firstMatch(b)?.group(1) ?? '';

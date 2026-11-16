@@ -144,19 +144,21 @@ void main() {
   // ──────────────────────── ④ 真题词 / 未筛选列表按钮 ────────────────────────
   test('列表分支：未筛选列带筛选按钮，真题词列中的未归类词无按钮', () {
     final src = _read('lib/windows_app.dart');
+    // P5 起该行渲染拆到独立组件，源码守卫跟随组件文件
+    final row = _read('lib/windows/imported_word_row.dart');
 
     const unfilteredMark = '// ---- 未筛选：频次 + 筛选按钮';
-    const zhentiMark = '// ---- 真题词列中的未归类词：仅频次，无筛选按钮';
-    final ui = src.indexOf(unfilteredMark);
-    final zi = src.indexOf(zhentiMark);
+    const zhentiMark = '// ---- 真题词列中的未归类词：仅频次';
+    final ui = row.indexOf(unfilteredMark);
+    final zi = row.indexOf(zhentiMark);
     expect(ui, greaterThan(-1), reason: '缺少未筛选列表分支');
     expect(zi, greaterThan(ui), reason: '未筛选分支必须出现在真题词分支之前');
 
     // 未筛选列：四个词库都不收录的词（含语料出现过的）一律带筛选按钮，
     // 且不再用 isInCorpus 做二次拦截
-    final unfilteredBranch = src.substring(
+    final unfilteredBranch = row.substring(
       ui,
-      ui + 420 > src.length ? src.length : ui + 420,
+      ui + 420 > row.length ? row.length : ui + 420,
     );
     expect(
       unfilteredBranch.contains('isUnfilteredColumn'),
@@ -164,23 +166,23 @@ void main() {
       reason: '未筛选分支必须按筛选列判定，不再按 isInCorpus 拦截',
     );
     expect(
-      unfilteredBranch.contains('_buildClassifyButton'),
+      unfilteredBranch.contains('_classifyButton'),
       isTrue,
       reason: '未筛选列必须带筛选按钮',
     );
 
     // 真题词列中的未归类词：只显示频次，归类入口留在未筛选列
-    final zhentiBranch = src.substring(
+    final zhentiBranch = row.substring(
       zi,
-      zi + 300 > src.length ? src.length : zi + 300,
+      zi + 300 > row.length ? row.length : zi + 300,
     );
     expect(
-      zhentiBranch.contains('_buildFreqColumn'),
+      zhentiBranch.contains('_freqColumn'),
       isTrue,
       reason: '真题词列必须显示频次',
     );
     expect(
-      zhentiBranch.contains('_buildClassifyButton'),
+      zhentiBranch.contains('_classifyButton'),
       isFalse,
       reason: '真题词列不得出现筛选按钮',
     );
@@ -222,22 +224,11 @@ void main() {
     expect(counts[kFilterUnfiltered], 2);
   });
 
-  // ───────────────────── ③ 原文标注样式七类齐备（源码守卫） ─────────────────────
-  test('原文标注样式覆盖七类规范配色与字重', () {
-    final src = _read('lib/shared/inplace_docx_annotator.dart');
-    for (final cat in const [
-      '初中课标词',
-      '必修课标词',
-      '选修课标词',
-      '拓展词',
-      '超标词',
-      '专有词',
-      '未筛选',
-    ]) {
-      expect(src.contains('$cat\':'), isTrue, reason: '原文标注缺少分类：$cat');
-    }
+  // ───────────────── ③ 原文标注单点复用规范表（源码守卫） ─────────────────
+  test('原文标注单点复用规范表，方案一关闭加粗、未筛选不标注', () {
+    final style = _read('lib/shared/export_word_style.dart');
     // 规范配色（与导出汇总一致）：初中黑 / 必修深蓝 / 选修浅蓝 /
-    // 拓展深绿 / 超标红 / 专有紫 / 未筛选土红
+    // 拓展深绿 / 超标红 / 专有紫 / 未筛选土红（未筛选样式仅供 Android 与统计）
     for (final hex in const [
       '000000',
       '0B3D91',
@@ -247,35 +238,25 @@ void main() {
       '800080',
       'A0522D',
     ]) {
-      expect(src.contains(hex), isTrue, reason: '原文标注缺少规范配色 #$hex');
+      expect(style.contains(hex), isTrue, reason: '规范表缺少配色 #$hex');
     }
-    // 字重：课标词（初中/必修）与拓展词加粗；选修/超标/专有/未筛选不加粗（省略即 false）
-    final boldTrue = RegExp(r'bold:\s*true').allMatches(src).length;
-    expect(boldTrue, greaterThanOrEqualTo(3), reason: '初中/必修/拓展三类必须加粗');
-    for (final cat in const ['选修课标词', '超标词', '专有词', '未筛选']) {
-      expect(
-        RegExp("'$cat':\\s*AnnotateStyle\\(color: '[0-9A-F]{6}'\\)")
-            .hasMatch(src),
-        isTrue,
-        reason: '$cat 应只给字色、不加粗',
-      );
-    }
-    // 去底纹守卫：Word 导出通道不得再“写入”底纹/高亮（保留“清除源文档已有标记”的判定）
-    expect(src.contains("'w:shd'"), isFalse, reason: 'Word 导出不得再写入 w:shd');
+    // 原地标注不再维护第二份分类表，直接取共享规范表
+    final src = _read('lib/shared/inplace_docx_annotator.dart');
+    expect(src.contains('kExportWordStyles'), isTrue,
+        reason: '原地标注应复用共享规范表');
+    expect(src.contains("'初中课标词':"), isFalse,
+        reason: '不得在原地标注中重复维护分类表');
+    // Windows 方案一：关闭加粗（原文可能自带加粗，避免混淆）
+    final win = _read('lib/windows_app.dart');
     expect(
-      src.contains("'w:highlight'"),
-      isFalse,
-      reason: 'Word 导出不得再写入 w:highlight',
+      RegExp(r'colorBold:\s*false').allMatches(win).length,
+      greaterThanOrEqualTo(3),
+      reason: 'docx 重生成 / 原地标注 / PDF 均须关闭方案一加粗',
     );
-    expect(
-      RegExp("tag == 'highlight'").hasMatch(src),
-      isTrue,
-      reason: '仍需清除命中 run 上已有的 highlight 底纹',
-    );
-    expect(
-      RegExp("tag == 'shd'").hasMatch(src),
-      isTrue,
-      reason: '仍需清除命中 run 上已有的 shd 底纹',
-    );
+    // 方案二专有词 30% 灰底纹（唯一使用底纹的类别）
+    expect(style.contains('shadeFill: kExportScheme2ShadeFill'), isTrue);
+    // 未筛选在 Windows 导出中一律不标注
+    expect(win.contains('annotateUnfiltered: false'), isTrue,
+        reason: 'Windows 导出须跳过未筛选词标注');
   });
 }

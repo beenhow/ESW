@@ -94,11 +94,29 @@ class EswTheme {
       dialogTheme: DialogThemeData(
         backgroundColor: EswColors.card,
         surfaceTintColor: Colors.transparent,
+        elevation: 0,
+        barrierColor: EswColors.textPrimary.withValues(alpha: 0.34),
+        insetPadding: const EdgeInsets.symmetric(
+          horizontal: EswSpace.xxxl,
+          vertical: EswSpace.xxl,
+        ),
+        actionsPadding: const EdgeInsets.fromLTRB(
+          EswSpace.lg,
+          EswSpace.md,
+          EswSpace.lg,
+          EswSpace.lg,
+        ),
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(EswRadius.card),
         ),
-        titleTextStyle: EswText.title.copyWith(color: EswColors.textPrimary),
-        contentTextStyle: EswText.body.copyWith(color: EswColors.textPrimary),
+        titleTextStyle: EswText.title.copyWith(
+          color: EswColors.textPrimary,
+          fontWeight: FontWeight.w700,
+        ),
+        contentTextStyle: EswText.body.copyWith(
+          color: EswColors.textPrimary.withValues(alpha: 0.72),
+          height: 1.6,
+        ),
       ),
       inputDecorationTheme: InputDecorationTheme(
         filled: true,

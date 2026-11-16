@@ -3,10 +3,16 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>
+    <!-- 扫描文档：自定义实时预览页直接使用相机，需 CAMERA 权限（运行时申请） -->
+    <uses-permission android:name="android.permission.CAMERA"/>
+    <!-- 扫描文档内容：相机非必需硬件，无摄像头设备同样可安装（改用文件导入） -->
+    <uses-feature android:name="android.hardware.camera" android:required="false"/>
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false"/>
     <application
-        android:label="真题课标词"
+        android:label="ESW"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:largeHeap="true"
         android:requestLegacyExternalStorage="true">
         <activity
@@ -36,6 +42,17 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <!-- 打开「最近检测」历史项对应的导出文档：通过 FileProvider 授予临时读权限，
+             交由 Word / WPS / 文本编辑器等系统应用打开（Android 7+ 禁止 file:// 直传）。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/esw_file_paths" />
+        </provider>
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and
@@ -45,6 +62,15 @@
     <queries>
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+        <!-- 供「打开导出文档」查询可处理 docx / txt 的第三方应用 -->
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:mimeType="application/vnd.openxmlformats-officedocument.wordprocessingml.document"/>
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
             <data android:mimeType="text/plain"/>
         </intent>
     </queries>

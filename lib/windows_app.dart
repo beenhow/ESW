@@ -1,4 +1,4 @@
-﻿import 'package:flutter/material.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart'
     show rootBundle, Clipboard, ClipboardData;
@@ -12,19 +12,17 @@ import 'package:ffi/ffi.dart';
 import 'package:window_manager/window_manager.dart';
 import 'theme/app_theme.dart';
 import 'theme/glass_theme.dart';
-import 'theme/dialog_kit.dart' show EswDialog, EswDialogShell, EswDialogActions, EswDialogTextAction, EswDialogPrimaryAction, EswDialogGhostAction, EswOptionTile, EswOptionRow, EswDialogWidth;
+import 'theme/dialog_kit.dart' show EswDialog, EswDialogShell, EswDialogActions, EswDialogTextAction, EswDialogPrimaryAction, EswDialogGhostAction, EswOptionTile, EswOptionRow, EswDialogWidth, EswDialogHint;
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'dart:ui' show ImageFilter;
 import 'package:archive/archive.dart';
-import 'package:xml/xml.dart';
 import 'package:pdfrx/pdfrx.dart';
 import 'package:pdf/pdf.dart' as pwpdf;
 import 'package:pdf/widgets.dart' as pw;
 import 'package:path/path.dart' as p;
-import 'package:fast_gbk/fast_gbk.dart' show gbk;
 import 'package:url_launcher/url_launcher.dart';
 import 'package:http/http.dart' as http;
 import 'dictionary_service.dart';
@@ -41,6 +39,11 @@ import 'shared/inplace_docx_annotator.dart';
 import 'shared/export_word_style.dart';
 import 'word_filter_rules.dart';
 import 'shared/export_annotate_markup.dart';
+import 'shared/text_normalize.dart';
+import 'shared/builtin_corpus.dart';
+import 'shared/imported_corpus.dart';
+import 'windows/imported_word_row.dart';
+import 'windows/year_filter_bar.dart';
 
 typedef _GetDroppedFileC = Pointer<Utf8> Function();
 typedef _GetDroppedFileDart = Pointer<Utf8> Function();
@@ -241,12 +244,21 @@ class MainWindow extends StatefulWidget {
   State<MainWindow> createState() => _MainWindowState();
 }
 
-class _MainWindowState extends State<MainWindow> with WindowListener {
+class _MainWindowState extends State<MainWindow>
+    with WindowListener, WidgetsBindingObserver {
   // ============ 自绘标题栏状态 ============
   bool _isMaximized = false;
   double _windowBtnScale = 1.0; // 窗口三键按压反馈
   // ============ 左侧状态 ============
   List<CorpusFile> _corpusFiles = [];
+  // 内置真题（随包发布，首启释放）与用户自选语料分开持有：
+  // _corpusFiles 始终是「内置 + 用户」的合并视图，下游扫描/统计/导出一律读它，
+  // 因此内置接入不需要改动任何检测与导出逻辑。
+  List<CorpusFile> _builtinFiles = [];
+  List<CorpusFile> _userCorpusFiles = [];
+  Set<String> _builtinIds = {};
+  bool _builtinHidden = false; // 隐藏内置真题（不参与统计，可一键恢复）
+  bool _builtinCollapsed = false; // 仅折叠内置分组（仍参与统计）
   bool _highFreqExporting = false;
   // 教材导入文件列表（txt/doc/docx，可勾选，参与语料统计）
   List<CorpusFile> _textbookFiles = [];
@@ -255,6 +267,9 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
   String? _activeCorpusPath;
   String? _activeTextbookPath;
 
+  /// 左栏当前列表：false = 真题（默认），true = 教材。两态互斥、各占满左栏。
+  bool _leftPanelIsTextbook = false;
+
   /// 取某组的高亮行路径：优先记住的行；[fallbackFirst] 为 true 时失效回退第 1 行。
   /// 第三关 ⑥：全栏唯一高亮——仅"真题导入"组默认高亮第 1 行；其余组默认无高亮
   /// （透明底、hover 变灰），点击后才产生高亮，避免左栏同时出现两处选中态。
@@ -262,28 +277,20 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
     List<CorpusFile> files,
     String? remembered, {
     bool fallbackFirst = false,
+    String? firstPathOverride,
   }) {
     if (files.isEmpty) return null;
     if (remembered != null && files.any((f) => f.path == remembered)) {
       return remembered;
     }
-    return fallbackFirst ? files.first.path : null;
+    if (!fallbackFirst) return null;
+    // 左栏分组展示后，"第一行"以展示序列为准（内置分组可能排在用户分组之前）
+    return firstPathOverride ?? files.first.path;
   }
   // ============ 右侧状态 ============
   final TextEditingController _searchController = TextEditingController();
   String _activeFilter = '真题词';
 
-  /// 第三轮清单第 7 项：统计数字千分位格式化（等价 NumberFormat('#,###')，不引第三方依赖）
-  String _thousands(int n) {
-    final neg = n < 0;
-    final s = n.abs().toString();
-    final b = StringBuffer();
-    for (var i = 0; i < s.length; i++) {
-      if (i > 0 && (s.length - i) % 3 == 0) b.write(',');
-      b.write(s[i]);
-    }
-    return neg ? '-${b.toString()}' : b.toString();
-  }
   final List<String> _filters = ['真题词', '课标词', '拓展词', '超标词', '专有词', '未筛选'];
   final Map<String, int> _filterCounts = {
     '真题词': 0,
@@ -321,6 +328,10 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
   String _userId = '';
   final GlobalKey _importBtnKey = GlobalKey();
   final GlobalKey _textbookBtnKey = GlobalKey();
+
+  /// 左栏标题行锚点：切换标签后「＋」按钮的 GlobalKey 可能尚未挂载，
+  /// 导入菜单以标题行为兜底锚点，避免空指针。
+  final GlobalKey _leftHeaderKey = GlobalKey();
 
   // 词库列表弹窗批量操作状态：3 秒防抖自动弹出批量操作弹窗
   final Set<String> _batchSelected = {};
@@ -387,8 +398,6 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
   // （语料扫描 Future.wait、词典 lookup 回调）据此判定过期并丢弃，杜绝快速连续
   // 点击时"后发先至"的旧结果覆盖新结果——即"点A出B"根因。
   int _querySeq = 0;
-  // 右侧面板读取代际：快速切换结果行/文件时，旧文件的异步读取结果不覆盖新选择。
-  int _readerSeq = 0;
   // 历史下拉当前 hover 的词条索引（整行高亮，直观提示整块可点击）。
   // 用 ValueNotifier 驱动高亮：hover 变化只重建条目内部的 Container，
   // 绝不触发包含 GestureDetector 的子树重建，避免 recognizer 被替换导致
@@ -449,8 +458,7 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
   final List<ResultRow> _results = [];
   // 教材文件中的位置结果（检测时并行搜索选中教材文件生成，点击联动右侧原文面板）
   final List<ResultRow> _textbookResults = [];
-  Set<int> _importedYears = {};
-  List<int> _sortedYears = []; // 预计算降序年份列表
+  List<int> _sortedYears = []; // 预计算降序年份列表（由 _rebuildCorpusList 统一维护）
   List<ResultRow> _filteredResults = []; // 预计算年份筛选结果
   int? _selectedYear;
   String? _selectedTextbook; // 教材筛选：当前选中的教材文件路径
@@ -465,8 +473,27 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
   String _rightPanelTitle = '';
   String _rightPanelKeyword = '';
   _HighlightController? _rightHighlightController;
+  final GlobalKey _rightReaderKey = GlobalKey(); // 右侧原文 TextField（精确文本定位用）
   final ScrollController _rightScrollController = ScrollController();
-  ResultRow? _rightPanelRow; // 真题定位行（供弹窗编辑兜底）
+  ResultRow? _rightPanelRow; // 教材定位行（供弹窗编辑兜底）
+  int _rightPanelOccurrence = 0; // 当前关键词的第几次出现（窗口缩放后重新定位用）
+  // ======== 左侧真题内联阅读器 ========
+  // 真题原文不再占用右侧面板：点击文件行尾按钮在行下方内联展开本套真题，
+  // 从检测结果点击单词时自动展开该词所在年份并定位到该词。
+  final Set<String> _corpusReaderOpen = <String>{}; // 展开中的真题路径
+  final Map<String, String> _corpusReaderTexts = {}; // 路径 → 已解析全文
+  final Map<String, _HighlightController> _corpusReaderControllers = {};
+  final Map<String, ScrollController> _corpusReaderScrolls = {};
+  final Map<String, GlobalKey> _corpusReaderKeys = {}; // 用于精确计算关键词行位置
+  final Map<String, int> _corpusReaderAnchors = {}; // 路径 → 当前定位到的字符位置
+  final ScrollController _corpusListScrollController = ScrollController();
+  Timer? _readerReanchorTimer; // 窗口缩放后重新定位的防抖计时器
+  /// 结果行定位时只显示这一套真题（其它年份折叠隐藏），null 表示正常全量列表
+  String? _corpusFocusPath;
+  // ======== 教材内联阅读器（与真题一致：行下展开、关键词定位） ========
+  final Set<String> _textbookReaderOpen = <String>{}; // 展开中的教材路径
+  final ScrollController _textbookListScrollController = ScrollController();
+  String? _textbookFocusPath; // 结果定位时只显示这本教材
 
   /// 已筛选过的文件路径集合，打开这些文件时自动积累分类结果
   final Set<String> _processedFilePaths = {};
@@ -513,7 +540,7 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
   static const int _fileTextCacheMaxBytes = 80 * 1024 * 1024;
 
   /// 缓存条目上限
-  static const int _fileTextCacheMaxEntries = 64;
+  static const int _fileTextCacheMaxEntries = 160;
 
   /// 命中返回文本，未命中返回 null（缓存的是纯文本，比每次解析出的 XML/压缩中间结构省内存）
   String? _readCachedFileText(String path) {
@@ -585,20 +612,16 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
     } else {
       content = _decodeTxtBytes(File(filePath).readAsBytesSync());
     }
+    // 三条入口（真题语料 / 导入文档 / 粘贴文本）统一规范化：
+    // 制表符当分隔、软换行当断行、选项标记断行，避免 itB / toC 这类粘连 token
+    content = normalizeText(content);
     _cacheFileText(filePath, content);
     return content;
   }
 
-  /// txt 文本解码：优先 UTF-8 严格解码（并排除含替换符 U+FFFD 的误判），
-  /// 失败或含替换符时回退 GBK/GB2312 解码，兼容国内真题/教材常用的
-  /// 非 UTF-8 编码 txt 文件（fast_gbk 为纯 Dart 实现，无平台限制）。
-  String _decodeTxtBytes(List<int> bytes) {
-    try {
-      final s = utf8.decode(bytes);
-      if (!s.contains('\uFFFD')) return s;
-    } catch (_) {}
-    return gbk.decode(bytes);
-  }
+  /// txt 文本解码：统一走 shared/doc_extractor 的 decodeTextBytes
+  /// （UTF-16 BOM / UTF-8 BOM / UTF-8 严格 / GBK 回退）。
+  String _decodeTxtBytes(List<int> bytes) => decodeTextBytes(bytes);
 
   // ======== 性能优化常量 ========
   static const int _maxContextHalf = 30;
@@ -607,7 +630,6 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
   static final RegExp _wordTokenRegex = RegExp(r'\b[a-zA-Z]{2,}\b');
   static final RegExp _yearPrefixRegex = RegExp(r'^(\d{4})');
   static final RegExp _whitespaceRegex = RegExp(r'[\s\n\u3000]');
-  static final RegExp _pureDigitsRegex = RegExp(r'^\d+$');
   static final RegExp _anyWhitespaceChar = RegExp(r'\s');
   static final RegExp _sentenceEndRegex = RegExp(r'[。！？.!?\n]');
   // ======== 防抖保存 ========
@@ -630,15 +652,17 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
       });
     }
     windowManager.addListener(this);
+    WidgetsBinding.instance.addObserver(this);
     _initWindowState();
     _initDragDrop();
     _searchFocus.addListener(_onSearchFocusChange);
     _initOcr();
     _loadStandardWords();
-    // 配置加载（异步）完成后才恢复上次导入的真题（依赖 lastExamImportPath），
-    // 两者串联但都不阻塞首帧：原实现是首帧前同步读盘 45ms + 同步枚举目录
-    // 目录 118ms，实测首帧时间因此被拉长。
-    unawaited(_loadConfig().then((_) => _autoImportLast()));
+    // 配置加载（异步）完成后只释放内置真题；不再自动载入上次导入的真题目录。
+    // 历史路径仍保存在配置里，仅用于文件选择器的初始目录（initialDirectory）。
+    unawaited(_loadConfig().then((_) async {
+      await _initBuiltinCorpus();
+    }));
     if (Platform.environment['ESW_SHOT_CAPTURE'] == null && !EswPerf.enabled) {
       _maybePromptSync();
     }
@@ -761,9 +785,17 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
   /// 自动动作钩子（仅自动化取证使用；未设置 ESW_AUTO_ACTION 时零影响）。
   ///
   /// 环境变量：
-  ///   ESW_AUTO_ACTION    filter | export | maximize | resize
+  ///   ESW_AUTO_ACTION    filter | query | export | maximize | resize
   ///   ESW_AUTO_ACTION_MS 动作开始时刻（自 initState 起算，默认 6500）
   ///   ESW_AUTO_DOC      export 动作前先导入检测的文档绝对路径
+  ///   ESW_AUTO_QUERY    query 动作要检测的单词（默认 science）
+  ///   ESW_AUTO_RESIZE   query 动作检测完成后是否缩到最小窗口（1=是）
+  ///   ESW_AUTO_EXPAND   query 动作检测完成后是否展开首套真题原文（1=是）
+  ///   ESW_AUTO_CLICK_RESULT query 动作检测完成后是否点击第一条结果行（1=是）
+  ///   ESW_AUTO_CLICK_TEXTBOOK query 动作检测完成后是否点击第一条教材结果（1=是）
+  ///   ESW_AUTO_TEXTBOOK query 动作使用的教材语料文件路径（验证教材结果联动）
+  ///   ESW_AUTO_IMPORTED_CONTEXT 配合 ESW_AUTO_DOC：模拟「从导入文档点词进入查词」
+  ///   ESW_AUTO_FRESH_QUERY 模拟「搜索框独立查词」，应退出导入文档语境
   ///   ESW_ACTION_LOG    动作时间轴日志路径（与 frames_log.txt 对齐）
   Future<void> _maybeAutoDrive() async {
     final action = Platform.environment['ESW_AUTO_ACTION'];
@@ -788,6 +820,134 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
         w('filter.$f ${DateTime.now().microsecondsSinceEpoch}');
         setState(() => _activeFilter = f);
         await Future<void>.delayed(const Duration(milliseconds: 220));
+      }
+    } else if (action == 'query') {
+      final q = Platform.environment['ESW_AUTO_QUERY'] ?? 'science';
+      // 可选：把指定文档当作「用户导入的被检测文本」，用于验证右侧联动
+      final doc = Platform.environment['ESW_AUTO_DOC'];
+      if (doc != null && doc.isNotEmpty && File(doc).existsSync()) {
+        try {
+          _savedImportedText = await _readFileTextCached(doc);
+          _importedFileName = p.basename(doc);
+          // 模拟「从导入文档点词进入查词」：允许右侧回退展示该文档
+          if (Platform.environment['ESW_AUTO_IMPORTED_CONTEXT'] == '1') {
+            _cameFromImportedMode = true;
+          }
+        } catch (_) {}
+      }
+      // 模拟「搜索框独立查词」：应退出导入文档语境
+      if (Platform.environment['ESW_AUTO_FRESH_QUERY'] == '1') {
+        _beginIndependentQuery();
+      }
+      // 可选：把指定文件/目录当作「教材语料」，用于验证教材结果联动
+      final tb = Platform.environment['ESW_AUTO_TEXTBOOK'];
+      if (tb != null && tb.isNotEmpty) {
+        final paths = <String>[];
+        final tbDir = Directory(tb);
+        if (tbDir.existsSync()) {
+          for (final e in tbDir.listSync()) {
+            if (e is! File) continue;
+            final low = e.path.toLowerCase();
+            if (low.endsWith('.txt') ||
+                low.endsWith('.doc') ||
+                low.endsWith('.docx') ||
+                low.endsWith('.pdf')) {
+              paths.add(e.path);
+            }
+          }
+        } else if (File(tb).existsSync()) {
+          paths.add(tb);
+        }
+        if (paths.isNotEmpty) {
+          _textbookFiles = [
+            for (final path in paths)
+              CorpusFile(name: p.basename(path), path: path)..isSelected = true,
+          ];
+        }
+      }
+      setState(() => _searchController.text = q);
+      w('detect.begin tb=${_textbookFiles.length} '
+          '${DateTime.now().microsecondsSinceEpoch}');
+      await _onDetect();
+      w('detect.done results=${_results.length} '
+          'textbook=${_filteredTextbookResults.length} '
+          '${DateTime.now().microsecondsSinceEpoch}');
+      if (Platform.environment['ESW_AUTO_EXPAND'] == '1' &&
+          _corpusFiles.isNotEmpty) {
+        await _openCorpusReader(_corpusFiles.first);
+        await Future<void>.delayed(const Duration(milliseconds: 1200));
+      }
+      if (Platform.environment['ESW_AUTO_CLICK_RESULT'] == '1' &&
+          _filteredResults.isNotEmpty) {
+        // 先展开另一套真题，验证点击结果行后其它年份自动折叠
+        if (_corpusFiles.length > 3) {
+          await _openCorpusReader(_corpusFiles[3]);
+          await Future<void>.delayed(const Duration(milliseconds: 400));
+        }
+        w('click.result ${DateTime.now().microsecondsSinceEpoch}');
+        await _showResultInRightReader(_filteredResults.first);
+        await Future<void>.delayed(const Duration(milliseconds: 1200));
+      }
+      // 教材结果点击冒烟：验证左栏内联展开、右侧仍为被检测文本
+      if (Platform.environment['ESW_AUTO_CLICK_TEXTBOOK'] == '1' &&
+          _filteredTextbookResults.isNotEmpty) {
+        w('click.textbook ${_filteredTextbookResults.first.source}');
+        await _showResultInRightReader(_filteredTextbookResults.first);
+        await Future<void>.delayed(const Duration(milliseconds: 1200));
+        w('after.textbook right=$_rightPanelVisible kw=$_rightPanelKeyword '
+            'focus=$_textbookFocusPath open=${_textbookReaderOpen.length}');
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 2500));
+      if (Platform.environment['ESW_AUTO_RESIZE'] == '1') {
+        w('resize.min ${DateTime.now().microsecondsSinceEpoch}');
+        await windowManager.setSize(const Size(900, 600));
+        await Future<void>.delayed(const Duration(milliseconds: 600));
+      }
+      // 导出冒烟：查词模式下直接走一次导出（ESW_AUTO_OUT 指定输出路径）
+      if (Platform.environment['ESW_AUTO_EXPORT'] == '1') {
+        w('export.begin ${DateTime.now().microsecondsSinceEpoch}');
+        await _exportResultToWord();
+        w('export.end ${DateTime.now().microsecondsSinceEpoch}');
+      }
+    } else if (action == 'winning') {
+      final doc = Platform.environment['ESW_AUTO_DOC'];
+      if (doc != null && File(doc).existsSync()) {
+        try {
+          _savedImportedText = await _readFileTextCached(doc);
+          _importedFileName = p.basename(doc);
+          // 模拟「导入文档后进入查词」：输入框保存被检测文本，便于 _openImportedWord 留存
+          _searchController.text = _savedImportedText;
+        } catch (_) {}
+      }
+      final word = Platform.environment['ESW_AUTO_QUERY'] ?? 'winning';
+      w('word.begin=$word len=${_savedImportedText.length} '
+          'idx=${_savedImportedText.toLowerCase().indexOf(word.toLowerCase())}');
+      await _openImportedWord(_ImportedWord(
+        word: word,
+        category: '拓展词',
+        frequency: 1,
+        isInCorpus: true,
+      ));
+      await Future<void>.delayed(const Duration(milliseconds: 1200));
+      w('detect.done results=${_filteredResults.length} '
+          'right=$_rightPanelVisible');
+      if (_filteredResults.isNotEmpty) {
+        final row = _filteredResults.firstWhere(
+          (r) => r.keyword.toLowerCase() == word.toLowerCase(),
+          orElse: () => _filteredResults.first,
+        );
+        w('click.row ${row.source} kw=${row.keyword} off=${row.matchOffset}');
+        await _showResultInRightReader(row);
+        await Future<void>.delayed(const Duration(milliseconds: 900));
+        w('after.click right=$_rightPanelVisible kw=$_rightPanelKeyword '
+            'focus=$_corpusFocusPath items=${_corpusDisplayItems().length} '
+            'open=${_corpusReaderOpen.length} collapsed=$_builtinCollapsed '
+            'pixels=${_rightScrollController.hasClients ? _rightScrollController.offset.toStringAsFixed(1) : -1}');
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 2500));
+      if (Platform.environment['ESW_AUTO_RESIZE'] == '1') {
+        await windowManager.setSize(const Size(900, 600));
+        await Future<void>.delayed(const Duration(milliseconds: 1200));
       }
     } else if (action == 'maximize') {
       for (var i = 0; i < 2; i++) {
@@ -826,6 +986,8 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
         }
       }
       w('export.begin ${DateTime.now().microsecondsSinceEpoch}');
+      w('export.state imported=$_inImportedMode '
+          'words=${_importedWords.length} counts=$_importedFilterCounts');
       await _exportResultToWord();
       w('export.end ${DateTime.now().microsecondsSinceEpoch}');
     }
@@ -859,6 +1021,37 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
   @override
   void onWindowUnmaximize() {
     if (mounted) setState(() => _isMaximized = false);
+  }
+
+  /// 窗口尺寸变化后文本会重新换行，等布局稳定再按关键词重新定位左右原文，
+  /// 避免放大/缩小窗口后高亮词跑出可视区。
+  @override
+  void onWindowResize() {
+    _scheduleReaderReanchor();
+  }
+
+  /// Windows 上窗口停止缩放后还会单独发一次 onWindowResized，一并作为重定位信号。
+  @override
+  void onWindowResized() {
+    _scheduleReaderReanchor();
+  }
+
+  /// 窗口尺寸变化（含系统 DPI/可用区域变化）统一在布局更新后重定位原文。
+  @override
+  void didChangeMetrics() {
+    _scheduleReaderReanchor();
+  }
+
+  void _scheduleReaderReanchor() {
+    // 结构守卫测试下不注册定时器，避免留下 pending Timer
+    if (kEswStructureGuardTestMode) return;
+    _readerReanchorTimer?.cancel();
+    _readerReanchorTimer = Timer(
+      const Duration(milliseconds: 240),
+      () {
+        if (mounted) _reanchorReaders();
+      },
+    );
   }
 
   /// 标题栏窗口控制按钮（最小化/最大化/关闭）。
@@ -1517,38 +1710,6 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
     EswPerf.bootDt('initOcr(ocrReady=$_ocrReady)', sw);
   }
 
-  /// 启动时自动导入上次使用的真题路径
-  Future<void> _autoImportLast() async {
-    if (_lastExamImportPath == null || _lastExamImportPath!.isEmpty) return;
-    final sw = Stopwatch()..start();
-    final dirObj = Directory(_lastExamImportPath!);
-    if (!await dirObj.exists()) {
-      _lastExamImportPath = null;
-      _saveConfig();
-      return;
-    }
-    final files = <CorpusFile>[];
-    final recurse = _lastImportMode == 'folder';
-    // 异步枚举（原 listSync 同步递归 267 个文件实测阻塞主线程 118ms）：
-    // 语义与 listSync(recursive) 完全一致，仅把等待从"阻塞 UI 线程"改为"异步等待"。
-    await for (final entity in dirObj.list(recursive: recurse)) {
-      if (entity is File) {
-        final ext = entity.path.toLowerCase();
-        if (ext.endsWith('.txt') ||
-            ext.endsWith('.doc') ||
-            ext.endsWith('.docx') ||
-            ext.endsWith('.pdf')) {
-          files.add(
-            CorpusFile(name: entity.uri.pathSegments.last, path: entity.path),
-          );
-        }
-      }
-    }
-    EswPerf.bootDt('autoImportLast.list(${files.length} 文件)', sw);
-    _applyCorpusFiles(files);
-    EswPerf.bootDt('autoImportLast.total', sw);
-  }
-
   /// 课标词数据：{word: {category, pos, def}}，key 为原始大小写
   Map<String, Map<String, String>> _standardWords = {};
 
@@ -1610,6 +1771,9 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
         _lastTextbookImportPath = null;
       }
       _lastImportMode = json['lastImportMode'] as String?;
+      // 内置真题分组的显示偏好（隐藏 / 折叠）
+      _builtinHidden = json['builtinHidden'] as bool? ?? false;
+      _builtinCollapsed = json['builtinCollapsed'] as bool? ?? false;
       _lastExportPath = json['lastExportPath'] as String?;
       final wh = json['wordHistory'];
       if (wh is List) {
@@ -1673,31 +1837,50 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
       if (pf is List) {
         _processedFilePaths.addAll(pf.map((e) => e.toString()));
       }
-      // 恢复上次导入的教材文件列表（路径失效的自动跳过，不崩溃）
+      // 恢复用户主动导入的真题文件：只认本应用内导入并记录到配置的路径，
+      // 不读取任何外部固定目录；路径失效的条目静默跳过。
+      // 同名内置项由 _initBuiltinCorpus 的既有合并规则归并（内置优先）。
+      final icp = json['importedCorpusPaths'];
+      if (icp is List && icp.isNotEmpty) {
+        final validPaths = await ImportedCorpusRestore.existingPaths(
+          icp.map((e) => e.toString()),
+        );
+        if (validPaths.isNotEmpty) {
+          _userCorpusFiles = [
+            for (final path in validPaths)
+              CorpusFile(
+                name: File(path).uri.pathSegments.last,
+                path: path,
+              ),
+          ];
+          _rebuildCorpusList();
+        }
+      }
+      // 恢复用户主动导入的教材文件列表（路径失效的自动跳过，不崩溃）
       final itp = json['importedTextbookPaths'];
       if (itp is List && itp.isNotEmpty) {
-        final validFiles = <CorpusFile>[];
-        for (final p in itp) {
-          final path = p.toString();
-          if (path.isEmpty || !await File(path).exists()) continue;
-          validFiles.add(CorpusFile(
-            name: File(path).uri.pathSegments.last,
-            path: path,
-          ));
-        }
-        if (validFiles.isNotEmpty) {
-          _textbookFiles = validFiles;
+        final validPaths = await ImportedCorpusRestore.existingPaths(
+          itp.map((e) => e.toString()),
+        );
+        if (validPaths.isNotEmpty) {
+          _textbookFiles = [
+            for (final path in validPaths)
+              CorpusFile(
+                name: File(path).uri.pathSegments.last,
+                path: path,
+              ),
+          ];
           // 教材默认全部勾选，便于直接参与"同时检测真题和教材"
           for (final f in _textbookFiles) {
             f.isSelected = true;
           }
           // 同步恢复导入目录记忆，便于下次打开文件选择器定位
-          _lastTextbookImportPath = File(validFiles.first.path).parent.path;
+          _lastTextbookImportPath = File(validPaths.first).parent.path;
         }
       }
       await _mergeOldConfig();
     } catch (_) {}
-    // 配置已在首帧之后异步就绪：补一次重建，让历史词 / 扩展词 / 教材文件等
+    // 配置已在首帧之后异步就绪：补一次重建，让历史词 / 扩展词等
     // 依配置恢复的界面元素及时反映出来。
     if (mounted) setState(() {});
     EswPerf.bootDt('loadConfig', sw);
@@ -1824,8 +2007,12 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
       put('lastDocImportPath', _lastDocImportPath);
       put('lastTextbookImportPath', _lastTextbookImportPath);
       put('lastImportMode', _lastImportMode);
+      put('builtinHidden', _builtinHidden);
+      put('builtinCollapsed', _builtinCollapsed);
       put('lastExportPath', _lastExportPath);
       put('wordHistory', _wordHistory);
+      // 仅记录用户在本应用内主动导入的语料文件（内置 98 套由内置链路释放，不写这里）
+      put('importedCorpusPaths', _userCorpusFiles.map((f) => f.path).toList());
       put('importedTextbookPaths', _textbookFiles.map((f) => f.path).toList());
       put('extendWords', _extendWords);
       put('extendBaseMap', _extendBaseMap);
@@ -1921,6 +2108,16 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
     _searchFocus.dispose();
     _rightHighlightController?.dispose();
     _rightScrollController.dispose();
+    _corpusListScrollController.dispose();
+    _textbookListScrollController.dispose();
+    _readerReanchorTimer?.cancel();
+    WidgetsBinding.instance.removeObserver(this);
+    for (final c in _corpusReaderControllers.values) {
+      c.dispose();
+    }
+    for (final s in _corpusReaderScrolls.values) {
+      s.dispose();
+    }
     // 关闭常驻扫描 worker isolate，释放后台线程与内存
     _scanResultPort?.close();
     _scanWorker?.kill(priority: Isolate.immediate);
@@ -1929,8 +2126,11 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
 
   // 弹出导入方式菜单（居中于按钮正下方）
   Future<void> _showImportMenu() async {
-    final RenderBox box =
-        _importBtnKey.currentContext!.findRenderObject() as RenderBox;
+    if (_leftPanelIsTextbook) {
+      setState(() => _leftPanelIsTextbook = false);
+    }
+    final ctx = _importBtnKey.currentContext ?? _leftHeaderKey.currentContext;
+    final RenderBox box = ctx!.findRenderObject() as RenderBox;
     final offset = box.localToGlobal(Offset.zero);
     final centerX = offset.dx + box.size.width / 2;
     final items = <PopupMenuEntry<String>>[
@@ -2009,8 +2209,12 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
 
   // ==================== 教材导入（txt/doc/docx，可多选，可勾选） ====================
   Future<void> _showTextbookImportMenu() async {
-    final RenderBox box =
-        _textbookBtnKey.currentContext!.findRenderObject() as RenderBox;
+    if (!_leftPanelIsTextbook) {
+      setState(() => _leftPanelIsTextbook = true);
+    }
+    final ctx =
+        _textbookBtnKey.currentContext ?? _leftHeaderKey.currentContext;
+    final RenderBox box = ctx!.findRenderObject() as RenderBox;
     final offset = box.localToGlobal(Offset.zero);
     final centerX = offset.dx + box.size.width / 2;
     final items = <PopupMenuEntry<String>>[
@@ -2092,6 +2296,8 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
     }
     setState(() {
       _textbookFiles = files;
+      // 导入教材后左栏自动切到教材栏（单栏形态，真题列表整块不占位）
+      _leftPanelIsTextbook = true;
       // 教材文件默认全部勾选，便于直接参与"同时检测真题和教材"
       for (final f in _textbookFiles) {
         f.isSelected = true;
@@ -2114,31 +2320,9 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
     _saveConfig();
   }
 
-  /// 什.docx 文件中提取纯文本
+  /// 什.docx 文件中提取纯文本（保留制表符/软换行分隔，与构建脚本共用实现）
   String _readDocxContent(String filePath) {
-    final bytes = File(filePath).readAsBytesSync();
-    final archive = ZipDecoder().decodeBytes(bytes);
-    final documentXml = archive.findFile('word/document.xml');
-    if (documentXml == null) return '';
-    final contentBytes = documentXml.content is List<int>
-        ? Uint8List.fromList(documentXml.content as List<int>)
-        : documentXml.content as Uint8List;
-    final xmlStr = utf8.decode(contentBytes);
-    final document = XmlDocument.parse(xmlStr);
-    final paragraphs = document.findAllElements('w:p');
-    final buffer = StringBuffer();
-    for (final p in paragraphs) {
-      final texts = p.findAllElements('w:t');
-      if (texts.isEmpty) {
-        buffer.writeln();
-        continue;
-      }
-      for (final t in texts) {
-        buffer.write(t.innerText);
-      }
-      buffer.writeln();
-    }
-    return buffer.toString().trim();
+    return extractDocxText(File(filePath).readAsBytesSync());
   }
 
   /// 从 PDF 文件中提取纯文本（含 OCR 回退）
@@ -2337,18 +2521,74 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
     });
   }
 
-  void _applyCorpusFiles(List<CorpusFile> files) {
-    if (files.isEmpty) return;
-    files.sort((a, b) => a.name.compareTo(b.name));
+  /// 首启释放内置真题到用户目录，并登记为内置分组。
+  /// 任何一步失败都静默降级（左栏只是没有内置分组），不影响手动导入。
+  Future<void> _initBuiltinCorpus() async {
+    // 结构守卫测试只验证骨架，跳过释放（避免测试写用户目录 2MB 语料）
+    if (kEswStructureGuardTestMode) return;
+    try {
+      final index = await BuiltinCorpus.loadIndex();
+      if (index == null) return;
+      final paths = await BuiltinCorpus.ensureExtracted(
+        baseDir: p.join(_userDataDir, 'corpus'),
+        version: index.version,
+        papers: index.papers,
+      );
+      if (paths == null) return;
+      final files = <CorpusFile>[];
+      for (final paper in index.papers) {
+        final path = paths[paper.id];
+        if (path == null) continue;
+        files.add(
+          CorpusFile(name: '${paper.id}.txt', path: path, isBuiltin: true),
+        );
+      }
+      if (files.isEmpty) return;
+      _builtinIds = files.map((f) => f.name).toSet();
+      if (!mounted) {
+        _builtinFiles = files;
+        _rebuildCorpusList();
+        return;
+      }
+      setState(() {
+        _builtinFiles = files;
+        // 内置已覆盖同名文件：用户分组里剔除，避免同一套真题被计两次词频
+        _userCorpusFiles = _userCorpusFiles
+            .where((f) => !_builtinIds.contains(f.name))
+            .toList();
+        _rebuildCorpusList();
+      });
+    } catch (_) {}
+  }
+
+  /// 合并「内置 + 用户」语料为下游唯一的 _corpusFiles 视图，并重算年份索引。
+  /// 调用方需在 setState 内调用（构造期初始化除外）。
+  void _rebuildCorpusList() {
+    final merged = <CorpusFile>[
+      if (!_builtinHidden) ..._builtinFiles,
+      ..._userCorpusFiles,
+    ]..sort((a, b) => a.name.compareTo(b.name));
     final yearRegex = _yearPrefixRegex;
     final years = <int>{};
-    for (final f in files) {
+    for (final f in merged) {
       final m = yearRegex.firstMatch(f.name);
       if (m != null) {
         final y = int.parse(m.group(1)!);
         if (y >= 2000 && y <= 2099) years.add(y);
       }
     }
+    _corpusFiles = merged;
+    _sortedYears = years.toList()..sort((a, b) => b.compareTo(a));
+  }
+
+  void _applyCorpusFiles(List<CorpusFile> files) {
+    if (files.isEmpty) return;
+    files.sort((a, b) => a.name.compareTo(b.name));
+    // 内置已收录的同名真题不重复计入（用户导入同源文件夹时归并到内置分组）；
+    // 内置被隐藏时仍保留用户副本，保证用户导入的语料可用。
+    final userFiles = _builtinHidden
+        ? files
+        : files.where((f) => !_builtinIds.contains(f.name)).toList();
     // 退出单词查询模式：若输入框仍为上次查询词则一并清空
     final queryText = _searchController.text.trim();
     if (_detectedWord.isNotEmpty &&
@@ -2356,9 +2596,10 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
       _searchController.clear();
     }
     setState(() {
-      _corpusFiles = files;
-      _importedYears = years;
-      _sortedYears = years.toList()..sort((a, b) => b.compareTo(a));
+      _userCorpusFiles = userFiles;
+      // 导入真题后左栏切回真题栏
+      _leftPanelIsTextbook = false;
+      _rebuildCorpusList();
       // 导入真题后自动退出单词查询模式，切换/进入文档检测模式
       _detectedWord = '';
       _activeFilter = '真题词';
@@ -2373,6 +2614,8 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
       _selectedYear = null;
       _selectedTextbook = null;
     });
+    // 持久化用户主动导入的真题路径列表，重启后自动恢复
+    _saveConfig();
   }
 
   // ---------- 单词检测----------
@@ -2390,6 +2633,7 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
       offset: w.length,
     );
     // 显式传参发起检测：查询词来源 = 被点击的历史词（overrideWord）
+    _beginIndependentQuery();
     _onDetect(w);
     _searchFocus.unfocus();
     // 强制重建一次，确保下拉（text 非空 + 失焦）立即关闭
@@ -2723,6 +2967,19 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
       _filteredTextbookResults = List.from(textbookResults);
       _filteredResults = List.from(results);
       _filterCounts.updateAll((_, __) => 0);
+      // 查词时右侧默认空白：不自动打开上次导入/上次阅读的文本，
+      // 只有用户点击结果行或主动选择时才由 _showResultInRightReader 加载。
+      if (!_inImportedMode) {
+        _rightPanelVisible = false;
+        _rightPanelTitle = '';
+        _rightPanelKeyword = '';
+        _rightPanelRow = null;
+        _rightHighlightController?.dispose();
+        _rightHighlightController = null;
+        // 新查询恢复完整真题 / 教材列表（退出聚焦态）
+        _corpusFocusPath = null;
+        _textbookFocusPath = null;
+      }
       // 词库归属（互斥）：filter 必为 课标/拓展/超标/专有/未筛选 之一；
       // 四库均不收录的词归未筛选，语料出现过的另计入真题词（叠加口径）
       _filterCounts[filter] = 1;
@@ -2842,7 +3099,8 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
       );
 
   Future<void> _analyzeImportedText() async {
-    final text = _searchController.text.trim();
+    // 粘贴/输入文本同样走统一规范化（幂等，文件入口已规范化过）
+    final text = normalizeText(_searchController.text.trim());
     if (text.isEmpty) {
       setState(() {
         _cameFromImportedMode = false;
@@ -2857,26 +3115,16 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
       });
       return;
     }
-    // 提取单词（仅英文单词，至多字符且非纯数字）并保留原始大小写
-    final wordRegex = _wordTokenRegex;
-    final matches = wordRegex.allMatches(text);
+    // 提取单词（仅英文单词，至少 2 字符且非纯数字）并保留原始大小写。
+    // 统一走 shared/text_normalize 的 extractWordTokens：连字/变音/全角折叠 +
+    // 选项字母粘连剥离，与 Android 端和语料统计口径一致。
     final freqMap = <String, int>{};
     final wordCaseMap = <String, String>{}; // 小写→原始大小写
-    // 剥离真题选项字母粘连（如 hostedB 还原为 hosted），与导出侧 filterGluedRe 同款
-    final gluedLetterRe = RegExp(r'^([a-zA-Z]{3,})([A-H])$');
-    for (final m in matches) {
-      final original = m.group(0)!;
-      if (_pureDigitsRegex.hasMatch(original)) continue;
-      var w = original.toLowerCase();
-      var display = original;
-      final glued = gluedLetterRe.firstMatch(original);
-      if (glued != null) {
-        w = glued.group(1)!.toLowerCase();
-        display = glued.group(1)!;
-      }
+    for (final original in extractWordTokens(text)) {
+      final w = original.toLowerCase();
       freqMap[w] = (freqMap[w] ?? 0) + 1;
       if (!wordCaseMap.containsKey(w)) {
-        wordCaseMap[w] = display;
+        wordCaseMap[w] = original;
       }
     }
     // 收集真题 + 教材语料中的所有单词；其中真题语料另统计真题词频（totalFreq）
@@ -2904,9 +3152,7 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
       final corpusText = fileTexts[i];
       if (corpusText == null) continue;
       final isCorpusText = corpusFilePaths.contains(selectedFiles[i].path);
-      for (final m in wordRegex.allMatches(corpusText)) {
-        final cw = m.group(0)!;
-        if (_pureDigitsRegex.hasMatch(cw)) continue;
+      for (final cw in extractWordTokens(corpusText)) {
         final lw = cw.toLowerCase();
         if (isCorpusText) {
           corpusFreqMap[lw] = (corpusFreqMap[lw] ?? 0) + 1;
@@ -2962,6 +3208,8 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
         ..clear()
         ..addAll(counts);
     });
+    // 检测完成即把被检测文本展示在右侧面板（不再展示真题原文）
+    _showDetectedTextInRightReader();
     _autoAccumulateImportedResults();
   }
 
@@ -3025,7 +3273,7 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
                               ),
                             ),
                             const SizedBox(width: kGap8),
-                            GlassVersionBadge(version: 'v1.5.8'),
+                            GlassVersionBadge(version: 'v1.6.0'),
                           ],
                         ),
                       ),
@@ -3078,24 +3326,54 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
                   color: Colors.transparent,
                   child: Row(
                     children: [
-                      GlassToolButton(
-                        label: '使用说明',
-                        icon: Icons.help_outline_rounded,
-                        onPressed: _showHelp,
+                      // 左组按钮：窗口变窄时横向滚动，避免挤压/溢出（最小 900×600 安全）
+                      Expanded(
+                        child: SingleChildScrollView(
+                          scrollDirection: Axis.horizontal,
+                          child: Row(
+                            children: [
+                              // 恢复文字按钮：图标按钮挤在一起显粘连，改回「图标 + 文字」并留足间距
+                              GlassToolButton(
+                                label: '使用说明',
+                                icon: Icons.help_outline_rounded,
+                                onPressed: _showHelp,
+                              ),
+                              const SizedBox(width: kGap12),
+                              GlassToolButton(
+                                label: '同步词库',
+                                icon: Icons.sync_rounded,
+                                onPressed: _syncVocab,
+                              ),
+                              const SizedBox(width: kGap12),
+                              GlassToolButton(
+                                label: '导出高频',
+                                icon: Icons.file_download_outlined,
+                                onPressed: _exportHighFreq,
+                              ),
+                              const SizedBox(width: kGap12),
+                              // 三个词库入口（原主面板三块卡片改为工具栏按钮）
+                              GlassToolButton(
+                                label: '拓展词库',
+                                icon: Icons.menu_book_rounded,
+                                onPressed: _showExtendWordsDialog,
+                              ),
+                              const SizedBox(width: kGap12),
+                              GlassToolButton(
+                                label: '超标词库',
+                                icon: Icons.trending_up_rounded,
+                                onPressed: _showChaoGangWordsDialog,
+                              ),
+                              const SizedBox(width: kGap12),
+                              GlassToolButton(
+                                label: '专有词库',
+                                icon: Icons.bookmark_added_outlined,
+                                onPressed: _showExtraWordsDialog,
+                              ),
+                            ],
+                          ),
+                        ),
                       ),
-                      const SizedBox(width: kGap8),
-                      GlassToolButton(
-                        label: '同步词库',
-                        icon: Icons.sync_rounded,
-                        onPressed: _syncVocab,
-                      ),
-                      const SizedBox(width: kGap8),
-                      GlassToolButton(
-                        label: '导出高频',
-                        icon: Icons.file_download_outlined,
-                        onPressed: _exportHighFreq,
-                      ),
-                      const Spacer(),
+                      const SizedBox(width: kGap12),
                       // 状态徽标：无边框淡底圆角矩形（非按钮，规范 2.2）
                       Container(
                         height: GlassTheme.hToolBtn,
@@ -3135,7 +3413,7 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
                           ],
                         ),
                       ),
-                      const SizedBox(width: kGap8),
+                      const SizedBox(width: kGap12),
                       GlassToolButton(
                         label: '检查更新',
                         icon: Icons.system_update_alt_rounded,
@@ -3153,76 +3431,34 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
               child: Row(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  // ========== 左侧窄栏（真题 + 教材）③ region-side w248 ==========
+                  // ========== 左侧窄栏（真题 / 教材 二选一）③ region-side w248 ==========
                   SizedBox(
                     key: const ValueKey('region-side'),
                     width: leftWidth,
-                    child: LayoutBuilder(
-                      builder: (context, sideConstraints) {
-                        // 第三轮清单第 4 项：真题卡按内容自适应高度（上限可用高的 55%），
-                        // 教材卡 Expanded 吸收剩余空间 —— 左栏只有两张卡，任何内容都不溢出窗口
-                        final availH =
-                            sideConstraints.maxHeight - kGap16 - kGap12;
-                        final corpusH = (65.0 + _corpusFiles.length * 33.0)
-                            .clamp(150.0, (availH * 0.55).clamp(150.0, 1e6))
-                            .toDouble();
-                        return Column(
-                      children: [
-                        SizedBox(
-                          height: corpusH,
-                          child: Padding(
-                            padding: const EdgeInsets.fromLTRB(kGap12, kGap16, kGap12, 0),
-                            child: RepaintBoundary(
-                            child: GlassPanel(
-                              radius: GlassTheme.rXl,
-                              sigma: 0, // 任务④：背靠平滑柔光背景，模糊不可见但每帧代价高
-                              child: Column(
-                                children: [
-                                  _buildLeftSectionHeader(
-                                    title: '真题导入',
-                                    // 第三轮清单第 9 项：计数胶囊只留纯数字（规范 §2.3，去掉「份」）
-                                    count: '${_corpusFiles.length}',
-                                    tip: '导入真题',
-                                    onAdd: _showImportMenu,
-                                    addKey: _importBtnKey,
-                                  ),
-                                  Container(height: 1, color: GlassTheme.line),
-                                  Expanded(child: _buildCorpusList()),
-                                ],
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(
+                          kGap12, kGap16, kGap12, kGap16),
+                      child: RepaintBoundary(
+                        child: GlassPanel(
+                          radius: GlassTheme.rXl,
+                          sigma: 0, // 任务④：背靠平滑柔光背景，模糊不可见但每帧代价高
+                          child: Column(
+                            children: [
+                              // 单栏形态：标题行本身就是「真题 / 教材」切换入口，
+                              // 两种状态互斥，各自占满整个左栏高度。
+                              _buildLeftTabHeader(),
+                              Container(height: 1, color: GlassTheme.line),
+                              Expanded(
+                                child: RepaintBoundary(
+                                  child: _leftPanelIsTextbook
+                                      ? _buildTextbookList()
+                                      : _buildCorpusList(),
+                                ),
                               ),
-                            ),
-                            ),
+                            ],
                           ),
                         ),
-                        const SizedBox(height: kGap12),
-                        Expanded(
-                          child: Padding(
-                            padding: const EdgeInsets.fromLTRB(kGap12, 0, kGap12, kGap16),
-                            child: RepaintBoundary(
-                            child: GlassPanel(
-                              radius: GlassTheme.rXl,
-                              sigma: 0, // 任务④：同上，关闭不可见模糊
-                              child: Column(
-                                children: [
-                                  _buildLeftSectionHeader(
-                                    title: '教材导入',
-                                    // 第三轮清单第 9 项：计数胶囊只留纯数字（规范 §2.3，去掉「份」）
-                                    count: '${_textbookFiles.length}',
-                                    tip: '导入教材',
-                                    onAdd: _showTextbookImportMenu,
-                                    addKey: _textbookBtnKey,
-                                  ),
-                                  Container(height: 1, color: GlassTheme.line),
-                                  Expanded(child: _buildTextbookList()),
-                                ],
-                              ),
-                            ),
-                            ),
-                          ),
-                        ),
-                      ],
-                        );
-                      },
+                      ),
                     ),
                   ),
                   // ========== 单条连续分隔线（左右留白，避免贴边）==========
@@ -3265,6 +3501,8 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
 
 
   // ==================== 教材文件列表（可勾选，参与语料统计） ====================
+  /// 教材列表：与真题列表一致，点击行尾按钮在行下内联展开教材原文；
+  /// 命中教材结果时进入聚焦态（只显示该教材）并定位到关键词。
   Widget _buildTextbookList() {
     if (_textbookFiles.isEmpty) {
       return Center(
@@ -3285,81 +3523,237 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
         ),
       );
     }
-    return ListView.builder(
-      // 任务④：固定行高 32 → 声明 itemExtent，列表可跳过逐项测量、直接按
-      // 偏移定位可视区间（长列表滚动更稳、布局开销更低）。
-      itemExtent: GlassTheme.dp(32),
-      // 对齐示意图：卡内列表内容左内缩 16 = 列表 padding 8 + 行 padding 8
-      padding: const EdgeInsets.symmetric(horizontal: kGap8, vertical: kGap8),
-      itemCount: _textbookFiles.length,
-      itemBuilder: (context, index) {
-        final file = _textbookFiles[index];
-        // 第三关 ⑥：高亮行全栏唯一——教材导入组默认无高亮（透明底、hover 变灰），
-        // 点击后才产生高亮；勾选语义 isSelected 保持原功能
-        final selected =
-            file.path == _activePathOf(_textbookFiles, _activeTextbookPath);
-        final ext = _fileTypeLabel(file.name);
-        return GlassPressable(radius: GlassTheme.rMd, hoverColor: const Color(0x0A18181B), pressColor: const Color(0x294462F2), enabled: true, child: InkWell(
-          onTap: () {
-            setState(() {
-              file.isSelected = !file.isSelected;
-              // 原功能：多选参与统计（只改视觉，不动交互）
-              _activeTextbookPath = file.path; // 第三关 ⑥：高亮行唯一
-            });
-            _showFileInRightReader(file.path, file.name);
-          },
-          borderRadius: BorderRadius.circular(GlassTheme.rMd),
-          child: Container(
-            height: 32,
-            padding: const EdgeInsets.only(right: kGap8),
-            // 第三轮清单第 2 项：选中态 = 淡蓝底 rgba(68,98,242,.12) + 左侧 2.5px 蓝竖条
-            //（竖条上下各内缩 6，圆角 2）+ 深蓝字，行高仍 32、不整行填主色
-            decoration: BoxDecoration(
-              color: selected ? const Color(0x1F4462F2) : null,
-              borderRadius: BorderRadius.circular(GlassTheme.rMd),
+    final items = _textbookDisplayItems();
+    final heights = items.map(_textbookItemHeight).toList();
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final double avail = constraints.maxHeight;
+        final double natural =
+            kGap8 * 2 + heights.fold<double>(0, (s, h) => s + h);
+        double viewH = natural <= avail ? natural : avail;
+        double? focusReaderH;
+        if (_textbookFocusPath != null) {
+          viewH = avail;
+          final double hintH = GlassTheme.dp(24);
+          final double rowH = GlassTheme.dp(32);
+          final double rest = avail - kGap8 * 2 - hintH - rowH - kGap6;
+          focusReaderH =
+              rest < GlassTheme.dp(120) ? GlassTheme.dp(120) : rest;
+        }
+        return Align(
+          alignment: Alignment.topCenter,
+          child: SizedBox(
+            height: viewH,
+            child: ListView.builder(
+              controller: _textbookListScrollController,
+              // 对齐示意图：卡内列表内容左内缩 16 = 列表 padding 8 + 行 padding 8
+              padding: const EdgeInsets.symmetric(
+                horizontal: kGap8,
+                vertical: kGap8,
+              ),
+              itemCount: items.length,
+              itemBuilder: (context, index) {
+                final item = items[index];
+                switch (item.kind) {
+                  case 'focusHint':
+                    return _buildTextbookFocusHint();
+                  case 'reader':
+                    return _buildCorpusReader(
+                      item.file!,
+                      itemHeight: focusReaderH,
+                    );
+                  default:
+                    return _buildTextbookFileRow(item.file!);
+                }
+              },
             ),
-            child: Row(
-              children: [
-                // 左侧 2.5px 蓝色竖条（骨架 FileItem: Positioned(left:0, top:6, bottom:6, width:2.5)）
-                SizedBox(
-                  width: kGap8,
-                  child: selected
-                      ? Align(
-                          alignment: Alignment.centerLeft,
-                          child: Container(
-                            width: 2.5,
-                            height: 20,
-                            decoration: BoxDecoration(
-                              color: GlassTheme.accent,
-                              borderRadius: BorderRadius.circular(2),
-                            ),
-                          ),
-                        )
-                      : null,
+          ),
+        );
+      },
+    );
+  }
+
+  List<({String kind, CorpusFile? file})> _textbookDisplayItems() {
+    final focus = _textbookFocusPath;
+    final files = focus == null
+        ? _textbookFiles
+        : _textbookFiles.where((f) => f.path == focus).toList();
+    if (files.isEmpty) return const <({String kind, CorpusFile? file})>[];
+    return <({String kind, CorpusFile? file})>[
+      if (focus != null) (kind: 'focusHint', file: null),
+      for (final f in files) ...[
+        (kind: 'file', file: f),
+        if (_textbookReaderOpen.contains(f.path)) (kind: 'reader', file: f),
+      ],
+    ];
+  }
+
+  double _textbookItemHeight(({String kind, CorpusFile? file}) item) {
+    switch (item.kind) {
+      case 'focusHint':
+        return GlassTheme.dp(24);
+      case 'reader':
+        return GlassTheme.dp(_kCorpusReaderH) + kGap6;
+      default:
+        return GlassTheme.dp(32);
+    }
+  }
+
+  /// 教材聚焦态提示条：只显示当前教材，可一键恢复完整列表。
+  Widget _buildTextbookFocusHint() {
+    var name = '';
+    for (final f in _textbookFiles) {
+      if (f.path == _textbookFocusPath) {
+        name = f.name;
+        break;
+      }
+    }
+    return SizedBox(
+      height: GlassTheme.dp(24),
+      child: Row(
+        children: [
+          const Icon(
+            Icons.filter_alt_outlined,
+            size: 13,
+            color: GlassTheme.accentInk,
+          ),
+          const SizedBox(width: 4),
+          Expanded(
+            child: Text(
+              '仅显示 $name',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 11, color: GlassTheme.ink2),
+            ),
+          ),
+          const SizedBox(width: kGap8),
+          MouseRegion(
+            cursor: SystemMouseCursors.click,
+            child: GestureDetector(
+              onTap: () => setState(() => _textbookFocusPath = null),
+              child: const Text(
+                '显示全部',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: GlassTheme.accentInk,
+                  decoration: TextDecoration.underline,
+                  decorationColor: GlassTheme.accentInk,
                 ),
-                GlassFileTypeTag(label: ext, selected: selected),
-                const SizedBox(width: kGap8),
-                Expanded(
-                  child: Text(
-                    file.name,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: GlassTheme.fBody,
-                      color: selected
-                          ? GlassTheme.accentInk
-                          : const Color(0xFF52525B),
-                      fontWeight:
-                          selected ? FontWeight.w600 : FontWeight.w400,
-                      height: 1,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTextbookFileRow(CorpusFile file) {
+    // 第三关 ⑥：高亮行全栏唯一——教材导入组默认无高亮（透明底、hover 变灰），
+    // 点击后才产生高亮；勾选语义 isSelected 保持原功能
+    final selected =
+        file.path == _activePathOf(_textbookFiles, _activeTextbookPath);
+    final expanded = _textbookReaderOpen.contains(file.path);
+    final ext = _fileTypeLabel(file.name);
+    return GlassPressable(
+      radius: GlassTheme.rMd,
+      hoverColor: const Color(0x0A18181B),
+      pressColor: const Color(0x294462F2),
+      enabled: true,
+      child: InkWell(
+        onTap: () {
+          setState(() {
+            file.isSelected = !file.isSelected;
+            // 原功能：多选参与统计（只改视觉，不动交互）
+            _activeTextbookPath = file.path; // 第三关 ⑥：高亮行唯一
+          });
+        },
+        borderRadius: BorderRadius.circular(GlassTheme.rMd),
+        child: Container(
+          height: 32,
+          padding: const EdgeInsets.only(right: kGap8),
+          // 第三轮清单第 2 项：选中态 = 淡蓝底 rgba(68,98,242,.12) + 左侧 2.5px 蓝竖条
+          //（竖条上下各内缩 6，圆角 2）+ 深蓝字，行高仍 32、不整行填主色
+          decoration: BoxDecoration(
+            color: selected ? const Color(0x1F4462F2) : null,
+            borderRadius: BorderRadius.circular(GlassTheme.rMd),
+          ),
+          child: Row(
+            children: [
+              // 左侧 2.5px 蓝色竖条（骨架 FileItem: Positioned(left:0, top:6, bottom:6, width:2.5)）
+              SizedBox(
+                width: kGap8,
+                child: selected
+                    ? Align(
+                        alignment: Alignment.centerLeft,
+                        child: Container(
+                          width: 2.5,
+                          height: 20,
+                          decoration: BoxDecoration(
+                            color: GlassTheme.accent,
+                            borderRadius: BorderRadius.circular(2),
+                          ),
+                        ),
+                      )
+                    : null,
+              ),
+              GlassFileTypeTag(label: ext, selected: selected),
+              const SizedBox(width: kGap8),
+              Expanded(
+                child: Text(
+                  file.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: GlassTheme.fBody,
+                    color: selected
+                        ? GlassTheme.accentInk
+                        : const Color(0xFF52525B),
+                    fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                    height: 1,
+                  ),
+                ),
+              ),
+              const SizedBox(width: kGap4),
+              // 行尾展开按钮：行下内联展示教材原文
+              Tooltip(
+                message: expanded ? '收起教材原文' : '查看教材原文',
+                child: MouseRegion(
+                  cursor: SystemMouseCursors.click,
+                  child: GlassPressable(
+                    radius: 6,
+                    hoverColor: GlassTheme.accentSoft,
+                    pressColor: const Color(0x294462F2),
+                    enabled: true,
+                    child: InkWell(
+                      onTap: () => _toggleTextbookReader(file),
+                      borderRadius: BorderRadius.circular(6),
+                      child: SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: Icon(
+                          expanded
+                              ? Icons.keyboard_arrow_up_rounded
+                              : Icons.keyboard_arrow_down_rounded,
+                          size: 16,
+                          color:
+                              selected ? GlassTheme.accentInk : GlassTheme.ink3,
+                        ),
+                      ),
                     ),
                   ),
                 ),
-                const SizedBox(width: kGap4),
-                GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTap: _showTextbookImportMenu,
-                  child: GlassPressable(radius: 6, hoverColor: GlassTheme.accentSoft, pressColor: const Color(0x294462F2), enabled: true, child: Container(
+              ),
+              const SizedBox(width: 2),
+              GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: _showTextbookImportMenu,
+                child: GlassPressable(
+                  radius: 6,
+                  hoverColor: GlassTheme.accentSoft,
+                  pressColor: const Color(0x294462F2),
+                  enabled: true,
+                  child: Container(
                     width: 20,
                     height: 20,
                     decoration: BoxDecoration(
@@ -3372,14 +3766,112 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
                       color: GlassTheme.ink2,
                     ),
                   ),
-                  ),
                 ),
-              ],
-            ),
+              ),
+            ],
           ),
-        ));
-      },
+        ),
+      ),
     );
+  }
+
+  Future<void> _toggleTextbookReader(CorpusFile file) async {
+    if (_textbookFocusPath != null) {
+      setState(() => _textbookFocusPath = null);
+    }
+    if (_textbookReaderOpen.contains(file.path)) {
+      _closeTextbookReader(file.path);
+      return;
+    }
+    await _openTextbookReader(file);
+  }
+
+  void _closeTextbookReader(String path) {
+    setState(() => _textbookReaderOpen.remove(path));
+    _corpusReaderControllers.remove(path)?.dispose();
+    _corpusReaderScrolls.remove(path)?.dispose();
+    _corpusReaderKeys.remove(path);
+    _corpusReaderAnchors.remove(path);
+    _corpusReaderTexts.remove(path);
+  }
+
+  /// 展开教材并（可选）定位到关键词；[focusOnly] 时教材栏只显示这一本。
+  Future<void> _openTextbookReader(
+    CorpusFile file, {
+    String keyword = '',
+    int? matchOffset,
+    bool collapseOthers = false,
+    bool focusOnly = false,
+  }) async {
+    final path = file.path;
+    if (collapseOthers) {
+      for (final p in _textbookReaderOpen.where((p) => p != path).toList()) {
+        _corpusReaderControllers.remove(p)?.dispose();
+        _corpusReaderScrolls.remove(p)?.dispose();
+        _corpusReaderKeys.remove(p);
+        _corpusReaderAnchors.remove(p);
+        _corpusReaderTexts.remove(p);
+      }
+    }
+    setState(() {
+      _leftPanelIsTextbook = true;
+      _activeTextbookPath = path;
+      _textbookFocusPath = focusOnly ? path : null;
+      if (collapseOthers) {
+        _textbookReaderOpen
+          ..clear()
+          ..add(path);
+      } else {
+        _textbookReaderOpen.add(path);
+      }
+      _corpusReaderControllers.remove(path)?.dispose();
+      _corpusReaderControllers[path] =
+          _HighlightController(_corpusReaderTexts[path] ?? '', keyword);
+      _corpusReaderScrolls.putIfAbsent(path, () => ScrollController());
+    });
+    if (!_corpusReaderTexts.containsKey(path)) {
+      String text = '';
+      try {
+        text = await _readFileTextCached(path);
+      } catch (_) {}
+      if (!mounted) return;
+      setState(() {
+        _corpusReaderTexts[path] = text;
+        _corpusReaderControllers.remove(path)?.dispose();
+        _corpusReaderControllers[path] = _HighlightController(text, keyword);
+      });
+    }
+    _scrollTextbookListToFile(path);
+    final loaded = _corpusReaderTexts[path] ?? '';
+    int? anchor = matchOffset;
+    if (anchor == null && keyword.isNotEmpty) {
+      final i = loaded.toLowerCase().indexOf(keyword.toLowerCase());
+      if (i >= 0) anchor = i;
+    }
+    if (anchor != null) _corpusReaderAnchors[path] = anchor;
+    _jumpCorpusReaderToKeyword(path, loaded, keyword, anchor);
+  }
+
+  /// 把教材列表滚动到指定教材行并居中。
+  void _scrollTextbookListToFile(String path) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_textbookListScrollController.hasClients) return;
+      final items = _textbookDisplayItems();
+      double off = kGap8;
+      double targetH = GlassTheme.dp(32);
+      for (final it in items) {
+        if (it.kind == 'file' && it.file?.path == path) {
+          targetH = _textbookItemHeight(it);
+          break;
+        }
+        off += _textbookItemHeight(it);
+      }
+      final pos = _textbookListScrollController.position;
+      final center = off - (pos.viewportDimension - targetH) / 2;
+      _textbookListScrollController.jumpTo(
+        center.clamp(0.0, pos.maxScrollExtent),
+      );
+    });
   }
 
   String _fileTypeLabel(String name) {
@@ -3488,6 +3980,7 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
                           _searchController.selection = TextSelection.collapsed(
                             offset: trimmed.length,
                           );
+                          _beginIndependentQuery();
                           _onDetect();
                           _cancelHistoryTimer();
                           return;
@@ -3525,6 +4018,7 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
                       }
                     },
                     onSubmitted: (_) {
+                      _beginIndependentQuery();
                       _onDetect();
                       _cancelHistoryTimer();
                     },
@@ -3647,8 +4141,11 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
   }
 
   // ========== 右栏内容区（④ region-content）：上16 左右20 下16，块间距 12 ==========
-  // 骨架 ④：④-1 搜索行(40) → ④-2 统计卡(72) → ④-3 筛选行(30) →
-  //          ④-4 词频面板(146) → ④-5 结果表(flex:1)，逐块独立成区域。
+  // 骨架 ④：④-1 搜索行(40) → ④-2 筛选行(自适应) →
+  //          ④-3 词频面板(按可用高度分配) → ④-4 结果表(flex:1)。
+  /// 内容区纵向栅格：所有区块之间统一 12，避免逐块手写不同间距
+  static const double _kSectionGap = kGap12;
+
   Widget _buildRightContent() {
     return Column(
       key: const ValueKey('region-content'),
@@ -3660,40 +4157,56 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
         Expanded(
           child: _inImportedMode
               ? _buildImportedTextPanel()
-              : Padding(
-                  // §4.9 面板级：上 16 / 左右 20 / 下 16；区块间统一 kGap12（原 18 非标已收敛）
-                  padding: const EdgeInsets.fromLTRB(kGap20, kGap16, kGap20, kGap16),
-                  child: Column(
-                    children: [
-                      if (_cameFromImportedMode &&
-                          _searchController.text.isNotEmpty) ...[
-                        _buildReturnToImportedBar(),
-                        const SizedBox(height: kGap12),
-                      ],
-                      _buildWordBankEntries(),
-                      const SizedBox(height: kGap12),
-                      _buildFilterChips(),
-                      const SizedBox(height: kGap12),
-                      _buildYearDistribution(),
-                      const SizedBox(height: kGap12),
-                      Expanded(
-                        child: GlassPanel(
-                          key: const ValueKey('region-table'),
-                          sigma: 0, // 任务④：结果表为常驻大面板，模糊不可见 → 关闭
-
-                          // 对齐示意图：结果面板表头带与面板顶沿齐平（示意图 y462 面板顶=表头带顶）
-                          padding: EdgeInsets.zero,
-                          radius: GlassTheme.rXl,
-                          child: Column(
-                            children: [
-                              _buildResultHeader(),
-                              Expanded(child: _buildResultList()),
-                            ],
+              : LayoutBuilder(
+                  builder: (context, constraints) {
+                    // 自适应分配：年份面板常态保持设计高度，窗口变矮时按可用
+                    // 高度线性收缩；剩余高度全部留给结果表。筛选行改为内容
+                    // 自适应高度（可换行），不再以固定高度裁切/压住下方区块。
+                    final yearHeight = (constraints.maxHeight * 0.34)
+                        .clamp(GlassTheme.dp(96), GlassTheme.hWordPanel)
+                        .toDouble();
+                    return Padding(
+                      // 内容区栅格统一：左右 20、下 16，内部所有区块之间统一 _kSectionGap(12)
+                      padding: const EdgeInsets.fromLTRB(
+                          kGap20, _kSectionGap, kGap20, kGap16),
+                      child: Column(
+                        children: [
+                          if (_cameFromImportedMode &&
+                              _searchController.text.isNotEmpty) ...[
+                            _buildReturnToImportedBar(),
+                            const SizedBox(height: _kSectionGap),
+                          ],
+                          _buildFilterChips(),
+                          const SizedBox(height: _kSectionGap),
+                          SizedBox(
+                            height: yearHeight,
+                            child: _buildYearDistribution(),
                           ),
-                        ),
+                          const SizedBox(height: _kSectionGap),
+                          Expanded(
+                            child: GlassPanel(
+                              key: const ValueKey('region-table'),
+                              sigma: 0, // 任务④：结果表为常驻大面板，模糊不可见 → 关闭
+
+                              // 对齐示意图：结果面板表头带与面板顶沿齐平（示意图 y462 面板顶=表头带顶）
+                              padding: EdgeInsets.zero,
+                              radius: GlassTheme.rXl,
+                              child: Column(
+                                children: [
+                                  _buildResultHeader(),
+                                  Expanded(
+                                    child: RepaintBoundary(
+                                      child: _buildResultList(),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
-                    ],
-                  ),
+                    );
+                  },
                 ),
         ),
       ],
@@ -3901,107 +4414,139 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
             color: GlassTheme.accent.withValues(alpha: 0.25),
           ),
         ),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: [
-            // 分类 + 词性：单行横向排列
-            const Text(
-              '分类：',
-              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500),
-            ),
-            const SizedBox(width: kGap8),
-            Container(
-              padding: const EdgeInsets.symmetric(
-                horizontal: 14,
-                vertical: 4,
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            // 窄窗口（如最小 900×600 且右侧原文面板打开）时释义改为第二行居中，
+            // 避免释义被挤成单字换行。
+            final bool compact = constraints.maxWidth < 560;
+            final List<Widget> head = [
+              // 分类 + 词性：单行横向排列
+              const Text(
+                '分类：',
+                style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500),
               ),
-              decoration: BoxDecoration(
-                color: chipColor,
-                borderRadius: BorderRadius.circular(5),
-              ),
-              child: Text(
-                chipLabel,
-                style: const TextStyle(
-                  fontSize: 12,
-                  color: Colors.white,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ),
-            if (!isExtend && !isStandard) ...[
-              const SizedBox(width: kGap10),
-              GlassPressable(radius: GlassTheme.rMd, hoverColor: GlassTheme.accentSoft, pressColor: const Color(0x294462F2), enabled: true, child: InkWell(
-                onTap: () => _showExtendWordDialog(),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 4,
-                  ),
-                  decoration: BoxDecoration(
-                    color: AppTheme.green.withValues(alpha: 0.08),
-                    borderRadius: BorderRadius.circular(GlassTheme.rMd),
-                    border: Border.all(
-                      color: AppTheme.green.withValues(alpha: 0.3),
-                    ),
-                  ),
-                  child: const Text(
-                    '+ 拓展词',
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: AppTheme.green,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
-              )),
-            ],
-            if (isStandard || _wordPos.isNotEmpty) ...[
-              const SizedBox(width: kGap16),
-              // 词性
-              Text.rich(
-                TextSpan(
-                  children: [
-                    const TextSpan(
-                      text: '词性：',
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                    TextSpan(
-                      text: _wordPos.isEmpty ? '?' : _wordPos,
-                      style: const TextStyle(
-                        fontSize: 13,
-                        color: GlassTheme.accentInk,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-            if (_wordDef.isNotEmpty) ...[
-              const SizedBox(width: kGap16),
+              const SizedBox(width: kGap8),
               Container(
-                width: 1,
-                height: 20,
-                color: GlassTheme.accent.withValues(alpha: 0.15),
-              ),
-              const SizedBox(width: kGap16),
-              Flexible(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 4,
+                ),
+                decoration: BoxDecoration(
+                  color: chipColor,
+                  borderRadius: BorderRadius.circular(5),
+                ),
                 child: Text(
-                  _wordDef,
-                  textAlign: TextAlign.center,
+                  chipLabel,
                   style: const TextStyle(
-                    fontSize: 14,
-                    color: GlassTheme.accentInk,
+                    fontSize: 12,
+                    color: Colors.white,
                     fontWeight: FontWeight.w600,
                   ),
                 ),
               ),
-            ],
-          ],
+              if (!isExtend && !isStandard) ...[
+                const SizedBox(width: kGap10),
+                GlassPressable(radius: GlassTheme.rMd, hoverColor: GlassTheme.accentSoft, pressColor: const Color(0x294462F2), enabled: true, child: InkWell(
+                  onTap: () => _showExtendWordDialog(),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: AppTheme.green.withValues(alpha: 0.08),
+                      borderRadius: BorderRadius.circular(GlassTheme.rMd),
+                      border: Border.all(
+                        color: AppTheme.green.withValues(alpha: 0.3),
+                      ),
+                    ),
+                    child: const Text(
+                      '+ 拓展词',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: AppTheme.green,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                )),
+              ],
+              if (isStandard || _wordPos.isNotEmpty) ...[
+                const SizedBox(width: kGap16),
+                // 词性
+                Text.rich(
+                  TextSpan(
+                    children: [
+                      const TextSpan(
+                        text: '词性：',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                      TextSpan(
+                        text: _wordPos.isEmpty ? '?' : _wordPos,
+                        style: const TextStyle(
+                          fontSize: 13,
+                          color: GlassTheme.accentInk,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ];
+            const defStyle = TextStyle(
+              fontSize: 14,
+              color: GlassTheme.accentInk,
+              fontWeight: FontWeight.w600,
+            );
+            if (compact) {
+              return Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Wrap(
+                    alignment: WrapAlignment.center,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    runSpacing: 4,
+                    children: head,
+                  ),
+                  if (_wordDef.isNotEmpty) ...[
+                    const SizedBox(height: 6),
+                    Text(
+                      _wordDef,
+                      textAlign: TextAlign.center,
+                      style: defStyle,
+                    ),
+                  ],
+                ],
+              );
+            }
+            return Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                ...head,
+                if (_wordDef.isNotEmpty) ...[
+                  const SizedBox(width: kGap16),
+                  Container(
+                    width: 1,
+                    height: 20,
+                    color: GlassTheme.accent.withValues(alpha: 0.15),
+                  ),
+                  const SizedBox(width: kGap16),
+                  Flexible(
+                    child: Text(
+                      _wordDef,
+                      textAlign: TextAlign.center,
+                      style: defStyle,
+                    ),
+                  ),
+                ],
+              ],
+            );
+          },
         ),
       ),
     );
@@ -4017,7 +4562,176 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
     );
   }
 
-  /// 将导入的原文导出为 txt / doc / docx / pdf，按分类颜色高亮标注单词（纯 Dart 实现，无 Python 依赖）
+  /// 导出检测结果前的「单词标注方案」选择弹窗（返回 null 表示用户取消）。
+  ///
+  /// 沿用「选择导出格式」同一套玻璃弹窗骨架与紧凑选项块，不新增并行入口：
+  /// - 方案一：按单词类型标不同颜色（既有导出）；
+  /// - 方案二：按单词类型用字体与格式区分（Times New Roman / 下划线 /
+  ///   波浪下划线 / 加粗），一眼可分辨类型。
+  Future<ExportAnnotateScheme?> _promptAnnotateScheme() {
+    return showDialog<ExportAnnotateScheme>(
+      context: context,
+      builder: (dctx) {
+        var picked = ExportAnnotateScheme.color;
+        return _glassDialog(
+          StatefulBuilder(
+            builder: (ctx, setDialogState) => EswDialogShell(
+              title: '选择单词标注方案',
+              subtitle: '导出时按所选方案标注原文中的单词：',
+              icon: Icons.text_fields,
+              minContent: 340,
+              body: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  EswOptionRow(
+                    children: [
+                      EswOptionTile(
+                        label: '方案一',
+                        desc: '不同颜色',
+                        selected: picked == ExportAnnotateScheme.color,
+                        onTap: () => setDialogState(
+                          () => picked = ExportAnnotateScheme.color,
+                        ),
+                      ),
+                      EswOptionTile(
+                        label: '方案二',
+                        desc: '字体与格式',
+                        selected: picked == ExportAnnotateScheme.typography,
+                        onTap: () => setDialogState(
+                          () => picked = ExportAnnotateScheme.typography,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: kGap8),
+                  EswDialogHint(
+                    picked == ExportAnnotateScheme.color
+                        ? '方案一：按类型着色——初中课标词黑色、必修课标词深蓝、'
+                            '选修课标词浅蓝、拓展词深绿、超标词红色、专有词紫色，'
+                            '不加粗。'
+                        : '方案二（黑白打印）：课标词默认不标注；拓展词 加粗；'
+                            '超标词 单线下划线；专有词 30% 灰底纹；'
+                            '全文西文统一 Times New Roman。',
+                    icon: Icons.info_outline,
+                  ),
+                ],
+              ),
+              actions: EswDialogActions(
+                children: [
+                  EswDialogTextAction(
+                    label: '取消',
+                    onPressed: () => Navigator.pop(dctx),
+                  ),
+                  EswDialogPrimaryAction(
+                    label: '下一步',
+                    onPressed: () => Navigator.pop(dctx, picked),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// 导出格式选择（docx / pdf）。返回 null 表示用户取消。
+  ///
+  /// 先定格式再打保存对话框：保存框里只保留所选类型，建议文件名后缀与格式
+  /// 始终一致，避免原生对话框切换类型时文件名后缀不跟随的问题。
+  Future<String?> _promptExportFormat() {
+    return showDialog<String>(
+      context: context,
+      builder: (dctx) {
+        var picked = 'docx';
+        return _glassDialog(
+          StatefulBuilder(
+            builder: (ctx, setDialogState) => EswDialogShell(
+              title: '选择导出格式',
+              subtitle: 'Word 可保留原文档排版；PDF 适合直接打印或分享。',
+              icon: Icons.save_alt_rounded,
+              minContent: 340,
+              body: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  EswOptionRow(
+                    children: [
+                      EswOptionTile(
+                        label: 'Word 文档',
+                        desc: '*.docx',
+                        selected: picked == 'docx',
+                        onTap: () => setDialogState(() => picked = 'docx'),
+                      ),
+                      EswOptionTile(
+                        label: 'PDF 文档',
+                        desc: '*.pdf',
+                        selected: picked == 'pdf',
+                        onTap: () => setDialogState(() => picked = 'pdf'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: kGap8),
+                  const EswDialogHint(
+                    '选择后进入保存对话框，文件名后缀会与所选格式保持一致。',
+                    icon: Icons.info_outline,
+                  ),
+                ],
+              ),
+              actions: EswDialogActions(
+                children: [
+                  EswDialogTextAction(
+                    label: '取消',
+                    onPressed: () => Navigator.pop(dctx),
+                  ),
+                  EswDialogPrimaryAction(
+                    label: '下一步',
+                    onPressed: () => Navigator.pop(dctx, picked),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// 导出前置拦截：存在未筛选词时禁止导出，引导用户先去筛选列归类。
+  ///
+  /// 方案一 / 方案二共用同一导出入口，因此两套方案都会被拦下。
+  Future<void> _promptUnfilteredBeforeExport(int count) async {
+    if (!mounted) return;
+    final go = await showDialog<bool>(
+      context: context,
+      builder: (dctx) => _glassDialog(
+        EswDialogShell(
+          title: '还有未筛选的词',
+          subtitle: '当前检测结果中仍有 $count 个未筛选的词。未筛选词不参与导出标注，'
+              '请先在筛选列把它们归类到课标词 / 拓展词 / 超标词 / 专有词，'
+              '全部归类完成后再导出。',
+          icon: Icons.filter_alt_off,
+          body: const SizedBox.shrink(),
+          actions: EswDialogActions(
+            children: [
+              EswDialogTextAction(
+                label: '取消',
+                onPressed: () => Navigator.pop(dctx, false),
+              ),
+              EswDialogPrimaryAction(
+                label: '去筛选',
+                onPressed: () => Navigator.pop(dctx, true),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (go == true && mounted) {
+      setState(() => _importedActiveFilter = '未筛选');
+    }
+  }
+
+  /// 将导入的原文导出为 docx / pdf，按所选方案标注单词（纯 Dart 实现，无 Python 依赖）
   Future<void> _exportResultToWord() async {
     // 文档检测模式优先：已导入文档并完成检测时，导出文档检测结果
     if (_inImportedMode && _importedWords.isNotEmpty) {
@@ -4034,63 +4748,95 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
       ).showSnackBar(const SnackBar(content: Text('请先导入文本并完成检测后再导出')));
       return;
     }
-    // 不再弹窗选格式：直接在系统保存对话框中列出全部格式，
-    // 用户选择什么保存类型，文件名后缀就保持为该类型后缀。
-    // （file_selector 的 Windows 实现不会自动把建议名后缀改成所选类型，
-    // 必须由应用层依据 activeFilter 校准，保证“选什么格式、后缀就是什么”。）
-    String? outPath;
-    // 自动化取证钩子：ESW_AUTO_OUT 指定输出路径时跳过系统保存对话框，
-    // 其余导出流程与生产完全一致；未设置该变量时零影响。
+    // 前置拦截：仍有未筛选词时禁止导出（两套标注方案同一入口，均被拦下）。
+    // 未筛选词在导出中不再标注，必须先人工归类到课标 / 拓展 / 超标 / 专有。
+    final unfilteredCount = _importedFilterCounts['未筛选'] ?? 0;
+    if (unfilteredCount > 0) {
+      // 自动化取证（ESW_AUTO_OUT）下不弹窗阻塞，直接终止导出
+      final autoOut = Platform.environment['ESW_AUTO_OUT'];
+      if (autoOut == null || autoOut.isEmpty) {
+        await _promptUnfilteredBeforeExport(unfilteredCount);
+      }
+      return;
+    }
+    // 单词标注方案：导出前弹窗让用户二选一（方案一配色 / 方案二字体格式）。
+    // 复用「选择导出格式」同一套弹窗骨架与选项块（EswDialogShell + EswOptionRow），
+    // 不另设并行入口；用户取消则不导出。
+    final autoScheme = Platform.environment['ESW_AUTO_ANNOTATE'];
+    final autoOut = Platform.environment['ESW_AUTO_OUT'];
+    ExportAnnotateScheme? scheme;
+    if (autoScheme == 'color') {
+      scheme = ExportAnnotateScheme.color;
+    } else if (autoScheme == 'typography') {
+      scheme = ExportAnnotateScheme.typography;
+    } else if (autoOut != null && autoOut.isNotEmpty) {
+      // 自动化取证（ESW_AUTO_OUT 已指定输出路径）沿用既有方案一，不弹窗阻塞。
+      scheme = ExportAnnotateScheme.color;
+    } else {
+      scheme = await _promptAnnotateScheme();
+    }
+    if (scheme == null || !mounted) return;
+    // 先选格式再保存：保存对话框只列所选类型，建议文件名后缀与格式一致，
+    // 从根上避免「选了 PDF 但文件名仍是 .docx」的问题。
+    // 自动化取证钩子：ESW_AUTO_OUT 指定输出路径时跳过两个选择弹窗。
     final autoOutPath = Platform.environment['ESW_AUTO_OUT'];
+    String chosenExt;
+    if (autoOutPath != null && autoOutPath.isNotEmpty) {
+      chosenExt =
+          p.extension(autoOutPath).toLowerCase() == '.pdf' ? 'pdf' : 'docx';
+    } else {
+      final picked = await _promptExportFormat();
+      if (picked == null || !mounted) return;
+      chosenExt = picked;
+    }
+    String? outPath;
     if (autoOutPath != null && autoOutPath.isNotEmpty) {
       outPath = autoOutPath;
     } else {
-    try {
-      // 默认文件名：被检测文档名（去扩展名）+ 课标词检测 + .docx（默认类型组）
-      String defaultName = 'ESW_分析结果.docx';
-      if (_importedFileName != null && _importedFileName!.isNotEmpty) {
-        final dotIdx = _importedFileName!.lastIndexOf('.');
-        final baseName = dotIdx > 0
-            ? _importedFileName!.substring(0, dotIdx)
-            : _importedFileName!;
-        defaultName = '$baseName课标词检测.docx';
-      }
-      final fs.FileSaveLocation? result = await fs.getSaveLocation(
-        suggestedName: defaultName,
-        acceptedTypeGroups: const [
-          fs.XTypeGroup(label: 'Word 文档 (*.docx)', extensions: ['docx']),
-          fs.XTypeGroup(label: '文本文件 (*.txt)', extensions: ['txt']),
-          fs.XTypeGroup(label: 'Word 97-2003 文档 (*.doc)', extensions: ['doc']),
-          fs.XTypeGroup(label: 'PDF 文档 (*.pdf)', extensions: ['pdf']),
-        ],
-        initialDirectory: _lastExportPath,
-      );
-      // 原生保存对话框关闭后立刻整窗重绘，避免顶栏残留对话框投影形成条带
-      WinWindowRepaint.burst();
-      if (result == null) return; // 用户取消保存
-      // 用户实际选择的格式以后缀校准为准：保存对话框可能保留建议名原后缀
-      // 或返回无后缀/其他后缀文件名，统一替换成所选类型的后缀。
-      final exts = result.activeFilter?.extensions;
-      final selectedExt = (exts != null && exts.isNotEmpty)
-          ? exts.first.toLowerCase()
-          : null;
-      outPath = result.path;
-      if (selectedExt != null) {
-        final curExt = p.extension(outPath).toLowerCase();
-        if (curExt.isEmpty) {
-          outPath = '$outPath.$selectedExt';
-        } else if (curExt != '.$selectedExt') {
-          outPath = '${outPath.substring(0, outPath.length - curExt.length)}.$selectedExt';
+      try {
+        String baseName = 'ESW_分析结果';
+        if (_importedFileName != null && _importedFileName!.isNotEmpty) {
+          final dotIdx = _importedFileName!.lastIndexOf('.');
+          baseName = dotIdx > 0
+              ? _importedFileName!.substring(0, dotIdx)
+              : _importedFileName!;
         }
+        final fs.FileSaveLocation? result = await fs.getSaveLocation(
+          suggestedName: '$baseName课标词检测.$chosenExt',
+          acceptedTypeGroups: [
+            if (chosenExt == 'pdf')
+              const fs.XTypeGroup(
+                label: 'PDF 文档 (*.pdf)',
+                extensions: ['pdf'],
+              )
+            else
+              const fs.XTypeGroup(
+                label: 'Word 文档 (*.docx)',
+                extensions: ['docx'],
+              ),
+          ],
+          initialDirectory: _lastExportPath,
+        );
+        // 原生保存对话框关闭后立刻整窗重绘，避免顶栏残留对话框投影形成条带
+        WinWindowRepaint.burst();
+        if (result == null) return; // 用户取消保存
+        outPath = result.path;
+        // 后缀强制与所选格式一致（用户可能在保存框里手动改过名字/后缀）
+        final curExt = p.extension(outPath).toLowerCase();
+        final wantExt = '.$chosenExt';
+        if (curExt != wantExt) {
+          outPath = curExt.isEmpty
+              ? '$outPath$wantExt'
+              : '${outPath.substring(0, outPath.length - curExt.length)}$wantExt';
+        }
+      } catch (e) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('选择保存路径失败: $e')));
+        WinWindowRepaint.burst();
+        return;
       }
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('选择保存路径失败: $e')));
-      WinWindowRepaint.burst();
-      return;
-    }
     }
     // 原文文本：文档检测模式下输入框即为当前导入文档全文，直接取输入框；
     // 仅当从文档检测进入单词查词模式（_inImportedMode=false 且已保存返回现场）时
@@ -4109,14 +4855,29 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
     final setExportStage = exportProgress.setStage;
 
     try {
-      // 构建 小写单词 -> 分类 映射
+      // 构建 小写单词 -> 导出标注分类 映射（双端口径唯一真源）
+      //
+      // - 课标词按课标级别细分为「初中课标词 / 必修课标词 / 选修课标词」：
+      //   与汇总统计（[_standardCategoryCounts]）、标注说明（七类图例）逐类对齐，
+      //   统计分三类则正文也必须分三类着色，否则图例宣称的颜色在正文里查无对应；
+      // - 「未筛选」在真题语料出现过 → 「真题词」（叠加维度，不参与配色），
+      //   否则 → 「未筛选」（土红色），与筛选列的类别定义完全一致；
+      // - 手动归入拓展 / 超标 / 专有的词仍按实际类别着色。
       final wordCatMap = <String, String>{};
       for (final iw in _importedWords) {
-        // 导出标注口径保持原样：语料出现过、四库均不收录的词在导出原文里仍按
-        // 「真题词」处理（不参与配色标注），避免筛选列改动顺带把这类词染成
-        // 未筛选土红色。未归类词若已被手动归入拓展/超标/专有，仍按实际类别着色。
-        wordCatMap[iw.word.toLowerCase()] =
-            (iw.category == '未筛选' && iw.isInCorpus) ? '真题词' : iw.category;
+        final lower = iw.word.toLowerCase();
+        var level = '';
+        if (iw.category == '课标词') {
+          final keys = _standardWordsLower[lower];
+          if (keys != null && keys.isNotEmpty) {
+            level = _standardWords[keys.first]?['category'] ?? '';
+          }
+        }
+        wordCatMap[lower] = exportAnnotateCategoryOfDetected(
+          category: iw.category,
+          standardLevel: level,
+          isInCorpus: iw.isInCorpus,
+        );
       }
       // 换机首次导出：本地可能尚未部署词典库（无 ecdict.db），
       // 先确保部署到位，否则本次导出的释义列为空。已部署时仅做存在性/版本判断。
@@ -4127,41 +4888,22 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
       final exportData = await _buildExportTableData(originalText);
       final ext = p.extension(outPath).toLowerCase();
       final formatLabel = switch (ext) {
-        '.txt' => 'TXT 文本',
-        '.doc' => 'Word 97 文档',
         '.pdf' => 'PDF 文档',
         _ => 'Word(docx) 文档',
       };
       await setExportStage('正在生成$formatLabel并写入文件…');
-      if (ext == '.txt') {
-        await _writeResultTxt(
-          outPath,
-          originalText: originalText,
-          wordCatMap: wordCatMap,
-          fileName: _importedFileName ?? '',
-          exportData: exportData,
-        );
-      } else if (ext == '.doc') {
-        // .doc 导出：生成真正的 Word 97 兼容 RTF 文档（Word/WPS 打开即标准文档，
-        // 保留中文字体宋体与着色加粗标注，不再输出 Consolas 等宽 HTML 伪 .doc）。
-        await _writeResultDocRtf(
-          outPath,
-          originalText: originalText,
-          wordCatMap: wordCatMap,
-          fileName: _importedFileName ?? '',
-          exportData: exportData,
-        );
-      } else if (ext == '.pdf') {
+      if (ext == '.pdf') {
         await _writeResultPdf(
           outPath,
           originalText: originalText,
           wordCatMap: wordCatMap,
           fileName: _importedFileName ?? '',
           exportData: exportData,
+          scheme: scheme,
         );
       } else {
         // .docx 导出：若源文件是 docx，走“原地标注”保留原排版格式；
-        // 否则（txt/doc/pdf 或粘贴文本）退回重新生成模式
+        // 否则（pdf 或粘贴文本）退回重新生成模式
         final srcPath = _importedFilePath;
         final srcExt =
             srcPath != null ? p.extension(srcPath).toLowerCase() : '';
@@ -4174,9 +4916,10 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
             wordCatMap: wordCatMap,
             fileName: _importedFileName ?? '',
             exportData: exportData,
+            scheme: scheme,
           );
         } else {
-          // .doc / .pdf / 粘贴文本等非 docx 源：统一重新生成 Word 标注文档（.docx）。
+          // .pdf / 粘贴文本等非 docx 源：统一重新生成 Word 标注文档（.docx）。
           // 不再弹出"无法原位保留原排版"提示——生成新 docx 即为预期导出行为，
           // 原排版保留仅对 .docx 源文件生效（走上方 _writeResultDocxInplace）。
           await _writeResultDocx(
@@ -4185,6 +4928,7 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
             wordCatMap: wordCatMap,
             fileName: _importedFileName ?? '',
             exportData: exportData,
+            scheme: scheme,
           );
         }
       }
@@ -4195,7 +4939,8 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text('已导出分析结果到：$outPath')));
-    } catch (e) {
+    } catch (e, st) {
+      _debugLog('[Export] fail: $e\n$st');
       if (!mounted) return;
       ScaffoldMessenger.of(
         context,
@@ -4285,7 +5030,8 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text('已导出 $word 例句汇总到：$outPath')));
-    } catch (e) {
+    } catch (e, st) {
+      _debugLog('[Export] fail: $e\n$st');
       if (!mounted) return;
       ScaffoldMessenger.of(
         context,
@@ -4730,11 +5476,6 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
         standardCategoryCounts: _standardCategoryCounts(),
       );
 
-  /// 生成统一的统计汇总行（纯文本，以竖线分隔，供 txt 等无色格式使用）。
-  String _buildExportSummaryLine() => _buildExportSummaryItems()
-      .map((e) => '${e.label}: ${e.value}')
-      .join(' | ');
-
   /// 生成 DOCX 汇总段：条目按设计图着色，段间以竖线分隔，不设高亮底色。
   String _docxSummaryParagraph() {
     final items = _buildExportSummaryItems();
@@ -4755,15 +5496,20 @@ class _MainWindowState extends State<MainWindow> with WindowListener {
     required Map<String, String> wordCatMap,
     required String fileName,
     required _ExportTableData exportData,
+    required ExportAnnotateScheme scheme,
   }) async {
     final bodyParts = <String>[];
     bodyParts.add(_docxParagraph('ESW 课标词检测导出', bold: true));
     bodyParts.add(_docxParagraph('文件名: $fileName'));
-    bodyParts.add(_docxSummaryParagraph());
+    // 标注说明只保留一份：方案一用彩色统计行；方案二用带样式的图例行。
     bodyParts.add(_docxParagraph('【标注说明】', bold: true));
-    bodyParts.add(_docxAnnotateLegendParagraph());
+    if (scheme == ExportAnnotateScheme.color) {
+      bodyParts.add(_docxSummaryParagraph());
+    } else {
+      bodyParts.add(_docxAnnotateLegendParagraph(scheme));
+    }
     bodyParts.add(_docxParagraph('带标注全文', bold: true));
-    bodyParts.add(_docxAnnotatedParagraph(originalText, wordCatMap));
+    bodyParts.add(_docxAnnotatedParagraph(originalText, wordCatMap, scheme));
     bodyParts.addAll(_buildDocxDetailParagraphs(exportData));
     final documentXml =
         '''
@@ -4880,31 +5626,54 @@ ${bodyParts.join('\n')}
     return bodyParts;
   }
 
-  /// 构建 DOCX 正文前汇总段（原地标注用）：标题 + 文件名 + 统计 + 标注说明。
+  /// 构建 DOCX 正文前汇总段（原地标注用）：标题 + 文件名 + 标注说明。
+  ///
+  /// 标注说明只保留一份：方案一用彩色统计行；方案二用带样式的图例行。
   List<String> _buildDocxPreambleParagraphs({
     required String fileName,
     required _ExportTableData exportData,
+    required ExportAnnotateScheme scheme,
   }) {
     return [
       _docxParagraph('ESW 课标词检测导出', bold: true),
       _docxParagraph('文件名: $fileName'),
-      _docxSummaryParagraph(),
       _docxParagraph('【标注说明】', bold: true),
-      _docxAnnotateLegendParagraph(),
+      if (scheme == ExportAnnotateScheme.color)
+        _docxSummaryParagraph()
+      else
+        _docxAnnotateLegendParagraph(scheme),
     ];
   }
 
-  /// 生成 DOCX 标注说明段：七类逐类以规范色 + 字重呈现，末尾跟该类统计词数。
-  String _docxAnnotateLegendParagraph() {
-    final segments = exportAnnotateLegendSegments(_buildExportSummaryItems());
+  /// 生成 DOCX 标注说明段（方案二）：逐项呈现全部统计条目——
+  /// 总数类（全套词词数 / 去重总词数 / 真题词 / 其他）以「名称: 数值」中性黑输出，
+  /// 七类词以「名称（n 词）」并按方案二样式（加粗 / 单线 / 灰底纹）呈现。
+  /// 不遗漏项目，也不与方案一的彩色统计行同时出现。
+  String _docxAnnotateLegendParagraph(ExportAnnotateScheme scheme) {
+    final items = _buildExportSummaryItems();
     final runs = <String>[];
-    for (var i = 0; i < segments.length; i++) {
-      final seg = segments[i];
-      if (i > 0) runs.add(_docxRun('；', ExportSummaryItem.black));
-      runs.add(
-        _docxRun('${seg.label}（${seg.count} 词）', seg.colorHex,
-            bold: seg.bold),
-      );
+    for (var i = 0; i < items.length; i++) {
+      final item = items[i];
+      if (i > 0) runs.add(_docxRun(' | ', ExportSummaryItem.black));
+      if (!ExportCategory.all.contains(item.label)) {
+        // 总数类 / 真题词 / 其他：中性黑、不加样式
+        runs.add(_docxRun('${item.label}: ${item.value}', ExportSummaryItem.black));
+        continue;
+      }
+      final text = '${item.label}（${item.value} 词）';
+      if (scheme == ExportAnnotateScheme.typography) {
+        final style = exportScheme2StyleOf(item.label);
+        runs.add(docxRunXml(
+          text,
+          ExportSummaryItem.black,
+          fontName: kExportTypographyFont,
+          bold: style?.bold ?? false,
+          underline: style?.underline,
+          shadeFill: style?.shadeFill,
+        ));
+      } else {
+        runs.add(_docxRun(text, item.colorHex));
+      }
     }
     return '<w:p>${runs.join('')}</w:p>';
   }
@@ -4928,11 +5697,13 @@ ${bodyParts.join('\n')}
     required Map<String, String> wordCatMap,
     required String fileName,
     required _ExportTableData exportData,
+    required ExportAnnotateScheme scheme,
   }) async {
     final srcBytes = await File(srcPath).readAsBytes();
     final preamble = _buildDocxPreambleParagraphs(
       fileName: fileName,
       exportData: exportData,
+      scheme: scheme,
     );
     final appendix = _buildDocxAppendixParagraphs(
       exportData: exportData,
@@ -4947,6 +5718,9 @@ ${bodyParts.join('\n')}
             catByLower: wordCatMap,
             preambleParagraphsXml: preamble,
             appendixParagraphsXml: appendix,
+            scheme: scheme,
+            colorBold: false,
+            annotateUnfiltered: false,
           ));
     } else {
       bytes = annotateDocxBytes(
@@ -4954,6 +5728,9 @@ ${bodyParts.join('\n')}
         catByLower: wordCatMap,
         preambleParagraphsXml: preamble,
         appendixParagraphsXml: appendix,
+        scheme: scheme,
+        colorBold: false,
+        annotateUnfiltered: false,
       );
     }
     EswPerf.logFile('[export] annotateDocx ms=${swWrite.elapsedMilliseconds} '
@@ -5098,12 +5875,17 @@ ${bodyParts.join('\n')}
     return '<w:p>$runs</w:p>';
   }
 
-  /// 生成带标注全文的 DOCX 段落：规范七类的字色 + 字重着色，**不加底纹**。
+  /// 生成带标注全文的 DOCX 段落：按当前方案标注（配色 / 字体格式），**不加底纹**。
   ///
   /// 实现单点落地于 shared/export_annotate_markup.dart：DOCX 侧不再有任何
   /// w:shd / w:highlight 注入（底纹只有 PDF 导出使用）。
-  String _docxAnnotatedParagraph(String text, Map<String, String> catByLower) =>
-      docxAnnotatedParagraphXml(text, catByLower);
+  String _docxAnnotatedParagraph(
+    String text,
+    Map<String, String> catByLower,
+    ExportAnnotateScheme scheme,
+  ) =>
+      docxAnnotatedParagraphXml(text, catByLower,
+          scheme: scheme, colorBold: false, annotateUnfiltered: false);
 
   /// 生成单个 DOCX run（仅字色 + 可选加粗；无底纹/高亮参数，Word 导出不带底纹）。
   String _docxRun(String text, String color, {bool bold = false}) =>
@@ -5114,206 +5896,107 @@ ${bodyParts.join('\n')}
   String _docxParagraphWithBoldWords(String text, List<String> words) =>
       docxParagraphWithBoldWordsXml(text, words);
 
-  /// 导出为纯文本（txt）：标题 + 统计 + 标注说明 + 原文 + 拓展词明细。
-  Future<void> _writeResultTxt(
-    String path, {
-    required String originalText,
-    required Map<String, String> wordCatMap,
-    required String fileName,
-    required _ExportTableData exportData,
-  }) async {
-    final sb = StringBuffer();
-    sb.writeln('ESW 课标词检测导出');
-    sb.writeln('文件名: $fileName');
-    sb.writeln(_buildExportSummaryLine());
-    sb.writeln('【标注说明】');
-    sb.writeln(
-      '${exportAnnotateLegend()}（Word / PDF 导出按此逐词标注，并逐类给出统计词数）'
-      '本文本格式仅保留原文，不做颜色标注。',
-    );
-    sb.writeln('【带标注全文】');
-    sb.writeln(originalText);
-    sb.writeln('【拓展词明细】');
-    sb.writeln(_buildExtendDetailPlain(exportData.extend));
-    sb.writeln();
-    sb.writeln('【超标词】');
-    sb.writeln(_buildOverLimitPlain(exportData.overLimit));
-    await File(path).writeAsString(sb.toString(), encoding: utf8);
+
+
+  /// 用 WPS / Word 的 COM 接口把「已标注 docx」转成 PDF（对齐 Android 的 docx→PDF 流程）。
+  ///
+  /// 未安装可自动化办公套件、被安全策略拦截或转换超时则返回 false，
+  /// 由调用方回退到文本重排 PDF。
+  Future<bool> _convertDocxToPdf(String docxPath, String pdfPath) async {
+    const script = r'''
+$ErrorActionPreference = "Stop"
+$app = $null
+foreach ($prog in @("KWPS.Application", "Word.Application")) {
+  try { $app = New-Object -ComObject $prog; break } catch { }
+}
+if (-not $app) { exit 2 }
+try {
+  try { $app.Visible = $false } catch { }
+  try { $app.DisplayAlerts = 0 } catch { }
+  $doc = $app.Documents.Open($args[0], $false, $true)
+  $doc.ExportAsFixedFormat($args[1], 17)
+  $doc.Close(0)
+} finally {
+  try { $app.Quit() } catch { }
+}
+''';
+    Directory? tmpDir;
+    Process? proc;
+    try {
+      tmpDir = await Directory.systemTemp.createTemp('esw_pdf_conv_');
+      final scriptPath = '${tmpDir.path}\\convert.ps1';
+      await File(scriptPath).writeAsString(script, flush: true);
+      proc = await Process.start(
+        'powershell',
+        <String>[
+          '-NoProfile',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-WindowStyle',
+          'Hidden',
+          '-File',
+          scriptPath,
+          docxPath,
+          pdfPath,
+        ],
+      );
+      final code = await proc.exitCode.timeout(
+        const Duration(seconds: 90),
+        onTimeout: () {
+          proc?.kill();
+          return -1;
+        },
+      );
+      if (code != 0) return false;
+      final out = File(pdfPath);
+      return await out.exists() && await out.length() > 0;
+    } catch (_) {
+      return false;
+    } finally {
+      try {
+        await tmpDir?.delete(recursive: true);
+      } catch (_) {}
+    }
   }
 
-  /// 导出为 RTF 包装的 .doc（Word/WPS 可直接打开的标准 Word 97 兼容文档）：
-  /// 标题 + 统计 + 标注说明 + 带颜色全文 + 拓展词明细。全文为纯 ASCII，
-  /// 中文/特殊符号按 code unit 转义为 \uN?，写入采用 latin1 编码。
-  Future<void> _writeResultDocRtf(
-    String path, {
-    required String originalText,
-    required Map<String, String> wordCatMap,
-    required String fileName,
-    required _ExportTableData exportData,
-  }) async {
-    // 分类 -> RTF 颜色索引：0 为默认黑，1 起对应规范七类配色表
-    // （顺序即 ExportCategory.all：初中 / 必修 / 选修 / 拓展 / 超标 / 专有 / 未筛选）
-    int colorIdx(String cat) {
-      final idx = ExportCategory.all.indexOf(cat);
-      return idx < 0 ? 0 : idx + 1;
-    }
-
-    /// RTF 颜色表主体：0 号默认黑 + 规范七类色（索引与 colorIdx 严格对应）。
-    String colorTableLine() {
-      final buf = StringBuffer(r'\red0\green0\blue0;');
-      for (final hex in exportPaletteHex()) {
-        final h = hex.replaceAll('#', '').toUpperCase();
-        final r = int.parse(h.substring(0, 2), radix: 16);
-        final g = int.parse(h.substring(2, 4), radix: 16);
-        final b = int.parse(h.substring(4, 6), radix: 16);
-        buf.write('\\red$r\\green$g\\blue$b;');
-      }
-      return buf.toString();
-    }
-
-    // RTF 转义：保留字符 \ { } 转义；非 ASCII（中文/特殊符号）按 code unit
-    // 逐个转 \uN?（N 为十进制码点）；\t 转两空格、\r 转一空格，保证输出纯 ASCII。
-    String esc(String s) {
-      final sb = StringBuffer();
-      for (final c in s.codeUnits) {
-        if (c == 0x5C) {
-          sb.write('\\\\');
-        } else if (c == 0x7B) {
-          sb.write('\\{');
-        } else if (c == 0x7D) {
-          sb.write('\\}');
-        } else if (c == 0x09) {
-          sb.write('  ');
-        } else if (c == 0x0D) {
-          sb.write(' ');
-        } else if (c < 128) {
-          sb.writeCharCode(c);
-        } else {
-          sb.write('\\u$c?');
-        }
-      }
-      return sb.toString();
-    }
-
-    // 多行纯文本：换行转为 \par 段落分隔。
-    String multiPar(String s) => s.replaceAll('\n', '\\par ');
-
-    /// 汇总条目配色（十六进制）→ RTF 颜色索引：规范七类色取自同一颜色表，
-    /// 表外色（中性黑等）回落 0 号默认色。
-    int sumColorIdx(String hex) {
-      final h = hex.replaceAll('#', '').toUpperCase();
-      final idx = exportPaletteHex().indexOf(h);
-      return idx < 0 ? 0 : idx + 1;
-    }
-
-    /// 七类标注说明片段（逐类以规范色 + 字重着色，末尾跟该类统计词数）。
-    List<String> legendRtfSegments() {
-      final items = _buildExportSummaryItems();
-      int countOf(String label) {
-        for (final e in items) {
-          if (e.label == label) return e.value;
-        }
-        return 0;
-      }
-
-      final out = <String>[];
-      for (final label in ExportCategory.all) {
-        final idx = colorIdx(label);
-        final spec = exportWordStyleOf(label);
-        final text = esc('$label（${countOf(label)} 词）');
-        if (spec == null || idx == 0) {
-          out.add(text);
-        } else {
-          out.add(spec.bold ? '{\\cf$idx\\b $text}' : '{\\cf$idx $text}');
-        }
-      }
-      return out;
-    }
-
-    /// 汇总行 RTF：条目按设计图着色（0 值类别不输出），段间以竖线分隔。
-    String summaryRtf() {
-      final items = _buildExportSummaryItems();
-      final buf = StringBuffer();
-      for (var i = 0; i < items.length; i++) {
-        if (i > 0) buf.write(esc(' | '));
-        final text = esc('${items[i].label}: ${items[i].value}');
-        final idx = sumColorIdx(items[i].colorHex);
-        if (idx == 0) {
-          buf.write(text);
-        } else {
-          // 规范：初中 / 必修课标词与拓展词加粗，其余仅着色
-          buf.write(
-              items[i].bold ? '{\\cf$idx\\b $text}' : '{\\cf$idx $text}');
-        }
-      }
-      return buf.toString();
-    }
-
-    // 单行着色生成 RTF run（与 _writeResultDocHtml.oneLine 相同的分词着色逻辑）：
-    // 命中拓展词/超标词 -> {\cfN\b word}（着色加粗）；专有词 -> {\cfN word}（仅着色）；
-    // 课标词/真题词/未筛选/其他/未知 -> 普通文本。
-    String oneLineRtf(String line) {
-      final regex = RegExp(r'[a-zA-Z]+');
-      final runs = <String>[];
-      int lastEnd = 0;
-      for (final m in regex.allMatches(line)) {
-        final word = m.group(0)!;
-        final cat = wordCatMap[word.toLowerCase()];
-        final plain = line.substring(lastEnd, m.start);
-        if (plain.isNotEmpty) runs.add(esc(plain));
-        final spec = exportWordStyleOf(cat);
-        if (spec == null) {
-          // 真题词 / 其他 / 未知分类：不参与配色标注，保持默认黑
-          runs.add(esc(word));
-        } else {
-          final idx = colorIdx(cat!);
-          runs.add(spec.bold
-              ? '{\\cf$idx\\b ${esc(word)}}'
-              : '{\\cf$idx ${esc(word)}}');
-        }
-        lastEnd = m.end;
-      }
-      final tail = line.substring(lastEnd);
-      if (tail.isNotEmpty) runs.add(esc(tail));
-      return '${runs.join('')}\\par';
-    }
-
-    final sb = StringBuffer();
-    // 注意：\fonttbl 与 \colortbl 是目的控制字，必须用 {...} 成组包裹，
-    // 否则 WPS/Word 解析失败会把整份文档当作空文档打开。
-    sb.writeln(
-      '{\\rtf1\\ansi\\ansicpg936\\deff0'
-      '{\\fonttbl{\\f0\\fnil\\fcharset134 ${esc('宋体')};}}'
-      '{\\colortbl;${colorTableLine()}}',
-    );
-    sb.writeln('\\viewkind4\\uc1\\pard\\lang2052\\fs24');
-    sb.writeln('{\\b ${esc('ESW 课标词检测导出')}\\b0}\\par');
-    sb.writeln('${esc('文件名: $fileName')}\\par');
-    sb.writeln('${summaryRtf()}\\par');
-    sb.writeln('{\\b ${esc('【标注说明】')}\\b0}\\par');
-    // 七类标注说明：每类以规范色 + 字重着色，末尾跟该类统计词数
-    sb.writeln('${legendRtfSegments().join(esc('；'))}\\par');
-    for (final line in originalText.split('\n')) {
-      sb.writeln(oneLineRtf(line));
-    }
-    sb.writeln('\\page');
-    sb.writeln('{\\b ${esc('拓展词明细')}\\b0}\\par');
-    sb.writeln(multiPar(esc(_buildExtendDetailPlain(exportData.extend))));
-    sb.writeln('{\\b ${esc('超标词')}\\b0}\\par');
-    sb.writeln(multiPar(esc(_buildOverLimitPlain(exportData.overLimit))));
-    sb.write('}');
-    await File(path).writeAsString(sb.toString(), encoding: latin1);
-  }
-
-
-  /// 导出为 PDF：标题 + 统计 + 标注说明 + 带颜色全文 + 拓展词明细。
   Future<void> _writeResultPdf(
     String path, {
     required String originalText,
     required Map<String, String> wordCatMap,
     required String fileName,
     required _ExportTableData exportData,
+    required ExportAnnotateScheme scheme,
   }) async {
+    final typographyMode = scheme == ExportAnnotateScheme.typography;
+    // 与 DOCX 导出共用同一套标注逻辑（对齐 Android）：源文件是 docx 时，
+    // 先生成「已标注 docx」，再交给 WPS / Word 转 PDF，
+    // 从而完整保留原文档的段落、字体、表格与图片排版。
+    final srcDocx = _importedFilePath;
+    if (srcDocx != null &&
+        srcDocx.toLowerCase().endsWith('.docx') &&
+        File(srcDocx).existsSync()) {
+      Directory? tmpDir;
+      try {
+        tmpDir = await Directory.systemTemp.createTemp('esw_pdf_src_');
+        final tmpDocx = '${tmpDir.path}\\annotated.docx';
+        await _writeResultDocxInplace(
+          tmpDocx,
+          srcPath: srcDocx,
+          wordCatMap: wordCatMap,
+          fileName: fileName,
+          exportData: exportData,
+          scheme: scheme,
+        );
+        final ok = await _convertDocxToPdf(tmpDocx, path);
+        if (ok) return;
+      } catch (_) {
+        // 原生转换异常 → 回退到文本重排 PDF，保证导出仍可用
+      } finally {
+        try {
+          await tmpDir?.delete(recursive: true);
+        } catch (_) {}
+      }
+    }
     // 使用系统中文字体（优先黑体），缺失或加载失败时按候选回退，
     // 避免不同系统缺少字体导致导出报错。
     // 跨机器可运行性：字体目录由 %WINDIR% 推导（Windows 装在非 C 盘时同样有效），
@@ -5347,14 +6030,57 @@ ${bodyParts.join('\n')}
       throw Exception('未找到可用的中文字体（已尝试: ${fontCandidates.join(', ')}）');
     }
 
-    // 单行着色生成 RichText：七类规范字色 + 字重 + 极淡同色底纹（底纹仅 PDF 使用）。
+    // 方案二：全文单词统一 Times New Roman；拓展词用 Times New Roman Bold。
+    // 系统缺少字体时回退中文字体，加粗 / 线型 / 灰底纹语义不受影响。
+    pw.Font? loadLatinFont(String name) {
+      final fp = '$fontDir\\$name';
+      try {
+        if (!File(fp).existsSync()) return null;
+        final bytes = File(fp).readAsBytesSync();
+        return pw.Font.ttf(
+          ByteData.view(
+            bytes.buffer,
+            bytes.offsetInBytes,
+            bytes.lengthInBytes,
+          ),
+        );
+      } catch (_) {
+        return null;
+      }
+    }
+
+    final wordFont = typographyMode ? loadLatinFont('times.ttf') : null;
+    final boldFont = typographyMode ? loadLatinFont('timesbd.ttf') : null;
+
+    // 单行标注生成 RichText：方案一为规范字色 + 极淡同色底纹（不加粗，
+    // 底纹仅 PDF 使用）；方案二为 TNR + 加粗 / 单线 / 灰底纹。
     // 实现单点落地于 shared/export_annotate_markup.dart。
-    pw.Widget oneLine(String line) => pdfAnnotatedLine(line, wordCatMap, font!);
+    pw.Widget oneLine(String line) => pdfAnnotatedLine(
+          line,
+          wordCatMap,
+          font!,
+          scheme: scheme,
+          colorBold: false,
+          annotateUnfiltered: false,
+          // 方案一只靠字色区分：PDF 也不加底纹，避免与原文底色混淆。
+          annotateShade: false,
+          wordFont: wordFont,
+          boldFont: boldFont,
+        );
 
     /// 汇总行：条目按设计图着色（选修蓝 / 超标红 / 专有洋红 / 未筛选灰，其余黑）。
     pw.RichText summaryWidget() {
       final items = _buildExportSummaryItems();
       final spans = <pw.TextSpan>[];
+      pwpdf.PdfColor pdfHex(String hex) {
+        try {
+          return pwpdf.PdfColor.fromHex(hex);
+        } catch (e) {
+          _debugLog('[PdfColor] bad hex="$hex" ($e)');
+          return pwpdf.PdfColor.fromInt(0xFF000000);
+        }
+      }
+
       for (var i = 0; i < items.length; i++) {
         if (i > 0) {
           spans.add(pw.TextSpan(
@@ -5362,7 +6088,7 @@ ${bodyParts.join('\n')}
             style: pw.TextStyle(
               font: font,
               fontSize: 10,
-              color: pwpdf.PdfColor.fromHex('#$ExportSummaryItem.black'),
+              color: pdfHex('#${ExportSummaryItem.black}'),
             ),
           ));
         }
@@ -5371,9 +6097,7 @@ ${bodyParts.join('\n')}
           style: pw.TextStyle(
             font: font,
             fontSize: 10,
-            color: pwpdf.PdfColor.fromHex('#${items[i].colorHex}'),
-            fontWeight:
-                items[i].bold ? pw.FontWeight.bold : pw.FontWeight.normal,
+            color: pdfHex('#${items[i].colorHex}'),
           ),
         ));
       }
@@ -5386,25 +6110,58 @@ ${bodyParts.join('\n')}
       );
     }
 
-    /// 标注说明：七类逐类以规范色 + 字重着色，末尾跟该类统计词数。
+    /// 标注说明：逐项呈现全部统计条目——总数类（全套词词数 / 去重总词数 /
+    /// 真题词 / 其他）以「名称: 数值」中性黑输出，七类词以「名称（n 词）」
+    /// 并按所选方案的样式呈现（方案一配色；方案二加粗 / 单线 / 灰底纹）。
     pw.Widget legendWidget() {
-      final segments = exportAnnotateLegendSegments(_buildExportSummaryItems());
+      final items = _buildExportSummaryItems();
+      final black = pwpdf.PdfColor.fromInt(0xFF000000);
       final spans = <pw.TextSpan>[];
-      for (var i = 0; i < segments.length; i++) {
-        final seg = segments[i];
+      for (var i = 0; i < items.length; i++) {
+        final item = items[i];
         if (i > 0) {
           spans.add(pw.TextSpan(
-            text: '；',
+            text: ' | ',
             style: pw.TextStyle(font: font, fontSize: 10),
           ));
         }
+        final isCategory = ExportCategory.all.contains(item.label);
+        if (!isCategory) {
+          spans.add(pw.TextSpan(
+            text: '${item.label}: ${item.value}',
+            style: pw.TextStyle(font: font, fontSize: 10, color: black),
+          ));
+          continue;
+        }
+        if (typographyMode) {
+          final style = exportScheme2StyleOf(item.label);
+          spans.add(pw.TextSpan(
+            text: '${item.label}（${item.value} 词）',
+            style: pw.TextStyle(
+              font: wordFont ?? font,
+              fontSize: 10,
+              color: black,
+              decoration: style?.underline == null
+                  ? null
+                  : pw.TextDecoration.underline,
+              decorationStyle: pw.TextDecorationStyle.solid,
+              decorationColor: black,
+              background: style?.shadeFill == null
+                  ? null
+                  : pw.BoxDecoration(
+                      color: pwpdf.PdfColor.fromHex(style!.shadeFill!),
+                    ),
+            ),
+          ));
+          continue;
+        }
         spans.add(pw.TextSpan(
-          text: '${seg.label}（${seg.count} 词）',
+          text: '${item.label}（${item.value} 词）',
           style: pw.TextStyle(
             font: font,
             fontSize: 10,
-            color: pwpdf.PdfColor.fromHex('#${seg.colorHex}'),
-            fontWeight: seg.bold ? pw.FontWeight.bold : pw.FontWeight.normal,
+            color: pwpdf.PdfColor.fromHex('#${item.colorHex}'),
+            fontWeight: pw.FontWeight.normal,
           ),
         ));
       }
@@ -5415,6 +6172,19 @@ ${bodyParts.join('\n')}
         ),
         textDirection: pw.TextDirection.ltr,
       );
+    }
+
+    /// 纯文本明细逐行输出，保证长表也能跨页。
+    Iterable<pw.Widget> plainLines(String text, {double fontSize = 10}) sync* {
+      for (final line in text.split('\n')) {
+        yield pw.Padding(
+          padding: const pw.EdgeInsets.only(bottom: 1),
+          child: pw.Text(
+            line,
+            style: pw.TextStyle(font: font, fontSize: fontSize),
+          ),
+        );
+      }
     }
 
     final doc = pw.Document();
@@ -5432,45 +6202,34 @@ ${bodyParts.join('\n')}
               ),
             ),
             pw.Text('文件名: $fileName', style: pw.TextStyle(font: font, fontSize: 10)),
-            pw.Padding(
-              padding: const pw.EdgeInsets.only(top: 4, bottom: 8),
-              child: summaryWidget(),
-            ),
+            // 标注说明只保留一份：方案一用彩色统计行；方案二用带样式的图例行。
             pw.Text('【标注说明】', style: pw.TextStyle(font: font, fontSize: 11, fontWeight: pw.FontWeight.bold)),
-            pw.Padding(
-              padding: const pw.EdgeInsets.only(bottom: 6),
-              child: legendWidget(),
-            ),
+            if (scheme == ExportAnnotateScheme.color)
+              pw.Padding(
+                padding: const pw.EdgeInsets.only(top: 4, bottom: 8),
+                child: summaryWidget(),
+              )
+            else
+              pw.Padding(
+                padding: const pw.EdgeInsets.only(top: 4, bottom: 6),
+                child: legendWidget(),
+              ),
             pw.Text('【带标注全文】', style: pw.TextStyle(font: font, fontSize: 11, fontWeight: pw.FontWeight.bold)),
-            pw.Padding(
-              padding: const pw.EdgeInsets.only(top: 2, bottom: 8),
-              child: pw.Column(
-                crossAxisAlignment: pw.CrossAxisAlignment.start,
-                children: originalText.split('\n').map(oneLine).toList(),
-              ),
-            ),
+            pw.SizedBox(height: 2),
+            // 逐行输出：MultiPage 只能在顶层 widget 之间分页，
+            // 若整篇正文包在一个 Column 里，长文档会报 “Widget won't fit into the page”。
+            ...originalText.split('\n').map(
+                  (line) => pw.Padding(
+                    padding: const pw.EdgeInsets.only(bottom: 1),
+                    child: oneLine(line),
+                  ),
+                ),
+            pw.SizedBox(height: 8),
             pw.Text('【拓展词明细】', style: pw.TextStyle(font: font, fontSize: 11, fontWeight: pw.FontWeight.bold)),
-            pw.Padding(
-              padding: const pw.EdgeInsets.only(top: 4),
-              child: pw.Text(
-                _buildExtendDetailPlain(exportData.extend),
-                style: pw.TextStyle(font: font, fontSize: 9),
-              ),
-            ),
-            pw.Padding(
-              padding: const pw.EdgeInsets.only(top: 12),
-              child: pw.Text(
-                '【超标词】',
-                style: pw.TextStyle(font: font, fontSize: 11, fontWeight: pw.FontWeight.bold),
-              ),
-            ),
-            pw.Padding(
-              padding: const pw.EdgeInsets.only(top: 4),
-              child: pw.Text(
-                _buildOverLimitPlain(exportData.overLimit),
-                style: pw.TextStyle(font: font, fontSize: 10),
-              ),
-            ),
+            ...plainLines(_buildExtendDetailPlain(exportData.extend), fontSize: 9),
+            pw.SizedBox(height: 12),
+            pw.Text('【超标词】', style: pw.TextStyle(font: font, fontSize: 11, fontWeight: pw.FontWeight.bold)),
+            ...plainLines(_buildOverLimitPlain(exportData.overLimit)),
           ];
           return widgets;
         },
@@ -5484,34 +6243,55 @@ ${bodyParts.join('\n')}
   Widget _buildReturnToImportedBar() {
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: kGap16, vertical: kGap6),
-      decoration: const BoxDecoration(
-        border: Border(
-          bottom: BorderSide(color: GlassTheme.line, width: 1),
-        ),
-      ),
-      child: GlassPressable(radius: GlassTheme.rMd, hoverColor: const Color(0x0A18181B), pressColor: const Color(0x294462F2), enabled: true, child: InkWell(
-        onTap: _onReturnToImportedMode,
+      height: GlassTheme.dp(40),
+      decoration: BoxDecoration(
+        color: GlassTheme.accentSoft,
         borderRadius: BorderRadius.circular(GlassTheme.rMd),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: kGap8, vertical: kGap4),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: const [
-              Icon(Icons.arrow_back, size: 14, color: GlassTheme.accentInk),
-              SizedBox(width: kGap4),
-              Text(
-                '返回段落分析',
-                style: TextStyle(
-                  fontSize: 12,
+        border: Border.all(color: const Color(0x334462F2)),
+      ),
+      child: Material(
+        color: Colors.transparent,
+        child: InkWell(
+          onTap: _onReturnToImportedMode,
+          borderRadius: BorderRadius.circular(GlassTheme.rMd),
+          child: Padding(
+            padding: EdgeInsets.symmetric(
+                horizontal: GlassTheme.dp(kGap12)),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.keyboard_return_rounded,
+                  size: GlassTheme.dp(18),
                   color: GlassTheme.accentInk,
-                  fontWeight: FontWeight.w500,
                 ),
-              ),
-            ],
+                SizedBox(width: GlassTheme.dp(kGap8)),
+                Text(
+                  '返回段落分析',
+                  style: TextStyle(
+                    fontSize: GlassTheme.fBody,
+                    color: GlassTheme.accentInk,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const Spacer(),
+                Text(
+                  '回到原文段落',
+                  style: TextStyle(
+                    fontSize: GlassTheme.fSmall,
+                    color: GlassTheme.ink3,
+                  ),
+                ),
+                SizedBox(width: GlassTheme.dp(kGap4)),
+                Icon(
+                  Icons.chevron_right_rounded,
+                  size: GlassTheme.dp(16),
+                  color: GlassTheme.ink3,
+                ),
+              ],
+            ),
           ),
         ),
-      )),
+      ),
     );
   }
 
@@ -5551,6 +6331,8 @@ ${bodyParts.join('\n')}
       _searchController.text = _savedImportedText;
       _inImportedMode = true;
       _cameFromImportedMode = false;
+      _corpusFocusPath = null;
+      _textbookFocusPath = null;
       _importedWords = _savedImportedWords;
       _importedActiveFilter = _savedImportedActiveFilter;
       _importedTotalWords = _savedImportedTotalWords;
@@ -5567,6 +6349,8 @@ ${bodyParts.join('\n')}
       _selectedYear = null;
       _filteredResults = [];
     });
+    // 返回导入分析：右侧面板同步展示被检测文本
+    _showDetectedTextInRightReader();
   }
 
   /// 纯数据层：更新_importedWords / _savedImportedWords / 计数，不调用 setState
@@ -5615,7 +6399,7 @@ ${bodyParts.join('\n')}
       children: [
         _buildImportedFilterChips(),
         Container(height: 1, color: GlassTheme.line),
-        Expanded(child: _buildImportedWordList()),
+        Expanded(child: RepaintBoundary(child: _buildImportedWordList())),
       ],
     );
   }
@@ -5809,251 +6593,104 @@ ${bodyParts.join('\n')}
       itemCount: filtered.length,
       itemBuilder: (context, index) {
         final iw = filtered[index];
-        final color = _filterColors[iw.category]!;
-        // 真题词列为叠加列：词库类别（课标/拓展/超标/专有）的词在语料中出现过时
-        // 也会进入本列，此时只展示归属标签与频次，不出现筛选/移出入口
-        final isZhentiColumn = _importedActiveFilter == '真题词';
-        final isUnfilteredColumn = _importedActiveFilter == '未筛选';
-        final isChaoGang = iw.category == '超标词' && !isZhentiColumn;
-        final isExtraCorpus = iw.category == '专有词' && !isZhentiColumn;
-        // 未归入任何词库的词（含语料中出现过的）：在未筛选列提供手动归类入口
-        final isUnclassified =
-            iw.category == '未筛选' || iw.category == '真题词';
-        return Container(
-          margin: const EdgeInsets.symmetric(horizontal: kGap8, vertical: kGap1),
-          decoration: BoxDecoration(
-            color: index.isEven
-                ? const Color(0x0A18181B)
-                : GlassTheme.panel,
-            borderRadius: BorderRadius.circular(6),
-          ),
-          child: GlassPressable(radius: GlassTheme.rMd, hoverColor: const Color(0x0A18181B), pressColor: const Color(0x294462F2), enabled: true, child: InkWell(
-            borderRadius: BorderRadius.circular(6),
-            onTap: isExtraCorpus
-                ? null
-                : () async {
-                    // 保存当前导入分析状态，以便后续返回
-                    _savedImportedText = _searchController.text;
-                    _savedImportedWords = List.from(_importedWords);
-                    _savedImportedActiveFilter = _importedActiveFilter;
-                    _savedImportedTotalWords = _importedTotalWords;
-                    _savedImportedFilterCounts
-                      ..clear()
-                      ..addAll(_importedFilterCounts);
-                    // 真题语料中未出现过的单词：不切检测模式，
-                    // 弹窗打开导入文档并定位到该单词（与打开真题文本逻辑一致）
-                    if (!iw.isInCorpus) {
-                      _showImportedInRightReader(iw.word);
-                      return;
-                    }
-                    _searchController.text = iw.word;
-                    _searchController.selection = TextSelection.collapsed(
-                      offset: iw.word.length,
-                    );
-                    setState(() {
-                      _inImportedMode = false;
-                      _importedWords.clear();
-                      _importedTotalWords = 0;
-                      _importedActiveFilter = '真题词';
-                      _importedFilterCounts.updateAll((_, __) => 0);
-                    });
-                    await _onDetect();
-                    if (mounted) {
-                      setState(() {
-                        _cameFromImportedMode = true;
-                      });
-                    }
-                  },
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: kGap10, vertical: kGap8),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.center,
-                children: [
-                  // 分类彩色标签
-                  Container(
-                    width: 2,
-                    height: 22,
-                    decoration: BoxDecoration(
-                      color: color,
-                      borderRadius: BorderRadius.circular(2),
-                    ),
-                  ),
-                  const SizedBox(width: kGap10),
-                  // 单词
-                  SizedBox(
-                    width: 130,
-                    child: Text(
-                      iw.word,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
-                        color: GlassTheme.ink,
-                        letterSpacing: 0.2,
-                      ),
-                    ),
-                  ),
-                  const Spacer(),
-                  // ---- 未筛选：频次 + 筛选按钮（四个词库都不收录的词，语料出现过
-                  //      的也在此列 —— 真题词列与本列重叠，归类入口只在本列）----
-                  if (isUnfilteredColumn) ...[
-                    _buildFreqColumn(iw.frequency, color),
-                    const SizedBox(width: kGap6),
-                    _buildClassifyButton(iw),
-                  ]
-                  // ---- 专有词：标签 + 频次/筛选按钮----
-                  else if (isExtraCorpus) ...[
-                    if (_manualExtraWords.contains(iw.word)) ...[
-                      _buildCategoryTag('专有词', color),
-                      const Spacer(),
-                      GlassPressable(radius: GlassTheme.rSm, hoverColor: const Color(0x0A18181B), pressColor: const Color(0x294462F2), enabled: true, child: InkWell(
-                        onTap: () {
-                          _manualExtraWords.remove(iw.word);
-                          _classificationMemory.remove(iw.word.toLowerCase());
-                          // 移出专有词后：四个词库都不再收录 → 回到未筛选待用户重新归类
-                          // （语料中出现过的词仍会出现在真题词叠加列）
-                          const newCat = '未筛选';
-                          _reclassifyImportedWord(iw, newCat);
-                          setState(() {
-                            if ((_filterCounts['专有词'] ?? 0) > 0) {
-                              _filterCounts['专有词'] =
-                                  (_filterCounts['专有词'] ?? 0) - 1;
-                            }
-                          });
-                          _saveConfig();
-                        },
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 7,
-                            vertical: 2,
-                          ),
-                          decoration: BoxDecoration(
-                            color: color.withValues(alpha: 0.08),
-                            borderRadius: BorderRadius.circular(10),
-                          ),
-                          child: Text(
-                            '移出',
-                            style: TextStyle(
-                              fontSize: 10,
-                              fontWeight: FontWeight.w600,
-                              color: color,
-                            ),
-                          ),
-                        ),
-                      )),
-                    ] else ...[
-                      const Spacer(),
-                      _buildClassifyButton(iw),
-                    ],
-                  ]
-                  // ---- 超标词：标签 + 频次 + 移出按钮 ----
-                  else if (isChaoGang) ...[
-                    _buildCategoryTag('超标词', color),
-                    const Spacer(),
-                    GlassPressable(radius: GlassTheme.rSm, hoverColor: const Color(0x0A18181B), pressColor: const Color(0x294462F2), enabled: true, child: InkWell(
-                      onTap: () {
-                        _manualChaoGangWords.remove(iw.word);
-                        _classificationMemory.remove(iw.word.toLowerCase());
-                        final newCat = _manualExtraWords.contains(iw.word)
-                            ? '专有词'
-                            : '未筛选';
-                        _reclassifyImportedWord(iw, newCat);
-                        setState(() {
-                          if ((_filterCounts['超标词'] ?? 0) > 0) {
-                            _filterCounts['超标词'] =
-                                (_filterCounts['超标词'] ?? 0) - 1;
-                          }
-                        });
-                        _saveConfig();
-                      },
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 7,
-                          vertical: 2,
-                        ),
-                        decoration: BoxDecoration(
-                          color: color.withValues(alpha: 0.08),
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                        child: Text(
-                          '移出',
-                          style: TextStyle(
-                            fontSize: 10,
-                            fontWeight: FontWeight.w600,
-                            color: color,
-                          ),
-                        ),
-                      ),
-                    )),
-                    const Spacer(),
-                    _buildFreqColumn(iw.frequency, color),
-                  ]
-                  // ---- 课标词/ 拓展词：标签 + 频次 ----
-                  else if (!isUnclassified) ...[
-                    _buildCategoryTag(iw.category, color),
-                    const Spacer(),
-                    _buildFreqColumn(iw.frequency, color),
-                  ]
-                  // ---- 真题词列中的未归类词：仅频次，无筛选按钮（归类入口在未筛选列）。
-                  //      真题词列是叠加列：词库类别的词在上方分支已带归属标签 + 频次。
-                  else ...[
-                    _buildFreqColumn(iw.frequency, color),
-                    const Spacer(),
-                  ],
-                  const SizedBox(width: kGap4),
-                  const Icon(
-                    Icons.chevron_right,
-                    size: 14,
-                    color: GlassTheme.line,
-                  ),
-                ],
-              ),
-            ),
-          )),
+        return ImportedWordRow(
+          word: iw.word,
+          category: iw.category,
+          frequency: iw.frequency,
+          activeFilter: _importedActiveFilter,
+          color: _filterColors[iw.category]!,
+          isEven: index.isEven,
+          showRemoveExtra: _manualExtraWords.contains(iw.word),
+          onOpen: () => _openImportedWord(iw),
+          onClassify: () => _startClassifyBatch(iw),
+          onRemoveExtra: () => _removeFromManualExtra(iw),
+          onRemoveChaoGang: () => _removeFromManualChaoGang(iw),
         );
       },
     );
   }
 
-  Widget _buildCategoryTag(String label, Color color) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: kGap8, vertical: kGap4),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.08),
-        borderRadius: BorderRadius.circular(10),
-      ),
-      child: Text(
-        label,
-        style: TextStyle(
-          fontSize: 10,
-          fontWeight: FontWeight.w600,
-          color: color,
-        ),
-      ),
-    );
+  /// 点击导入词表的一行：进入单词检测模式（真题语料中未出现过的词改为在原文面板定位）。
+  Future<void> _openImportedWord(_ImportedWord iw) async {
+    // 保存当前导入分析状态，以便后续返回
+    _savedImportedText = _searchController.text;
+    _savedImportedWords = List.from(_importedWords);
+    _savedImportedActiveFilter = _importedActiveFilter;
+    _savedImportedTotalWords = _importedTotalWords;
+    _savedImportedFilterCounts
+      ..clear()
+      ..addAll(_importedFilterCounts);
+    // 真题语料中未出现过的单词：不切检测模式，
+    // 弹窗打开导入文档并定位到该单词（与打开真题文本逻辑一致）
+    if (!iw.isInCorpus) {
+      _showImportedInRightReader(iw.word);
+      return;
+    }
+    _searchController.text = iw.word;
+    _searchController.selection = TextSelection.collapsed(offset: iw.word.length);
+    setState(() {
+      _inImportedMode = false;
+      _importedWords.clear();
+      _importedTotalWords = 0;
+      _importedActiveFilter = '真题词';
+      _importedFilterCounts.updateAll((_, __) => 0);
+    });
+    await _onDetect();
+    if (mounted) {
+      setState(() {
+        _cameFromImportedMode = true;
+      });
+    }
+    // 查词结果页：右侧保持空白，仅点击结果行时才加载被检测文本
+    if (_results.isNotEmpty) {
+      final first = _results.first;
+      CorpusFile? corpus;
+      for (final f in _corpusFiles) {
+        if (f.path == first.filePath) {
+          corpus = f;
+          break;
+        }
+      }
+      if (corpus != null) {
+        await _openCorpusReader(
+          corpus,
+          keyword: first.keyword,
+          matchOffset: first.matchOffset,
+          collapseOthers: true,
+          focusOnly: true,
+        );
+      }
+    }
+    // 主动点击导入词表单词：右侧同步展示被检测文本并定位到该词，
+    // 避免沿用上一次面板内容（输入框查词时右侧仍保持空白）。
+    _showDetectedTextInRightReader(keyword: iw.word);
   }
 
-  Widget _buildFreqColumn(int frequency, Color color) {
-    return SizedBox(
-      width: 56,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          const Text(
-            '频次',
-            style: TextStyle(fontSize: 9, color: GlassTheme.ink3),
-          ),
-          Text(
-            '$frequency',
-            style: TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.bold,
-              color: color,
-            ),
-          ),
-        ],
-      ),
-    );
+  /// 专有词「移出」：回到未筛选待用户重新归类（语料中出现过的词仍在真题词叠加列）。
+  void _removeFromManualExtra(_ImportedWord iw) {
+    _manualExtraWords.remove(iw.word);
+    _classificationMemory.remove(iw.word.toLowerCase());
+    _reclassifyImportedWord(iw, '未筛选');
+    setState(() {
+      if ((_filterCounts['专有词'] ?? 0) > 0) {
+        _filterCounts['专有词'] = (_filterCounts['专有词'] ?? 0) - 1;
+      }
+    });
+    _saveConfig();
+  }
+
+  /// 超标词「移出」：若同时是手工专有词则回落专有词，否则回到未筛选。
+  void _removeFromManualChaoGang(_ImportedWord iw) {
+    _manualChaoGangWords.remove(iw.word);
+    _classificationMemory.remove(iw.word.toLowerCase());
+    final newCat = _manualExtraWords.contains(iw.word) ? '专有词' : '未筛选';
+    _reclassifyImportedWord(iw, newCat);
+    setState(() {
+      if ((_filterCounts['超标词'] ?? 0) > 0) {
+        _filterCounts['超标词'] = (_filterCounts['超标词'] ?? 0) - 1;
+      }
+    });
+    _saveConfig();
   }
 
   // ──────────────────────────────────────────────
@@ -6144,30 +6781,6 @@ ${bodyParts.join('\n')}
     }
   }
 
-  Widget _buildClassifyButton(_ImportedWord iw) {
-    return GlassPressable(radius: GlassTheme.rMd, hoverColor: const Color(0x0A18181B), pressColor: const Color(0x294462F2), enabled: true, child: InkWell(
-      onTap: () => _startClassifyBatch(iw),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: kGap8, vertical: kGap4),
-        decoration: BoxDecoration(
-          color: GlassTheme.accentSoft,
-          borderRadius: BorderRadius.circular(999),
-          border: Border.all(
-            color: GlassTheme.accent.withValues(alpha: 0.4),
-          ),
-        ),
-        child: const Text(
-          '筛选',
-          style: TextStyle(
-            fontSize: 10,
-            fontWeight: FontWeight.w600,
-            color: GlassTheme.accentInk,
-          ),
-        ),
-      ),
-    ));
-  }
-
   // ==================== 课标词智能匹配（按首字母桶加速） ====================
   List<String> _findBestSyllabusMatch(String word) {
     final lower = word.toLowerCase();
@@ -6199,62 +6812,68 @@ ${bodyParts.join('\n')}
     return sorted.take(5).map((e) => e.key).toList();
   }
 
-  // 左侧分组标题行：12px/700 墨色标题 + 灰色计数胶囊 + 右侧 +按钮（规范 2.3）
-  Widget _buildLeftSectionHeader({
-    required String title,
-    required String count,
-    required String tip,
-    required VoidCallback onAdd,
-    required Key addKey,
-  }) {
+  // 左栏标题行：真题 / 教材 两个切换入口 + 当前栏的「＋」导入按钮。
+  // 两个入口互斥，切换即整栏换内容；默认停在真题。
+  Widget _buildLeftTabHeader() {
+    final isTextbook = _leftPanelIsTextbook;
     return Padding(
-      // 对齐示意图：左卡内文字左内缩 16（示意图表头/列表行内容实测 x=50，卡左沿 34）
-      // 表头文字距卡顶 17（示意图 137-120），故上下内边距 12 + Row 居中 4 = 16
+      key: _leftHeaderKey,
+      // 对齐示意图：左卡内文字左内缩 16、表头上下内边距 12
       padding: const EdgeInsets.fromLTRB(kGap16, kGap12, kGap16, kGap12),
       child: Row(
         children: [
-          Text(
-            title,
-            style: const TextStyle(
-              fontSize: GlassTheme.fSmall,
-              fontWeight: FontWeight.w700,
-              color: GlassTheme.ink,
-              height: 1,
-            ),
-          ),
-          const SizedBox(width: kGap8),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: kGap8, vertical: kGap4),
-            decoration: BoxDecoration(
-              color: const Color(0x0D18181B), // 灰色计数胶囊 rgba(24,24,27,0.05)
-              borderRadius: BorderRadius.circular(999),
-            ),
-            child: Text(
-              count,
-              style: const TextStyle(
-                fontSize: GlassTheme.fSmall,
-                color: GlassTheme.ink2,
-                height: 1,
+          // 窄栏时整体等比收缩，保证「真题 / 教材」与计数胶囊始终完整可见
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                alignment: Alignment.centerLeft,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    _buildLeftTab(
+                      label: '真题',
+                      count: _corpusFiles.length,
+                      active: !isTextbook,
+                      onTap: () => setState(() => _leftPanelIsTextbook = false),
+                    ),
+                    const SizedBox(width: kGap12),
+                    _buildLeftTab(
+                      label: '教材',
+                      count: _textbookFiles.length,
+                      active: isTextbook,
+                      onTap: () => setState(() => _leftPanelIsTextbook = true),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
-          const Spacer(),
+          // 计数胶囊与「＋」之间保证至少 kGap8，避免视觉粘连
+          const SizedBox(width: kGap8),
           Tooltip(
-            message: tip,
+            message: isTextbook ? '导入教材' : '导入真题',
             child: MouseRegion(
               cursor: SystemMouseCursors.click,
               child: GlassPressable(radius: GlassTheme.rSm, hoverColor: GlassTheme.accentSoft, pressColor: const Color(0x294462F2), enabled: true, child: InkWell(
-                key: addKey,
-                onTap: onAdd,
+                key: isTextbook ? _textbookBtnKey : _importBtnKey,
+                onTap: isTextbook ? _showTextbookImportMenu : _showImportMenu,
                 hoverColor: GlassTheme.accentSoft,
                 borderRadius: BorderRadius.circular(6),
                 child: const SizedBox(
                   width: 20,
                   height: 20,
-                  child: Icon(
-                    Icons.add_rounded,
-                    size: 16,
-                    color: GlassTheme.ink2,
+                  child: Center(
+                    // 恢复原「＋」字形（不是方形图标）
+                    child: Text(
+                      '＋',
+                      style: TextStyle(
+                        fontSize: 15,
+                        height: 1,
+                        color: GlassTheme.ink2,
+                      ),
+                    ),
                   ),
                 ),
               )),
@@ -6265,9 +6884,154 @@ ${bodyParts.join('\n')}
     );
   }
 
+  /// 左栏切换标签：标题 + 计数胶囊 + 当前态下划线（只做视觉，不改列表语义）。
+  Widget _buildLeftTab({
+    required String label,
+    required int count,
+    required bool active,
+    required VoidCallback onTap,
+  }) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: onTap,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  label,
+                  maxLines: 1,
+                  style: TextStyle(
+                    fontSize: GlassTheme.fSmall,
+                    fontWeight: FontWeight.w700,
+                    color: active ? GlassTheme.ink : GlassTheme.ink3,
+                    height: 1,
+                  ),
+                ),
+                const SizedBox(width: kGap8),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: kGap8, vertical: kGap4),
+                  decoration: BoxDecoration(
+                    color: const Color(0x0D18181B), // 灰色计数胶囊
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text(
+                    '$count',
+                    style: const TextStyle(
+                      fontSize: GlassTheme.fSmall,
+                      color: GlassTheme.ink2,
+                      height: 1,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            SizedBox(height: GlassTheme.dp(4)),
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 160),
+              width: GlassTheme.dp(22),
+              height: GlassTheme.dp(2),
+              decoration: BoxDecoration(
+                color: active ? GlassTheme.accent : Colors.transparent,
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   // ==================== 真题文件列表（可勾选，参与语料统计） ====================
+  /// 左栏真题行高 / 分组头高度（与 [_buildCorpusSize] 的整行吸附保持一致）
+  static const double _kCorpusRowH = 36.0;
+  static const double _kCorpusGroupH = 26.0;
+  static const double _kCorpusHintH = 30.0;
+  /// 内联真题原文高度（展开后固定高度、内部自行滚动）
+  static const double _kCorpusReaderH = 200.0;
+
+  /// 左栏真题列表的展示序列：内置分组头 / 隐藏提示 / 用户分组头 / 文件行 / 内联原文。
+  /// 从结果行定位时进入聚焦态：只展示该套真题 + 其原文，其它年份不占位。
+  List<({String kind, CorpusFile? file})> _corpusDisplayItems() {
+    final focus = _corpusFocusPath;
+    if (focus != null) {
+      CorpusFile? target;
+      for (final f in _corpusFiles) {
+        if (f.path == focus) {
+          target = f;
+          break;
+        }
+      }
+      if (target != null) {
+        return <({String kind, CorpusFile? file})>[
+          (kind: 'focusHint', file: null),
+          (kind: 'file', file: target),
+          if (_corpusReaderOpen.contains(target.path))
+            (kind: 'reader', file: target),
+        ];
+      }
+    }
+    final items = <({String kind, CorpusFile? file})>[];
+    if (_builtinFiles.isNotEmpty) {
+      if (_builtinHidden) {
+        items.add((kind: 'hidden', file: null));
+      } else {
+        items.add((kind: 'builtinHeader', file: null));
+        if (!_builtinCollapsed) {
+          for (final f in _builtinFiles) {
+            items.add((kind: 'file', file: f));
+            if (_corpusReaderOpen.contains(f.path)) {
+              items.add((kind: 'reader', file: f));
+            }
+          }
+        }
+      }
+    }
+    if (_userCorpusFiles.isNotEmpty) {
+      items.add((kind: 'userHeader', file: null));
+      for (final f in _userCorpusFiles) {
+        items.add((kind: 'file', file: f));
+        if (_corpusReaderOpen.contains(f.path)) {
+          items.add((kind: 'reader', file: f));
+        }
+      }
+    }
+    return items;
+  }
+
+  double _corpusItemHeight(({String kind, CorpusFile? file}) item) {
+    switch (item.kind) {
+      case 'hidden':
+        return GlassTheme.dp(_kCorpusHintH);
+      case 'focusHint':
+        return GlassTheme.dp(24);
+      case 'builtinHeader':
+      case 'userHeader':
+        return GlassTheme.dp(_kCorpusGroupH);
+      case 'reader':
+        return GlassTheme.dp(_kCorpusReaderH) + kGap6;
+      default:
+        return GlassTheme.dp(_kCorpusRowH);
+    }
+  }
+
+  String? _firstCorpusDisplayPath(List<({String kind, CorpusFile? file})> items) {
+    for (final it in items) {
+      if (it.kind != 'file') continue;
+      final f = it.file;
+      if (f != null) return f.path;
+    }
+    return null;
+  }
+
   Widget _buildCorpusList() {
-    if (_corpusFiles.isEmpty) {
+    final items = _corpusDisplayItems();
+    if (items.isEmpty) {
       return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -6286,97 +7050,281 @@ ${bodyParts.join('\n')}
         ),
       );
     }
-    // 第三轮清单第 12 项：真题卡高度不变，列表视口按整行（32px）吸附 ——
-    // 放不下的内容整行进入滚动，卡片边缘不再出现被裁掉一半的 item。
-    const double kCorpusRowH = 32.0;
+    // 列表视口按整行吸附：放不下的内容整行进入滚动，卡片边缘不出现被裁一半的行。
+    final heights = items.map(_corpusItemHeight).toList();
     return LayoutBuilder(
       builder: (context, constraints) {
         final double avail = constraints.maxHeight;
-        final double natural = kGap8 * 2 + _corpusFiles.length * kCorpusRowH;
-        final int rows = ((avail - kGap8 * 2) / kCorpusRowH)
-            .floor()
-            .clamp(1, _corpusFiles.length)
-            .toInt();
-        final double fitted = kGap8 * 2 + rows * kCorpusRowH;
-        final double viewH =
-            natural <= avail ? natural : (fitted > avail ? avail : fitted);
+        final double natural = kGap8 * 2 + heights.fold<double>(0, (s, h) => s + h);
+        double viewH = natural <= avail ? natural : avail;
+        // 聚焦单套真题时列表占满整栏高度，且原文撑满剩余空间
+        double? focusReaderH;
+        if (_corpusFocusPath != null) {
+          viewH = avail;
+          final double hintH = GlassTheme.dp(24);
+          final double rowH = GlassTheme.dp(_kCorpusRowH);
+          final double rest = avail - kGap8 * 2 - hintH - rowH - kGap6;
+          focusReaderH =
+              rest < GlassTheme.dp(120) ? GlassTheme.dp(120) : rest;
+        }
+        if (_corpusFocusPath == null && natural > avail) {
+          // 从顶部按整项累加，取不超过可用高度的最大整项集合
+          double acc = kGap8 * 2;
+          var shown = 0.0;
+          for (final h in heights) {
+            if (acc + h > avail) break;
+            acc += h;
+            shown += h;
+          }
+          viewH = shown > 0 ? acc : avail;
+        }
         return Align(
           alignment: Alignment.topCenter,
-          child: SizedBox(height: viewH, child: _buildCorpusScrollingList()),
+          child: SizedBox(
+            height: viewH,
+            child: _buildCorpusScrollingList(
+              items,
+              focusReaderH: focusReaderH,
+            ),
+          ),
         );
       },
     );
   }
 
   /// 真题文件列表（滚动区）：视口高度由 [_buildCorpusList] 按整行吸附后传入。
-  Widget _buildCorpusScrollingList() {
+  /// [focusReaderH] 仅在聚焦单套真题时传入，用于让原文撑满左栏剩余高度。
+  Widget _buildCorpusScrollingList(
+    List<({String kind, CorpusFile? file})> items, {
+    double? focusReaderH,
+  }) {
+    final firstPath = _firstCorpusDisplayPath(items);
     return ListView.builder(
-      // 任务④：固定行高 32 → 声明 itemExtent（同教材列表），减少滚动时布局开销。
-      itemExtent: GlassTheme.dp(32),
-      // 对齐示意图：卡内列表内容左内缩 16 = 列表 padding 8 + 行 padding 8
+      controller: _corpusListScrollController,
       padding: const EdgeInsets.symmetric(horizontal: kGap8, vertical: kGap8),
-      itemCount: _corpusFiles.length,
+      itemCount: items.length,
       itemBuilder: (context, index) {
-        final file = _corpusFiles[index];
-        // 第三关 ⑥：高亮行全栏唯一——真题导入组默认高亮第 1 行；勾选语义 isSelected 保持原功能
-        final selected = file.path ==
-            _activePathOf(_corpusFiles, _activeCorpusPath, fallbackFirst: true);
-        final ext = _fileTypeLabel(file.name);
-        return GestureDetector(
-          onSecondaryTapDown: (details) =>
-              _showCorpusFileContextMenu(details.globalPosition, file),
-          child: GlassPressable(radius: GlassTheme.rMd, hoverColor: const Color(0x0A18181B), pressColor: const Color(0x294462F2), enabled: true, child: InkWell(
+        final item = items[index];
+        switch (item.kind) {
+          case 'builtinHeader':
+            return _buildCorpusGroupHeader(
+              label: '内置真题',
+              count: _builtinFiles.length,
+              builtin: true,
+            );
+          case 'userHeader':
+            return _buildCorpusGroupHeader(
+              label: '我的导入',
+              count: _userCorpusFiles.length,
+              builtin: false,
+            );
+          case 'hidden':
+            return _buildBuiltinHiddenHint();
+          case 'focusHint':
+            return _buildCorpusFocusHint();
+          case 'reader':
+            return _buildCorpusReader(
+              item.file!,
+              itemHeight: focusReaderH,
+            );
+          default:
+            return _buildCorpusFileRow(
+              item.file!,
+              firstPath: firstPath,
+            );
+        }
+      },
+    );
+  }
+
+  /// 聚焦单套真题时的提示条：当前只显示这一套，点「显示全部」恢复完整列表。
+  Widget _buildCorpusFocusHint() {
+    var name = '';
+    for (final f in _corpusFiles) {
+      if (f.path == _corpusFocusPath) {
+        name = f.name.replaceAll(RegExp(r'\.[^.]+$'), '');
+        break;
+      }
+    }
+    return SizedBox(
+      height: GlassTheme.dp(24),
+      child: Row(
+        children: [
+          const Icon(
+            Icons.filter_alt_outlined,
+            size: 13,
+            color: GlassTheme.accentInk,
+          ),
+          const SizedBox(width: 4),
+          Expanded(
+            child: Text(
+              '仅显示 $name',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 11, color: GlassTheme.ink2),
+            ),
+          ),
+          const SizedBox(width: kGap8),
+          MouseRegion(
+            cursor: SystemMouseCursors.click,
+            child: GestureDetector(
+              onTap: () => setState(() => _corpusFocusPath = null),
+              child: const Text(
+                '显示全部',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: GlassTheme.accentInk,
+                  decoration: TextDecoration.underline,
+                  decorationColor: GlassTheme.accentInk,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 分组头：内置组可折叠 + 可隐藏；用户组只显示数量。
+  Widget _buildCorpusGroupHeader({
+    required String label,
+    required int count,
+    required bool builtin,
+  }) {
+    return SizedBox(
+      height: GlassTheme.dp(_kCorpusGroupH),
+      child: Row(
+        children: [
+          if (builtin)
+            Icon(
+              _builtinCollapsed
+                  ? Icons.keyboard_arrow_right_rounded
+                  : Icons.keyboard_arrow_down_rounded,
+              size: 16,
+              color: GlassTheme.ink3,
+            )
+          else
+            const SizedBox(width: 16),
+          const SizedBox(width: kGap4),
+          Text(
+            label,
+            style: const TextStyle(
+              fontSize: GlassTheme.fMicro,
+              fontWeight: FontWeight.w600,
+              color: GlassTheme.ink3,
+              height: 1,
+            ),
+          ),
+          const SizedBox(width: kGap6),
+          Text(
+            '$count',
+            style: const TextStyle(
+              fontSize: GlassTheme.fMicro,
+              color: GlassTheme.ink3,
+              height: 1,
+            ),
+          ),
+          const Spacer(),
+          // 折叠箭头（整组统一交互，避免 98 行逐个点）
+          if (builtin)
+            _corpusHeaderIcon(
+              icon: _builtinCollapsed
+                  ? Icons.unfold_more_rounded
+                  : Icons.unfold_less_rounded,
+              tooltip: _builtinCollapsed ? '展开内置真题' : '折叠内置真题',
+              onTap: () {
+                setState(() {
+                  _builtinCollapsed = !_builtinCollapsed;
+                });
+                _saveConfig();
+              },
+            ),
+          if (builtin) const SizedBox(width: kGap4),
+          if (builtin)
+            _corpusHeaderIcon(
+              icon: Icons.visibility_off_outlined,
+              tooltip: '隐藏内置真题',
+              onTap: () {
+                setState(() {
+                  _builtinHidden = true;
+                  _rebuildCorpusList();
+                });
+                _resetWordQueryState();
+                _saveConfig();
+              },
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _corpusHeaderIcon({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback onTap,
+  }) {
+    return Tooltip(
+      message: tooltip,
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: GlassPressable(
+          radius: 6,
+          hoverColor: GlassTheme.accentSoft,
+          pressColor: const Color(0x294462F2),
+          enabled: true,
+          child: InkWell(
+            onTap: onTap,
+            borderRadius: BorderRadius.circular(6),
+            child: SizedBox(
+              width: 20,
+              height: 20,
+              child: Icon(icon, size: 14, color: GlassTheme.ink3),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 内置真题被隐藏后的恢复入口（不删除任何文件，仅退出统计）。
+  Widget _buildBuiltinHiddenHint() {
+    return SizedBox(
+      height: GlassTheme.dp(_kCorpusHintH),
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: GlassPressable(
+          radius: GlassTheme.rSm,
+          hoverColor: GlassTheme.accentSoft,
+          pressColor: const Color(0x294462F2),
+          enabled: true,
+          child: InkWell(
             onTap: () {
               setState(() {
-                file.isSelected = !file.isSelected;
-                // 原功能：多选参与统计（只改视觉，不动交互）
-                _activeCorpusPath = file.path; // 第三关 ⑥：高亮行唯一
+                _builtinHidden = false;
+                _rebuildCorpusList();
               });
-              _showFileInRightReader(file.path, file.name);
+              _saveConfig();
             },
-            borderRadius: BorderRadius.circular(GlassTheme.rMd),
-            child: Container(
-              height: 32,
-              padding: const EdgeInsets.only(right: kGap8),
-              // 第三轮清单第 2 项：选中态 = 淡蓝底 rgba(68,98,242,.12) + 左侧 2.5px 蓝竖条
-              //（竖条上下各内缩 6，圆角 2）+ 深蓝字，行高仍 32、不整行填主色
-              decoration: BoxDecoration(
-                color: selected ? const Color(0x1F4462F2) : null,
-                borderRadius: BorderRadius.circular(GlassTheme.rMd),
-              ),
+            borderRadius: BorderRadius.circular(GlassTheme.rSm),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: kGap8),
               child: Row(
                 children: [
-                  // 左侧 2.5px 蓝色竖条（骨架 FileItem: Positioned(left:0, top:6, bottom:6, width:2.5)）
-                  SizedBox(
-                    width: kGap8,
-                    child: selected
-                        ? Align(
-                            alignment: Alignment.centerLeft,
-                            child: Container(
-                              width: 2.5,
-                              height: 20,
-                              decoration: BoxDecoration(
-                                color: GlassTheme.accent,
-                                borderRadius: BorderRadius.circular(2),
-                              ),
-                            ),
-                          )
-                        : null,
+                  const Icon(
+                    Icons.visibility_outlined,
+                    size: 14,
+                    color: GlassTheme.accentInk,
                   ),
-                  GlassFileTypeTag(label: ext, selected: selected),
-                  const SizedBox(width: kGap8),
+                  const SizedBox(width: kGap6),
                   Expanded(
                     child: Text(
-                      file.name,
+                      '内置真题已隐藏（${_builtinFiles.length} 套）· 点击恢复',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: GlassTheme.fBody,
-                        color: selected
-                            ? GlassTheme.accentInk
-                            : const Color(0xFF52525B),
-                        fontWeight:
-                            selected ? FontWeight.w600 : FontWeight.w400,
+                      style: const TextStyle(
+                        fontSize: GlassTheme.fMicro,
+                        color: GlassTheme.accentInk,
                         height: 1,
                       ),
                     ),
@@ -6384,10 +7332,398 @@ ${bodyParts.join('\n')}
                 ],
               ),
             ),
-          )),
-        );
-      },
+          ),
+        ),
+      ),
     );
+  }
+
+  /// 真题文件行：年份徽标 + 卷别名 + 内置标记（两级信息，便于 98 套内置真题扫读）。
+  Widget _buildCorpusFileRow(CorpusFile file, {String? firstPath}) {
+    final selected =
+        file.path == _activePathOf(_corpusFiles, _activeCorpusPath,
+            fallbackFirst: true, firstPathOverride: firstPath);
+    final expanded = _corpusReaderOpen.contains(file.path);
+    final base = file.name.replaceAll(RegExp(r'\.[^.]+$'), '');
+    final yearMatch = RegExp(r'^(\d{4})').firstMatch(base);
+    final String yearLabel = yearMatch != null ? yearMatch.group(1)! : '';
+    final String titleLabel = yearMatch != null
+        ? base.substring(4).replaceFirst(RegExp(r'^年'), '')
+        : base;
+    return GestureDetector(
+      onSecondaryTapDown: (details) =>
+          _showCorpusFileContextMenu(details.globalPosition, file),
+      child: GlassPressable(
+        radius: GlassTheme.rMd,
+        hoverColor: const Color(0x0A18181B),
+        pressColor: const Color(0x294462F2),
+        enabled: true,
+        child: InkWell(
+          onTap: () {
+            setState(() {
+              file.isSelected = !file.isSelected;
+              _activeCorpusPath = file.path;
+            });
+          },
+          borderRadius: BorderRadius.circular(GlassTheme.rMd),
+          child: Container(
+            height: GlassTheme.dp(_kCorpusRowH),
+            padding: EdgeInsets.only(right: kGap8),
+            decoration: BoxDecoration(
+              color: selected ? const Color(0x1F4462F2) : null,
+              borderRadius: BorderRadius.circular(GlassTheme.rMd),
+            ),
+            child: Row(
+              children: [
+                // 左侧 2.5px 蓝色竖条
+                SizedBox(
+                  width: kGap8,
+                  child: selected
+                      ? Align(
+                          alignment: Alignment.centerLeft,
+                          child: Container(
+                            width: 2.5,
+                            height: 20,
+                            decoration: BoxDecoration(
+                              color: GlassTheme.accent,
+                              borderRadius: BorderRadius.circular(2),
+                            ),
+                          ),
+                        )
+                      : null,
+                ),
+                if (yearLabel.isNotEmpty)
+                  Container(
+                    width: 30,
+                    height: 16,
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      color: selected
+                          ? const Color(0x294462F2)
+                          : const Color(0x0D18181B),
+                      borderRadius: BorderRadius.circular(6),
+                    ),
+                    child: Text(
+                      yearLabel,
+                      style: TextStyle(
+                        fontSize: 9.5,
+                        fontWeight: FontWeight.w600,
+                        color: selected ? GlassTheme.accentInk : GlassTheme.ink3,
+                        height: 1,
+                      ),
+                    ),
+                  )
+                else
+                  GlassFileTypeTag(label: _fileTypeLabel(file.name), selected: selected),
+                const SizedBox(width: kGap6),
+                Expanded(
+                  child: Text(
+                    titleLabel,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: GlassTheme.fBody,
+                      color: selected
+                          ? GlassTheme.accentInk
+                          : const Color(0xFF52525B),
+                      fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+                      height: 1,
+                    ),
+                  ),
+                ),
+                if (file.isBuiltin) ...[
+                  const SizedBox(width: kGap4),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 5, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: const Color(0x174462F2),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: const Text(
+                      '内置',
+                      style: TextStyle(
+                        fontSize: 9,
+                        fontWeight: FontWeight.w600,
+                        color: GlassTheme.accentInk,
+                        height: 1,
+                      ),
+                    ),
+                  ),
+                ],
+                const SizedBox(width: kGap4),
+                _corpusReaderToggle(file, selected: selected, expanded: expanded),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 行尾展开按钮：点击在本套真题下方内联展示原文（再次点击收起）。
+  Widget _corpusReaderToggle(
+    CorpusFile file, {
+    required bool selected,
+    required bool expanded,
+  }) {
+    return Tooltip(
+      message: expanded ? '收起真题原文' : '查看真题原文',
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: GlassPressable(
+          radius: 6,
+          hoverColor: GlassTheme.accentSoft,
+          pressColor: const Color(0x294462F2),
+          enabled: true,
+          child: InkWell(
+            onTap: () => _toggleCorpusReader(file),
+            borderRadius: BorderRadius.circular(6),
+            child: SizedBox(
+              width: 20,
+              height: 20,
+              child: Icon(
+                expanded
+                    ? Icons.keyboard_arrow_up_rounded
+                    : Icons.keyboard_arrow_down_rounded,
+                size: 16,
+                color: selected ? GlassTheme.accentInk : GlassTheme.ink3,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 内联真题原文：只读高亮展示，独立滚动；未加载完成时显示加载态。
+  /// [itemHeight] 为整项高度（含底部间距），聚焦态下由左栏剩余高度决定。
+  Widget _buildCorpusReader(CorpusFile file, {double? itemHeight}) {
+    final path = file.path;
+    final text = _corpusReaderTexts[path];
+    final controller = _corpusReaderControllers[path];
+    final double boxH =
+        (itemHeight ?? (GlassTheme.dp(_kCorpusReaderH) + kGap6)) - kGap6;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: kGap6),
+      child: Container(
+        height: boxH,
+        decoration: BoxDecoration(
+          color: const Color(0x0A18181B),
+          borderRadius: BorderRadius.circular(GlassTheme.rMd),
+          border: Border.all(color: GlassTheme.line),
+        ),
+        child: text == null || controller == null
+            ? const Center(
+                child: SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+              )
+            : TextField(
+                key: _corpusReaderKeys.putIfAbsent(path, () => GlobalKey()),
+                controller: controller,
+                scrollController: _corpusReaderScrolls[path],
+                readOnly: true,
+                maxLines: null,
+                textAlignVertical: TextAlignVertical.top,
+                style: const TextStyle(
+                  fontSize: 12,
+                  color: GlassTheme.ink,
+                  height: 1.5,
+                ),
+                decoration: const InputDecoration(
+                  border: InputBorder.none,
+                  enabledBorder: InputBorder.none,
+                  focusedBorder: InputBorder.none,
+                  disabledBorder: InputBorder.none,
+                  filled: false,
+                  fillColor: Colors.transparent,
+                  contentPadding: EdgeInsets.all(kGap8),
+                ),
+              ),
+      ),
+    );
+  }
+
+  /// 展开 / 收起某套真题的内联原文。
+  Future<void> _toggleCorpusReader(CorpusFile file) async {
+    // 手动操作退出「仅显示这一套」的聚焦态，恢复完整真题列表
+    if (_corpusFocusPath != null) {
+      setState(() => _corpusFocusPath = null);
+    }
+    if (_corpusReaderOpen.contains(file.path)) {
+      _closeCorpusReader(file.path);
+      return;
+    }
+    await _openCorpusReader(file);
+  }
+
+  void _closeCorpusReader(String path) {
+    setState(() => _corpusReaderOpen.remove(path));
+    _corpusReaderControllers.remove(path)?.dispose();
+    _corpusReaderScrolls.remove(path)?.dispose();
+    _corpusReaderKeys.remove(path);
+    _corpusReaderAnchors.remove(path);
+    _corpusReaderTexts.remove(path);
+  }
+
+  /// 展开指定真题并（可选）定位到关键词。
+  ///
+  /// 从检测结果点击单词时传入 [keyword]/[matchOffset]，并把 [collapseOthers]
+  /// 置为 true：其它年份的展开状态先折叠，再展开并定位到该词。
+  Future<void> _openCorpusReader(
+    CorpusFile file, {
+    String keyword = '',
+    int? matchOffset,
+    bool collapseOthers = false,
+    bool focusOnly = false,
+  }) async {
+    final path = file.path;
+    if (collapseOthers) {
+      for (final p in _corpusReaderOpen.where((p) => p != path).toList()) {
+        _corpusReaderControllers.remove(p)?.dispose();
+        _corpusReaderScrolls.remove(p)?.dispose();
+        _corpusReaderKeys.remove(p);
+        _corpusReaderAnchors.remove(p);
+        _corpusReaderTexts.remove(p);
+      }
+    }
+    // 打开真题时：左栏切回真题栏并只高亮该行
+    setState(() {
+      _leftPanelIsTextbook = false;
+      _activeCorpusPath = path;
+      _corpusFocusPath = focusOnly ? path : null;
+      // 内置真题被折叠 / 隐藏时先恢复，否则展开项不可见
+      if (file.isBuiltin) {
+        _builtinHidden = false;
+        _builtinCollapsed = false;
+      }
+      if (collapseOthers) {
+        _corpusReaderOpen
+          ..clear()
+          ..add(path);
+      } else {
+        _corpusReaderOpen.add(path);
+      }
+      _corpusReaderControllers.remove(path)?.dispose();
+      _corpusReaderControllers[path] =
+          _HighlightController(_corpusReaderTexts[path] ?? '', keyword);
+      _corpusReaderScrolls.putIfAbsent(path, () => ScrollController());
+    });
+    if (!_corpusReaderTexts.containsKey(path)) {
+      String text = '';
+      try {
+        text = await _readFileTextCached(path);
+      } catch (_) {}
+      if (!mounted) return;
+      setState(() {
+        _corpusReaderTexts[path] = text;
+        _corpusReaderControllers.remove(path)?.dispose();
+        _corpusReaderControllers[path] = _HighlightController(text, keyword);
+      });
+    }
+    _scrollCorpusListToFile(path);
+    final loaded = _corpusReaderTexts[path] ?? '';
+    int? anchor = matchOffset;
+    if (anchor == null && keyword.isNotEmpty) {
+      final i = loaded.toLowerCase().indexOf(keyword.toLowerCase());
+      if (i >= 0) anchor = i;
+    }
+    if (anchor != null) _corpusReaderAnchors[path] = anchor;
+    _jumpCorpusReaderToKeyword(
+      path,
+      loaded,
+      keyword,
+      anchor,
+    );
+  }
+
+  /// 把左栏真题列表滚动到指定真题行，并让该行停在可视区中间。
+  void _scrollCorpusListToFile(String path) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_corpusListScrollController.hasClients) return;
+      final items = _corpusDisplayItems();
+      double off = kGap8;
+      double targetH = GlassTheme.dp(_kCorpusRowH);
+      for (final it in items) {
+        if (it.kind == 'file' && it.file?.path == path) {
+          targetH = _corpusItemHeight(it);
+          break;
+        }
+        off += _corpusItemHeight(it);
+      }
+      final pos = _corpusListScrollController.position;
+      final center = off - (pos.viewportDimension - targetH) / 2;
+      _corpusListScrollController.jumpTo(center.clamp(0.0, pos.maxScrollExtent));
+    });
+  }
+
+  /// 把内联原文滚动到关键词处：优先用文本布局精确计算关键词所在行，
+  /// 保证高亮落在可视区内；布局未就绪时回退到按字符比例定位。
+  void _jumpCorpusReaderToKeyword(
+    String path,
+    String text,
+    String keyword,
+    int? matchOffset, [
+    int attempt = 0,
+  ]) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final sc = _corpusReaderScrolls[path];
+      if (sc == null || !sc.hasClients) {
+        // 展开项可能还没进入视口 / 还未布局，下一帧重试
+        if (attempt < 6) {
+          _jumpCorpusReaderToKeyword(path, text, keyword, matchOffset,
+              attempt + 1);
+        }
+        return;
+      }
+      var off = matchOffset;
+      if (off == null || off < 0) {
+        off = keyword.isEmpty
+            ? 0
+            : text.toLowerCase().indexOf(keyword.toLowerCase());
+        if (off < 0) off = 0;
+      }
+      final total = text.length;
+      final safeOff = off < 0 ? 0 : (off > total ? total : off);
+      final max = sc.position.maxScrollExtent;
+      double target;
+      final editable = _findRenderEditable(
+        _corpusReaderKeys[path]?.currentContext?.findRenderObject(),
+      );
+      // 只有渲染层已装载完整原文时才用精确行定位，否则先按比例并继续重试
+      final ready =
+          editable != null && total > 0 && editable.plainText.length == total;
+      if (ready) {
+        final caret =
+            editable.getLocalRectForCaret(TextPosition(offset: safeOff));
+        // caret.top 是视口坐标（已含滚动偏移），换算成文本坐标后再定位
+        target = caret.top + sc.position.pixels -
+            sc.position.viewportDimension * 0.25;
+      } else {
+        final ratio = total <= 0 ? 0.0 : (safeOff / total).clamp(0.0, 1.0);
+        target = max * ratio;
+      }
+      sc.jumpTo(target.clamp(0.0, max));
+      if (!ready && attempt < 10) {
+        _jumpCorpusReaderToKeyword(
+            path, text, keyword, matchOffset, attempt + 1);
+      }
+    });
+  }
+
+  /// 在渲染树中查找 TextField 内部的 RenderEditable（用于精确文本定位）。
+  RenderEditable? _findRenderEditable(RenderObject? root) {
+    if (root == null) return null;
+    if (root is RenderEditable) return root;
+    RenderEditable? found;
+    root.visitChildren((child) {
+      found ??= _findRenderEditable(child);
+    });
+    return found;
   }
 
   Future<void> _showCorpusFileContextMenu(
@@ -6405,10 +7741,12 @@ ${bodyParts.join('\n')}
       items: [
         const PopupMenuItem(value: 'open', child: Text('打开')),
         const PopupMenuItem(value: 'edit', child: Text('编辑')),
-        const PopupMenuItem(
-          value: 'delete',
-          child: Text('删除', style: TextStyle(color: Colors.red)),
-        ),
+        // 内置真题随包发布，不提供单卷删除（可在分组头整组隐藏）
+        if (!file.isBuiltin)
+          const PopupMenuItem(
+            value: 'delete',
+            child: Text('删除', style: TextStyle(color: Colors.red)),
+          ),
       ],
     );
     if (result == null) return;
@@ -6442,10 +7780,14 @@ ${bodyParts.join('\n')}
           final f = File(file.path);
           if (await f.exists()) {
             await f.delete();
-            setState(() {
-              _corpusFiles.removeWhere((cf) => cf.path == file.path);
-            });
           }
+          if (!mounted) return;
+          setState(() {
+            _userCorpusFiles.removeWhere((cf) => cf.path == file.path);
+            _rebuildCorpusList();
+          });
+          // 删除后立即持久化，重启不再恢复该项
+          _saveConfig();
         }
         break;
     }
@@ -6455,7 +7797,9 @@ ${bodyParts.join('\n')}
   Widget _buildFilterChips() {
     return Container(
       key: const ValueKey('region-filters'),
-      height: GlassTheme.hFilterRow,
+      // 自适应高度：宽度不足时 chips 自动换行，容器随内容增高，
+      // 不再以固定行高裁切导致压住下方「词频年份」标题。
+      constraints: BoxConstraints(minHeight: GlassTheme.hFilterRow),
       padding: EdgeInsets.zero,
       child: Center(
         child: Wrap(
@@ -6794,580 +8138,70 @@ ${bodyParts.join('\n')}
   // ---------- 词频年份 + 教材分布 ----------
   // ---------- 词频年份 + 教材分布 ----------
   Widget _buildYearDistribution() {
-
-    // 统计当前单词在各教材中的命中数（按文件路径）
-
     final textbookCounts = <String, int>{};
-
     for (final r in _textbookResults) {
-
       textbookCounts[r.filePath] = (textbookCounts[r.filePath] ?? 0) + 1;
-
     }
-
-    // 第三轮清单第 3 项：格宽不再写死 56，改为按面板内容宽动态计算
-    // cellW = (内容宽 − 12×6) / 13（间距只算 12 个），字号 10.5，「外研版」可完整显示。
-    final hasBoxes =
-        _textbookFiles.any((f) => f.isSelected) || _sortedYears.isNotEmpty;
-    // 统一格子：教材格在前 + 年份格在后，等宽一起排列
-    List<Widget> buildBoxes(double cellW) {
-    final allBoxes = <Widget>[];
-    // 教材格：
-    for (final cf in _textbookFiles.where((f) => f.isSelected)) {
-      final count = textbookCounts[cf.path] ?? 0;
-
-      final dotIdx = cf.name.lastIndexOf('.');
-
-      final name = dotIdx > 0 ? cf.name.substring(0, dotIdx) : cf.name;
-
-      final isSelected = _selectedTextbook == cf.path;
-
-      allBoxes.add(
-
-        Material(
-
-          color: Colors.transparent,
-
-          child: GlassPressable(radius: GlassTheme.rMd, hoverColor: GlassTheme.accentSoft, pressColor: const Color(0x294462F2), enabled: count > 0, child: InkWell(
-
-            onTap: count > 0
-
-                ? () => setState(() {
-
-                    // 统一点击筛选：教材格只筛该教材例句（真题例句无教材归属，按一致规则一并过滤）
-                    _selectedTextbook = isSelected ? null : cf.path;
-
-                    _selectedYear = null;
-
-                    _filteredTextbookResults = _selectedTextbook != null
-
-                        ? _textbookResults
-
-                              .where((r) => r.filePath == _selectedTextbook)
-
-                              .toList()
-
-                        : List.from(_textbookResults);
-
-                    _filteredResults = _selectedTextbook != null
-
-                        ? <ResultRow>[]
-
-                        : List.from(_results);
-
-                  })
-
-                : null,
-
-            borderRadius: BorderRadius.circular(GlassTheme.rMd),
-
-            child: AnimatedContainer(
-
-              duration: const Duration(milliseconds: 180),
-
-              width: cellW,
-
-              padding: const EdgeInsets.symmetric(horizontal: kGap4, vertical: kGap6),
-
-              decoration: BoxDecoration(
-
-                color: isSelected
-
-                    ? GlassTheme.violet
-
-                    : const Color(0x0F18181B), // rgba(24,24,27,0.06) 灰底
-
-                borderRadius: BorderRadius.circular(GlassTheme.rMd),
-
-                border: Border.all(
-
-                  color: Colors.transparent,
-
-                ),
-
-              ),
-
-              child: Column(
-
-                mainAxisSize: MainAxisSize.min,
-
-                children: [
-
-                  // 第三轮清单第 3 项：教材名（如「外研版」）字号 10.5，
-                  // FittedBox 缩排保证完整显示、绝不出现省略号
-                  FittedBox(
-
-                    fit: BoxFit.scaleDown,
-
-                    child: Text(
-
-                      name,
-
-                      maxLines: 1,
-
-                      softWrap: false,
-
-                      style: TextStyle(
-
-                        fontSize: 10.5,
-
-                        fontWeight: FontWeight.w600,
-
-                        height: 1.0,
-
-                        color: isSelected
-
-                            ? Colors.white
-
-                            : GlassTheme.ink2,
-
-                      ),
-
-                    ),
-
-                  ),
-
-                  const SizedBox(height: kGap4),
-
-                  Text(
-
-                    '$count',
-
-                    style: TextStyle(
-
-                      fontSize: 12,
-
-                      fontWeight: FontWeight.w600,
-
-                      color: isSelected
-
-                          ? Colors.white
-
-                          : GlassTheme.ink2,
-
-                    ),
-
-                  ),
-
-                ],
-
-              ),
-
-            ),
-
-          )),
-
-        ),
-
-      );
-
+    var yearTotal = 0;
+    for (final v in _yearFrequency.values) {
+      yearTotal += v;
     }
-
-    // 年份格：
-    for (final y in _sortedYears) {
-      final count = _yearFrequency[y] ?? 0;
-
-      final label = (y % 100).toString().padLeft(2, '0');
-
-      final isSelected = _selectedYear == y;
-
-      allBoxes.add(
-
-        Material(
-
-          color: Colors.transparent,
-
-          child: GlassPressable(radius: GlassTheme.rMd, hoverColor: GlassTheme.accentSoft, pressColor: const Color(0x294462F2), enabled: true, child: InkWell(
-
-            onTap: count > 0
-
-                ? () => setState(() {
-
-                    // 统一点击筛选：年份格只筛该年份真题例句（教材例句无年份归属，按一致规则一并过滤）
-                    _selectedYear = isSelected ? null : y;
-
-                    _selectedTextbook = null;
-
-                    _filteredResults = _selectedYear != null
-
-                        ? _results
-
-                              .where(
-
-                                (r) => r.source.startsWith('${_selectedYear!}'),
-
-                              )
-
-                              .toList()
-
-                        : List.from(_results);
-
-                    _filteredTextbookResults = _selectedYear != null
-
-                        ? <ResultRow>[]
-
-                        : List.from(_textbookResults);
-
-                  })
-
-                : null,
-
-            borderRadius: BorderRadius.circular(GlassTheme.rMd),
-
-            child: AnimatedContainer(
-
-              duration: const Duration(milliseconds: 180),
-
-              width: cellW,
-
-              padding: const EdgeInsets.symmetric(horizontal: kGap6, vertical: kGap6),
-
-              decoration: BoxDecoration(
-                // 第三关 ④：渐变只允许主按钮 / 徽标 / 选中胶囊三处，年份格有数据态改纯色淡靛蓝
-                gradient: null,
-
-                color: isSelected
-
-                    ? GlassTheme.violet
-
-                    : (count > 0 ? GlassTheme.accentSoft : const Color(0x73FFFFFF)), // rgba(255,255,255,.45)
-
-                borderRadius: BorderRadius.circular(GlassTheme.rMd),
-
-                border: Border.all(
-
-                  color: isSelected
-
-                      ? Colors.transparent
-
-                      : (count > 0
-
-                            ? const Color(0xFFC7D2FE)
-
-                            : Colors.transparent),
-
-                ),
-
-              ),
-
-              child: Column(
-
-                mainAxisSize: MainAxisSize.min,
-
-                children: [
-
-                  Text(
-
-                    label,
-
-                    style: TextStyle(
-
-                      // 第三轮清单第 3 项：年份格字号与教材格统一 10.5
-                      fontSize: 10.5,
-
-                      fontWeight: FontWeight.w600,
-
-                      height: 1.0,
-
-                      color: isSelected
-
-                          ? Colors.white
-
-                          : (count > 0
-
-                                ? GlassTheme.accentInk
-
-                                : GlassTheme.ink2),
-
-                    ),
-
-                  ),
-
-                  const SizedBox(height: kGap4),
-
-                  Text(
-
-                    '$count',
-
-                    style: TextStyle(
-
-                      fontSize: 12,
-
-                      fontWeight: FontWeight.w600,
-
-                      color: isSelected
-
-                          ? Colors.white
-
-                          : (count > 0
-
-                                ? GlassTheme.accentInk
-
-                                : GlassTheme.ink2),
-
-                    ),
-
-                  ),
-
-                ],
-
-              ),
-
-            ),
-
-          )),
-
-        ),
-
-      );
-
-    }
-
-    return allBoxes;
-    }
-
-    if (_importedYears.isEmpty && !hasBoxes) {
-
-      // ④-4 词频面板：必须存在（规范 §4.7 偏差 10），空态也保留玻璃面板
-      return SizedBox(
-        key: const ValueKey('region-freq'),
-        height: GlassTheme.hWordPanel,
-        child: GlassPanel(
-          radius: GlassTheme.rXl,
-          padding: const EdgeInsets.symmetric(horizontal: kGap16),
-          child: const Center(
-            child: Text(
-              '请点击真题导入按钮，导入真题数据',
-              style: TextStyle(fontSize: 13, color: GlassTheme.ink3),
-            ),
-          ),
-        ),
-      );
-
-    }
-
-    // ④-4 词频面板 h146 玻璃面板：23 个年份格 + 教材格，Wrap 两行、末行居中
-    return SizedBox(
-      key: const ValueKey('region-freq'),
-      height: GlassTheme.hWordPanel,
-      child: GlassPanel(
-      radius: GlassTheme.rXl,
-      sigma: 0, // 任务④：词频面板为常驻大面板，模糊不可见 → 关闭
-      // 视觉修正③：词频面板补 12 上内边距（规范 §4.3/§4.7：面板 padding 12 16 16），
-      // 原为 0 → 「词频年份/教材分布」标签行文字与面板上边缘过挤。
-      padding: const EdgeInsets.fromLTRB(kGap16, kGap12, kGap16, 0),
-
-      child: Column(
-
-        crossAxisAlignment: CrossAxisAlignment.start,
-
-        children: [
-
-          Padding(
-
-            padding: const EdgeInsets.only(bottom: kGap8),
-
-            child: Row(
-
-              children: [
-
-                Expanded(
-
-                  child: Text(
-
-                    '词频年份 (${_yearFrequency.values.fold(0, (a, b) => a + b)} 次) 与教材分布(${_textbookResults.length} 次)',
-                    textAlign: TextAlign.left,
-
-                    style: const TextStyle(
-
-                      fontSize: GlassTheme.fBody,
-
-                      fontWeight: FontWeight.w600,
-
-                      color: GlassTheme.ink,
-
-                    ),
-
-                  ),
-
-                ),
-
-                const Text(
-
-                  '检测后自动标注高频年份',
-                  style: TextStyle(
-
-                    fontSize: GlassTheme.fMicro,
-
-                    color: GlassTheme.ink3,
-
-                  ),
-
-                ),
-
-              ],
-
-            ),
-
-          ),
-
-          // 统一等宽格子：教材 + 年份 一起排列，优先两行居中（两行放不开才自然换行）
-          // 第三轮清单第 3 项：格子列表在 LayoutBuilder 内按 cellW 生成，此处只用 hasBoxes 判定
-          if (hasBoxes) ...[
-
-            // 自适应修复（窗口缩小时年份格显示不全）：
-            // Expanded 取面板（hWordPanel=146）内剩余可用高度，LayoutBuilder 同时按 可用宽 + 可用高 自适应：
-            //   ① 列数：设计基准每行最多 13 格（12 年份 + 1 教材），窗越窄按最小可读格宽 40 递减列数；
-            //   ② 格宽：按当前列数均分可用宽（夹 40~120），行内严格不溢出；
-            //   ③ 高度：由 Wrap 改为按行列等距排布（行距 = 列距 = 6），总高仍超出可用高时
-            //      用 FittedBox(scaleDown) 等比整体收小（只缩不放大、顶部对齐，保持紧跟标题的原观感），
-            //      任意窗口尺寸下年份格均完整可见：不裁切、不溢出、不出现横向滚动。
-            Expanded(
-              child: LayoutBuilder(
-                builder: (context, constraints) {
-                  const gap = kGap6;
-                  const minCellW = 40.0;
-                  const maxCellW = 120.0;
-                  final maxW = constraints.maxWidth;
-                  final maxH = constraints.maxHeight;
-                  if (maxW <= 0 || maxH <= 0) return const SizedBox.shrink();
-
-                  // 格子总数 = 已选教材数 + 年份数（与 buildBoxes 生成数一致）
-                  final n = _textbookFiles.where((f) => f.isSelected).length +
-                      _sortedYears.length;
-                  if (n <= 0) return const SizedBox.shrink();
-
-                  // 该宽度下最多能放几列（每格不小于最小可读格宽），再按设计基准 13 列封顶
-                  final colsFit = ((maxW + gap) / (minCellW + gap)).floor();
-                  final cols = colsFit.clamp(1, n < 13 ? n : 13);
-                  final cellW = ((maxW - (cols - 1) * gap) / cols)
-                      .clamp(minCellW, maxCellW)
-                      .toDouble();
-
-                  final allBoxes = buildBoxes(cellW);
-                  final rows = <Widget>[];
-                  for (var i = 0; i < allBoxes.length; i += cols) {
-                    final end = (i + cols).clamp(i, allBoxes.length);
-                    rows.add(
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        // 对齐示意图：格子之间留 8 间距（原为 0，格子互相贴边）
-                        spacing: gap,
-                        children: allBoxes.sublist(i, end),
-                      ),
-                    );
-                  }
-                  final grid = Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      for (var i = 0; i < rows.length; i++) ...[
-                        // 第三轮清单第 6 项：行距与列距一致 = 6
-                        if (i > 0) const SizedBox(height: gap),
-                        rows[i],
-                      ],
-                    ],
-                  );
-                  return FittedBox(
-                    fit: BoxFit.scaleDown,
-                    alignment: Alignment.topCenter,
-                    child: SizedBox(width: maxW, child: grid),
-                  );
-                },
-              ),
-            ),
-
-          ],
-
-          if (_selectedYear != null || _selectedTextbook != null)
-
-            Padding(
-
-              padding: const EdgeInsets.only(top: kGap4),
-
-              child: Wrap(
-
-                spacing: kGap12,
-
-                runSpacing: kGap4,
-
-                alignment: WrapAlignment.center,
-
-                children: [
-
-                  if (_selectedYear != null)
-
-                    GestureDetector(
-
-                      onTap: () => setState(() {
-
-                        _selectedYear = null;
-
-                        _filteredResults = List.from(_results);
-
-                        _filteredTextbookResults = List.from(_textbookResults);
-
-                      }),
-
-                      child: GlassPressable(radius: 6, hoverColor: GlassTheme.accentSoft, pressColor: const Color(0x294462F2), enabled: true, child: Text(
-
-                        '取消筛选· ${(_selectedYear! % 100).toString().padLeft(2, '0')}年',
-                        style: const TextStyle(
-
-                          fontSize: 12,
-
-                          color: GlassTheme.accentInk,
-
-                        ),
-
-                      ),
-                      ),
-
-                    ),
-
-                  if (_selectedTextbook != null)
-
-                    GestureDetector(
-
-                      onTap: () => setState(() {
-
-                        _selectedTextbook = null;
-
-                        _filteredResults = List.from(_results);
-
-                        _filteredTextbookResults = List.from(_textbookResults);
-
-                      }),
-
-                      child: GlassPressable(radius: 6, hoverColor: GlassTheme.accentSoft, pressColor: const Color(0x294462F2), enabled: true, child: Text(
-
-                        '取消筛选· ${_selectedTextbookName()}',
-                        style: const TextStyle(
-
-                          fontSize: 12,
-
-                          color: GlassTheme.accentInk,
-
-                        ),
-
-                      ),
-                      ),
-
-                    ),
-
-                ],
-
-              ),
-
-            ),
-
-        ],
-
-      ),
-
-      ),
-
+    return YearFilterBar(
+      textbookItems: [
+        for (final f in _textbookFiles.where((f) => f.isSelected))
+          (path: f.path, name: f.name),
+      ],
+      textbookCounts: textbookCounts,
+      years: _sortedYears,
+      yearCounts: _yearFrequency,
+      yearTotal: yearTotal,
+      textbookTotal: _textbookResults.length,
+      selectedYear: _selectedYear,
+      selectedTextbook: _selectedTextbook,
+      selectedTextbookName: _selectedTextbookName(),
+      onSelectYear: _toggleYearFilter,
+      onSelectTextbook: _toggleTextbookFilter,
+      onClearYear: () => setState(() {
+        _selectedYear = null;
+        _filteredResults = List.from(_results);
+        _filteredTextbookResults = List.from(_textbookResults);
+      }),
+      onClearTextbook: () => setState(() {
+        _selectedTextbook = null;
+        _filteredResults = List.from(_results);
+        _filteredTextbookResults = List.from(_textbookResults);
+      }),
     );
+  }
 
+  /// 统一点击筛选：年份格只筛该年份例句（教材例句无年份归属，按一致规则一并过滤）。
+  void _toggleYearFilter(int year) {
+    setState(() {
+      _selectedYear = _selectedYear == year ? null : year;
+      _selectedTextbook = null;
+      _filteredResults = _selectedYear != null
+          ? _results
+              .where((r) => r.source.startsWith('${_selectedYear!}'))
+              .toList()
+          : List.from(_results);
+      _filteredTextbookResults =
+          _selectedYear != null ? <ResultRow>[] : List.from(_textbookResults);
+    });
+  }
+
+  /// 统一点击筛选：教材格只筛该教材例句（真题例句无教材归属，按一致规则一并过滤）。
+  void _toggleTextbookFilter(String path) {
+    setState(() {
+      _selectedTextbook = _selectedTextbook == path ? null : path;
+      _selectedYear = null;
+      _filteredTextbookResults = _selectedTextbook != null
+          ? _textbookResults
+              .where((r) => r.filePath == _selectedTextbook)
+              .toList()
+          : List.from(_textbookResults);
+      _filteredResults =
+          _selectedTextbook != null ? <ResultRow>[] : List.from(_results);
+    });
   }
 
   // 当前选中的教材名称（用于"取消筛选"提示，去扩展名）
@@ -7388,7 +8222,14 @@ ${bodyParts.join('\n')}
   }
 
   // ---------- 检测结果表格----------
-  // ④-5 结果表头：高 38，三列 76 / flex:1 / 200，文字水平垂直居中，列间 1px 竖线（骨架）
+  // ④-5 结果表头：高 38，三列（序号 / 所在文本 / 出处），文字水平垂直居中，
+  // 列间 1px 竖线。序号与出处列宽随窗口收缩，保证窄窗口下「所在文本」不被挤没。
+  double get _resultIndexColW =>
+      (MediaQuery.of(context).size.width * 0.06).clamp(48.0, 76.0);
+
+  double get _resultSourceColW =>
+      (MediaQuery.of(context).size.width * 0.16).clamp(110.0, 200.0);
+
   Widget _buildResultHeader() {
     return Container(
       height: GlassTheme.hTableHeader,
@@ -7400,7 +8241,7 @@ ${bodyParts.join('\n')}
       child: Row(
         children: [
           SizedBox(
-            width: 76,
+            width: _resultIndexColW,
             child: Center(
               child: Text(
                 '序号',
@@ -7433,7 +8274,7 @@ ${bodyParts.join('\n')}
           ),
           Container(width: 1, height: 16, color: GlassTheme.line),
           SizedBox(
-            width: 200,
+            width: _resultSourceColW,
             child: Center(
               child: Text(
                 '出处',
@@ -7539,43 +8380,51 @@ ${bodyParts.join('\n')}
             : _filteredResults[index];
         final source =
             isTextbook ? _textbookNameByPath(row.filePath) : row.source;
-        return Container(
-          key: ValueKey('${row.source}_${row.matchOffset}'),
-          padding: const EdgeInsets.fromLTRB(kGap8, kGap6, kGap8, kGap6),
-          decoration: BoxDecoration(
-            border: Border(bottom: BorderSide(color: GlassTheme.line)),
-          ),
-          child: Row(
-            children: [
-              SizedBox(
-                width: 76,
-                child: Text(
-                  '${index + 1}',
-                  textAlign: TextAlign.left,
-                  style: TextStyle(fontSize: 12, color: GlassTheme.ink3),
-                ),
+        // 整行可点击：点击任意位置（含「所在文本」列单词）联动左/右原文定位
+        return MouseRegion(
+          cursor: SystemMouseCursors.click,
+          child: InkWell(
+            onTap: () => _showResultInRightReader(row),
+            hoverColor: const Color(0x0A18181B),
+            child: Container(
+              key: ValueKey('${row.source}_${row.matchOffset}'),
+              padding: const EdgeInsets.fromLTRB(kGap8, kGap6, kGap8, kGap6),
+              decoration: BoxDecoration(
+                border: Border(bottom: BorderSide(color: GlassTheme.line)),
               ),
-              const VerticalDivider(
-                width: 1,
-                thickness: 1,
-                color: GlassTheme.line,
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: _resultIndexColW,
+                    child: Text(
+                      '${index + 1}',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(fontSize: 12, color: GlassTheme.ink3),
+                    ),
+                  ),
+                  const VerticalDivider(
+                    width: 1,
+                    thickness: 1,
+                    color: GlassTheme.line,
+                  ),
+                  Expanded(child: _buildContextRow(row)),
+                  const VerticalDivider(
+                    width: 1,
+                    thickness: 1,
+                    color: GlassTheme.line,
+                  ),
+                  SizedBox(
+                    width: _resultSourceColW,
+                    child: Text(
+                      source,
+                      textAlign: TextAlign.right,
+                      style: TextStyle(fontSize: 12, color: GlassTheme.ink3),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
               ),
-              Expanded(child: _buildContextRow(row)),
-              const VerticalDivider(
-                width: 1,
-                thickness: 1,
-                color: GlassTheme.line,
-              ),
-              SizedBox(
-                width: 200,
-                child: Text(
-                  source,
-                  textAlign: TextAlign.right,
-                  style: TextStyle(fontSize: 12, color: GlassTheme.ink3),
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ),
-            ],
+            ),
           ),
         );
       },
@@ -7711,7 +8560,7 @@ ${bodyParts.join('\n')}
                     child: Padding(
                       padding: const EdgeInsets.all(kGap12),
                       child: Text(
-                        '点击左侧文件或中间结果中的单词\n此处将展示原文并自动定位高亮',
+                        '完成检测后此处展示被检测文本\n点击中间结果中的单词可自动定位',
                         textAlign: TextAlign.center,
                         style: TextStyle(
                           fontSize: 12,
@@ -7722,6 +8571,7 @@ ${bodyParts.join('\n')}
                     ),
                   )
                 : TextField(
+                    key: _rightReaderKey,
                     controller: controller,
                     scrollController: _rightScrollController,
                     readOnly: !isExamFile,
@@ -7921,122 +8771,243 @@ ${bodyParts.join('\n')}
     }
   }
 
-  /// 左侧文件列表点击联动：右侧常驻面板展示该文件原文
-  Future<void> _showFileInRightReader(String path, String title) async {
-    try {
-      final file = File(path);
-      if (!file.existsSync()) return;
-      // 优先走缓存读取，支持 txt/doc/docx/pdf 等格式
-      final text = await _readFileTextCached(path);
-      setState(() {
-        _rightPanelVisible = true;
-        _rightPanelTitle = title;
-        _rightPanelKeyword = '';
-        _rightPanelRow = null;
-                _rightHighlightController?.dispose();
-        _rightHighlightController = _HighlightController(text, '');
-      });
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (_rightScrollController.hasClients) {
-          _rightScrollController.jumpTo(0);
-        }
-      });
-    } catch (_) {
-      // 读取失败则忽略，不影响左侧功能
+  /// 被检测的导入文本（右侧面板唯一数据源）。
+  ///
+  /// 文档检测模式下输入框即当前被检测文本；从导入结果进入单词查词模式后
+  /// 输入框已被查询词占用，回退到进入查词前保存的导入文本。
+  /// 回退只对「从导入文档点词进入的查词」有效（[_cameFromImportedMode]）：
+  /// 用户自行输入 / 从历史发起独立查词时，右侧没有可展示的被检测文本。
+  String _detectedSourceText() {
+    if (_inImportedMode) return _searchController.text;
+    if (_cameFromImportedMode && _savedImportedText.isNotEmpty) {
+      return _savedImportedText;
     }
+    return '';
   }
 
-  /// 中间结果行点击联动：右侧常驻面板展示所在文件原文并滚动定位到该词
-  Future<void> _showResultInRightReader(ResultRow row) async {
-    // 捕获读取代际：等待文件读取期间用户若点击了其他结果行，旧读取结果不得覆盖
-    final seq = ++_readerSeq;
-    final file = File(row.filePath);
-    if (!file.existsSync()) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('文件不存在：${row.source}')),
-        );
-      }
-      return;
-    }
-    String text;
-    try {
-      // 优先走缓存读取，支持 txt/doc/docx/pdf 等格式
-      text = await _readFileTextCached(row.filePath);
-    } catch (_) {
-      text = '';
-    }
-    // 读取期间用户已切换到其他行，本次结果作废
-    if (!mounted || seq != _readerSeq) return;
-    final totalLen = text.length;
+  /// 用户从搜索框 / 历史 / 词库发起独立查词：退出「导入文档」语境。
+  ///
+  /// 之后点击结果行时右侧不再回退显示上一次导入的文档文本（无导入文档即留空）。
+  void _beginIndependentQuery() {
+    if (!_inImportedMode && !_cameFromImportedMode) return;
     setState(() {
-      _rightPanelVisible = true;
-      _rightPanelTitle = row.source;
-      _rightPanelKeyword = row.keyword;
-      _rightPanelRow = row;
-            _rightHighlightController?.dispose();
-      _rightHighlightController = _HighlightController(text, row.keyword);
-    });
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (totalLen > 0 && _rightScrollController.hasClients) {
-        final ratio = (row.matchOffset / totalLen).clamp(0.0, 1.0);
-        final maxExtent = _rightScrollController.position.maxScrollExtent;
-        _rightScrollController.jumpTo(maxExtent * ratio);
-      }
+      _inImportedMode = false;
+      _cameFromImportedMode = false;
     });
   }
 
-  /// 导入词点击联动：右侧常驻面板展示导入文档原文并滚动定位到该词
-  void _showImportedInRightReader(String word) {
-    final kw = word.toLowerCase();
-    String text = '';
-    String title = _importedFileName ?? '导入文档';
-    String filePath = _importedFilePath ?? '';
-    // 优先读导入的文件；无文件（粘贴文本场景）则回退到已保存的导入文本
-    if (filePath.isNotEmpty) {
-      final file = File(filePath);
-      if (file.existsSync()) {
-        try {
-          text = file.readAsStringSync();
-        } catch (_) {
-          text = '';
-        }
-      }
-    }
-    if (text.isEmpty) {
-      text = _savedImportedText;
-    }
-    if (text.isEmpty) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('未找到可定位的导入文档')),
-        );
-      }
-      return;
-    }
-    // 定位：大小写不敏感查找单词首次出现位置
-    int offset = text.toLowerCase().indexOf(kw);
-    if (offset < 0) {
-      final m = RegExp('\\b${RegExp.escape(word)}\\b', caseSensitive: false)
-          .firstMatch(text);
-      offset = m?.start ?? 0;
-    }
+  /// 右侧面板展示被检测文本，并（可选）滚动定位到关键词。
+  ///
+  /// [occurrence] 指定定位第几次出现（从 0 开始），用于结果行多点命中时
+  /// 尽量对准同一处；越界则回退到首次出现。
+  /// 返回 false 表示当前没有可展示的被检测文本（纯查词模式，未导入文档）。
+  bool _showDetectedTextInRightReader({
+    String keyword = '',
+    int occurrence = 0,
+  }) {
+    final text = _detectedSourceText();
+    if (text.isEmpty) return false;
     final totalLen = text.length;
+    final offset =
+        keyword.isEmpty ? 0 : _keywordOccurrenceOffset(text, keyword, occurrence);
     setState(() {
       _rightPanelVisible = true;
-      _rightPanelTitle = title;
-      _rightPanelKeyword = word;
+      _rightPanelTitle = _importedFileName ?? '被检测文本';
+      _rightPanelKeyword = keyword;
+      _rightPanelOccurrence = occurrence;
       _rightPanelRow = null;
-            _rightHighlightController?.dispose();
-      _rightHighlightController = _HighlightController(text, word);
-    });
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (totalLen > 0 && _rightScrollController.hasClients) {
-        final ratio = (offset / totalLen).clamp(0.0, 1.0);
-        final maxExtent = _rightScrollController.position.maxScrollExtent;
-        _rightScrollController.jumpTo(maxExtent * ratio);
+      final existing = _rightHighlightController;
+      if (existing != null && existing.text == text) {
+        // 文本未变：只换关键词，保留滚动位置（避免新 controller 把滚动重置到顶部）
+        existing.setKeyword(keyword);
+      } else {
+        existing?.dispose();
+        _rightHighlightController = _HighlightController(text, keyword);
       }
     });
+    _jumpRightReaderTo(offset, totalLen);
+    return true;
+  }
+
+  /// 收起右侧原文面板：无被检测的导入文本时不展示任何内容。
+  void _hideRightReader() {
+    if (!_rightPanelVisible && _rightHighlightController == null) return;
+    setState(() {
+      _rightPanelVisible = false;
+      _rightPanelTitle = '';
+      _rightPanelKeyword = '';
+      _rightPanelOccurrence = 0;
+      _rightPanelRow = null;
+      _rightHighlightController?.dispose();
+      _rightHighlightController = null;
+    });
+  }
+
+  /// 取关键词第 [occurrence] 次出现的位置（0 起）；越界返回最后一次命中，
+  /// 完全找不到时按单词边界兜底，仍找不到返回 0。
+  int _keywordOccurrenceOffset(String text, String keyword, int occurrence) {
+    final lowerText = text.toLowerCase();
+    final lowerKw = keyword.toLowerCase();
+    var from = 0;
+    var found = -1;
+    for (var i = 0; i <= occurrence; i++) {
+      final at = lowerText.indexOf(lowerKw, from);
+      if (at < 0) break;
+      found = at;
+      from = at + lowerKw.length;
+    }
+    if (found >= 0) return found;
+    final m = RegExp('\\b${RegExp.escape(keyword)}\\b', caseSensitive: false)
+        .firstMatch(text);
+    return m?.start ?? 0;
+  }
+
+  /// 窗口尺寸变化后，按各自锚点把左右原文重新定位到关键词处。
+  void _reanchorReaders() {
+    for (final path in <String>{
+      ..._corpusReaderOpen,
+      ..._textbookReaderOpen,
+    }) {
+      final text = _corpusReaderTexts[path];
+      final controller = _corpusReaderControllers[path];
+      final anchor = _corpusReaderAnchors[path];
+      if (text == null || controller == null || anchor == null) continue;
+      if (controller.keyword.isEmpty) continue;
+      _jumpCorpusReaderToKeyword(path, text, controller.keyword, anchor);
+    }
+    if (_rightPanelVisible && _rightPanelKeyword.isNotEmpty) {
+      final text = _rightHighlightController?.text;
+      if (text != null && text.isNotEmpty) {
+        _jumpRightReaderTo(
+          _keywordOccurrenceOffset(
+            text,
+            _rightPanelKeyword,
+            _rightPanelOccurrence,
+          ),
+          text.length,
+        );
+      }
+    }
+  }
+
+  /// 右侧原文滚动到指定字符位置：优先精确行位置，布局未就绪时回退比例。
+  void _jumpRightReaderTo(int offset, int totalLen, [int attempt = 0]) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      if (!_rightScrollController.hasClients) {
+        if (attempt < 10) _jumpRightReaderTo(offset, totalLen, attempt + 1);
+        return;
+      }
+      final pos = _rightScrollController.position;
+      double target;
+      final editable = _findRenderEditable(
+        _rightReaderKey.currentContext?.findRenderObject(),
+      );
+      // 只有渲染层已装载完整原文时才用精确行定位，否则先按比例并继续重试
+      final ready = editable != null &&
+          totalLen > 0 &&
+          editable.plainText.length == totalLen;
+      if (ready) {
+        final safe = offset < 0 ? 0 : (offset > totalLen ? totalLen : offset);
+        final caret = editable.getLocalRectForCaret(TextPosition(offset: safe));
+        // caret.top 是视口坐标（已含滚动偏移），换算成文本坐标后再定位
+        target = caret.top + pos.pixels - pos.viewportDimension * 0.25;
+      } else {
+        final ratio = totalLen <= 0 ? 0.0 : (offset / totalLen).clamp(0.0, 1.0);
+        target = pos.maxScrollExtent * ratio;
+      }
+      _rightScrollController.jumpTo(target.clamp(0.0, pos.maxScrollExtent));
+      // 面板首次展开时布局可能尚未稳定，连续几帧重算校正（幂等）
+      if (attempt < 3 || (!ready && attempt < 10)) {
+        _jumpRightReaderTo(offset, totalLen, attempt + 1);
+      }
+    });
+  }
+
+  /// 中间结果行点击联动：真题结果在左侧内联展开并定位，右侧展示被检测文本；
+  /// 教材结果沿用右侧原文面板展示教材原文并定位。
+  Future<void> _showResultInRightReader(ResultRow row) async {
+    CorpusFile? corpus;
+    for (final f in _corpusFiles) {
+      if (f.path == row.filePath) {
+        corpus = f;
+        break;
+      }
+    }
+    if (corpus != null) {
+      // 左侧：折叠其它年份，展开该词所在年份并跳转到该词
+      await _openCorpusReader(
+        corpus,
+        keyword: row.keyword,
+        matchOffset: row.matchOffset,
+        collapseOthers: true,
+        focusOnly: true,
+      );
+      // 右侧：展示被检测的导入文本并跳转到该词（纯查词模式无导入文本则不动）
+      // 同一单词多次命中时按当前行在同一单词结果中的序号对齐
+      var occurrence = 0;
+      final idx = _filteredResults.indexOf(row);
+      if (idx > 0) {
+        final kw = row.keyword.toLowerCase();
+        for (var i = 0; i < idx; i++) {
+          if (_filteredResults[i].keyword.toLowerCase() == kw) occurrence++;
+        }
+      }
+      if (!_showDetectedTextInRightReader(
+        keyword: row.keyword,
+        occurrence: occurrence,
+      )) {
+        // 没有导入文档：右侧不显示任何内容（教材原文只在左栏内联展示）
+        _hideRightReader();
+      }
+      return;
+    }
+    // 教材例句：左栏教材列表内联展开并定位该词；右侧始终保持被检测的导入文本
+    setState(() {
+      _leftPanelIsTextbook = true;
+      _activeTextbookPath = row.filePath;
+    });
+    CorpusFile? textbook;
+    for (final f in _textbookFiles) {
+      if (f.path == row.filePath) {
+        textbook = f;
+        break;
+      }
+    }
+    if (textbook != null) {
+      await _openTextbookReader(
+        textbook,
+        keyword: row.keyword,
+        matchOffset: row.matchOffset,
+        collapseOthers: true,
+        focusOnly: true,
+      );
+    }
+    // 同一单词在教材结果中多次命中时按序号对齐
+    var occurrence = 0;
+    final idx = _filteredTextbookResults.indexOf(row);
+    if (idx > 0) {
+      final kw = row.keyword.toLowerCase();
+      for (var i = 0; i < idx; i++) {
+        if (_filteredTextbookResults[i].keyword.toLowerCase() == kw) {
+          occurrence++;
+        }
+      }
+    }
+    if (!_showDetectedTextInRightReader(
+      keyword: row.keyword,
+      occurrence: occurrence,
+    )) {
+      // 没有导入文档：右侧不显示任何内容（教材原文只在左栏内联展示）
+      _hideRightReader();
+    }
+  }
+
+  /// 导入词点击联动：右侧面板展示被检测文本并滚动定位到该词
+  void _showImportedInRightReader(String word) {
+    if (_showDetectedTextInRightReader(keyword: word)) return;
+    // 无被检测的导入文本时面板保持收起，不展示任何内容
+    _hideRightReader();
   }
 
 
@@ -8505,6 +9476,7 @@ ${bodyParts.join('\n')}
                                           onTap: () {
                                             Navigator.pop(listCtx);
                                             _searchController.text = w;
+                                            _beginIndependentQuery();
                                             _onDetect();
                                           },
                                           child: Text(
@@ -8801,179 +9773,6 @@ ${bodyParts.join('\n')}
     }
     _saveConfig();
     return true;
-  }
-
-  // ==================== 词库列表入口按钮 ====================
-  // ④-2 统计卡：高 72，三张等宽（骨架 4.2）
-  Widget _buildWordBankEntries() {
-    return Container(
-      key: const ValueKey('region-stats'),
-      height: GlassTheme.hStatCard,
-      padding: EdgeInsets.zero,
-      child: Row(
-        children: [
-          _buildWordBankEntry(
-            label: '拓展词汇',
-            count: _extendWords.length,
-            color: const Color(0xFF4462F2),
-            dotColor: const Color(0xFFA0C4FF),
-            bg: const Color(0x174462F2),
-            border: Colors.transparent,
-            onTap: _showExtendWordsDialog,
-            icon: Icons.circle,
-            subLabel: '词',
-          ),
-          const SizedBox(width: kGap12),
-          _buildWordBankEntry(
-            label: '超标词汇',
-            count: _manualChaoGangWords.length,
-            color: const Color(0xFFF59E0B),
-            dotColor: const Color(0xFFFFB74D),
-            bg: const Color(0x1AF59E0B),
-            border: Colors.transparent,
-            onTap: _showChaoGangWordsDialog,
-            icon: Icons.circle,
-            subLabel: '词',
-          ),
-          const SizedBox(width: kGap12),
-          _buildWordBankEntry(
-            label: '专有词汇',
-            count: _manualExtraWords.length,
-            color: const Color(0xFF8B5CF6),
-            dotColor: const Color(0xFFB39DDB),
-            bg: const Color(0x1A8B5CF6),
-            border: Colors.transparent,
-            onTap: _showExtraWordsDialog,
-            icon: Icons.circle,
-            subLabel: '词',
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildWordBankEntry({
-    required String label,
-    required int count,
-    required Color color,
-    required Color bg,
-    required Color border,
-    required VoidCallback onTap,
-    IconData icon = Icons.folder_outlined,
-    Color? dotColor,
-    String subLabel = '词库',
-  }) {
-    return Expanded(
-      child: Material(
-        color: Colors.transparent,
-        child: GlassPressable(radius: GlassTheme.rXl, hoverColor: GlassTheme.accentSoft, pressColor: const Color(0x294462F2), enabled: true, child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(GlassTheme.rXl),
-          // 第三关 ②③：统计卡与其余面板统一玻璃结构 ClipRRect(12) → FrostFilter(blur20) → Container
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(GlassTheme.rXl),
-            child: FrostFilter(
-              enabled: false,
-              filter: ui.ImageFilter.blur(sigmaX: 20, sigmaY: 20),
-              child: Container(
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                      colors: [
-                        color.withValues(alpha: 0.10),
-                        const Color(0x4DFFFFFF), // rgba(255,255,255,0.30) 规范 2.5
-                      ],
-                    ),
-                    borderRadius: BorderRadius.circular(GlassTheme.rXl),
-                    // 第三关 ③：描边统一 line(0x1418181B)（带 borderRadius 的 Border 必须四边同色）
-                    border: Border.all(
-                      color: border == Colors.transparent ? GlassTheme.line : border,
-                    ),
-                  ),
-                  child: Stack(
-                    children: [
-                      // 任务②：卡内留白/行距随窗口等比缩放（与卡高 hStatCard 同步收缩，
-                      // 避免窗口变小时文字被固定留白挤到卡外）。
-                      Padding(
-                        padding: EdgeInsets.symmetric(
-                            horizontal: GlassTheme.dp(kGap16),
-                            vertical: GlassTheme.dp(kGap10)),
-                        // 任务②：内容整体再套一层 scaleDown —— 文字排版高度存在
-                        // 亚像素取整，极端缩放下仍可能高出卡高不到 1px；此层保证
-                        // 任何尺寸下内容都完整落在卡内，不出现 overflow 提示条。
-                        child: Align(
-                          alignment: Alignment.centerLeft,
-                          child: FittedBox(
-                            fit: BoxFit.scaleDown,
-                            alignment: Alignment.centerLeft,
-                            child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          GlowDot(color: dotColor ?? color, size: GlassTheme.dp(7)),
-                          SizedBox(width: GlassTheme.dp(kGap7)),
-                          Text(
-                            label,
-                            style: TextStyle(
-                              fontSize: GlassTheme.fSmall,
-                              fontWeight: FontWeight.w500,
-                              color: color,
-                            ),
-                          ),
-                        ],
-                      ),
-                      SizedBox(height: GlassTheme.dp(kGap9)),
-                      Row(
-                        mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: CrossAxisAlignment.baseline,
-                        textBaseline: TextBaseline.alphabetic,
-                        children: [
-                          // 第三轮清单第 7 项：统计数字加千分位（7,750 / 2,972，保留 tabular-nums）
-                          Text(
-                            _thousands(count),
-                            style: TextStyle(
-                              fontSize: GlassTheme.fNum,
-                              height: 1.0,
-                              fontWeight: FontWeight.w700,
-                              color: color,
-                              fontFeatures: const [ui.FontFeature.tabularFigures()],
-                            ),
-                          ),
-                          SizedBox(width: GlassTheme.dp(kGap4)),
-                          Text(
-                            subLabel,
-                            style: const TextStyle(
-                              fontSize: GlassTheme.fSmall,
-                              color: GlassTheme.ink3,
-                              height: 1,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                          ),
-                        ),
-                        ),
-                      // 第三关 ③：顶部 1px 白色内高光（与 GlassPanel 同款；Container 无 padding，高光贴面板顶缘）
-                      Positioned(
-                        top: 0,
-                        left: 0,
-                        right: 0,
-                        child: Container(height: 1, color: GlassTheme.lineHi),
-                      ),
-                    ],
-                  ),
-              ),
-            ),
-          ),
-        )),
-      ),
-    );
   }
 
   String _genUserId() {
@@ -10314,7 +11113,7 @@ ${bodyParts.join('\n')}
   }
 
   void _checkUpdate() async {
-    const currentVersion = '1.5.8';
+    const currentVersion = '1.6.0';
     try {
       final response = await http
           .get(
@@ -10456,7 +11255,16 @@ class CorpusFile {
   final String name;
   final String path;
   bool isSelected;
-  CorpusFile({required this.name, required this.path, this.isSelected = true});
+
+  /// 是否来自内置真题包（随安装包发布、首启释放到用户目录）。
+  /// 内置文件与用户自行导入的文件互不覆盖，左栏分区展示。
+  final bool isBuiltin;
+  CorpusFile({
+    required this.name,
+    required this.path,
+    this.isSelected = true,
+    this.isBuiltin = false,
+  });
 }
 
 class ResultRow {
@@ -10501,7 +11309,19 @@ class _CachedFileText {
 }
 
 class _HighlightController extends TextEditingController {
-  final String _keyword;
+  String _keyword;
+
+  /// 当前高亮关键词（窗口缩放后按此重新定位）
+  String get keyword => _keyword;
+
+  /// 同一文本内切换关键词时原地更新，避免替换 controller 导致滚动位置被重置
+  void setKeyword(String kw) {
+    if (_keyword == kw) return;
+    _keyword = kw;
+    _cachedRegex = null;
+    _cachedKeyword = null;
+    notifyListeners();
+  }
 
   /// 用户修改处区间（"修改"保存后追加），渲染时以琥珀色高亮标记
   final List<({int start, int end})> editSpans;

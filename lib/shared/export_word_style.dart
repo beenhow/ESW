@@ -61,8 +61,12 @@ class ExportWordStyle {
   String? get dashedShadeHex => shadeHex == null ? null : '#$shadeHex';
 }
 
-/// 七类词的规范样式表（用户导出样式图口径）。
+/// 规范样式表（导出样式图口径；Android 与 Windows 共用）。
 ///
+/// 表中保留历史字重（初中 / 必修 / 拓展加粗）供 Android 端沿用；
+/// Windows 端方案一通过 `colorBold: false` 关闭加粗，只靠颜色区分。
+/// 未筛选词在 Windows 导出前会被前置拦截（必须先归类），其历史样式仅保留
+/// 给 Android 与统计口径使用，不会出现在 Windows 导出文档中。
 /// shadeHex 为各类规范色的极淡同色底纹，仅 PDF 导出原文标注使用。
 const Map<String, ExportWordStyle> kExportWordStyles = {
   // 初中课标词：黑色加粗
@@ -98,14 +102,17 @@ const Map<String, ExportWordStyle> kExportWordStyles = {
     colorHex: '800080',
     shadeHex: 'EBD9F0',
   ),
-  // 未筛选：土红色（不加粗）
+  // 未筛选：土红色（Windows 导出已拦截，不会落盘）
   ExportCategory.unfiltered: ExportWordStyle(
     colorHex: 'A0522D',
     shadeHex: 'F0E0D6',
   ),
 };
 
-/// 取某类词的规范样式；非规范七类（真题词 / 其他）返回 null，表示不参与配色标注。
+/// 取某类词的规范样式；真题词 / 其他返回 null，表示不参与配色标注。
+///
+/// Windows 导出通过 `annotateUnfiltered: false` 跳过未筛选词：
+/// 导出前已有前置拦截，双保险确保未筛选词绝不会被标记。
 ExportWordStyle? exportWordStyleOf(String? category) =>
     category == null ? null : kExportWordStyles[category];
 
@@ -128,15 +135,35 @@ String standardExportCategory(String level) {
   }
 }
 
-/// 检测结果的词库归属 → 导出原文标注分类（安卓检测口径）。
+/// 检测结果的词库归属 → 导出原文标注分类（双端唯一口径）。
 ///
 /// 安卓检测分类为「课标词 / 拓展词 / 超标词 / 专有词 / 其他」，Windows 为
-/// 「课标词 / 拓展词 / 超标词 / 专有词 / 未筛选」。两端必须给出同一个导出分类：
-/// - 课标词**保持粗粒度**，不按课标级别细分（细分只用于汇总统计），否则原文会
-///   被染成黑粗 / 深蓝 / 浅蓝，与 Windows 版不一致；
-/// - 「其他」= Windows「未筛选且语料出现过」，统一降为真题词，不参与配色。
-String exportAnnotateCategoryOfFilter(String filterCategory) =>
-    filterCategory == '其他' ? '真题词' : filterCategory;
+/// 「课标词 / 拓展词 / 超标词 / 专有词 / 未筛选」，两端都必须经本函数落到同一
+/// 套七类导出分类上（原文标注、标注说明、汇总统计共用）：
+/// - 课标词：按课标级别细分为「初中课标词 / 必修课标词 / 选修课标词」，
+///   级别缺失时按初中处理（与 [standardExportCategory] 的统计口径一致）；
+/// - 拓展词 / 超标词 / 专有词：原样透传；
+/// - 未筛选 / 其他：真题语料出现过 → 「真题词」（叠加维度，不参与标注）；
+///   四库均不收录且未在语料出现 → 「未筛选」（导出不标注，且导出前会被拦截）。
+String exportAnnotateCategoryOfDetected({
+  required String category,
+  String standardLevel = '',
+  bool isInCorpus = false,
+}) {
+  switch (category) {
+    case '课标词':
+      return standardExportCategory(standardLevel);
+    case ExportCategory.extend:
+    case ExportCategory.overLimit:
+    case ExportCategory.proper:
+      return category;
+    case '未筛选':
+    case '其他':
+      return isInCorpus ? '真题词' : ExportCategory.unfiltered;
+    default:
+      return category;
+  }
+}
 
 /// 七类规范色按规范顺序排列的色表，
 /// 供 RTF 颜色表等「按索引引用颜色」的格式使用（索引 1 起对应本表第 1 项）。
@@ -149,7 +176,75 @@ List<String> exportPaletteHex() {
   return list;
 }
 
-/// 导出文档中的标注说明文本（各格式共用，保证说明与配色、字重一致）。
-String exportAnnotateLegend() =>
-    '标注说明：初中课标词 黑色加粗；必修课标词 深蓝色加粗；选修课标词 浅蓝色；'
-    '拓展词 深绿色加粗；超标词 红色；专有词 紫色；未筛选 土红色。';
+/// 导出原文标注的方案（导出弹窗由用户二选一）。
+///
+/// - [color]：沿用既有导出，按单词类型标不同颜色（七类规范色表）；
+/// - [typography]：全文单词统一 Times New Roman 常规体，按类型用
+///   加粗 / 单下划线 / 30% 灰底纹 / 点线下划线区分，不加任何符号。
+enum ExportAnnotateScheme {
+  color,
+  typography,
+}
+
+/// 方案二统一使用的西文字体。
+const String kExportTypographyFont = 'Times New Roman';
+
+/// 方案二专有词的 30% 灰底纹填充色（30% 黑度，黑字仍清晰）。
+const String kExportScheme2ShadeFill = 'B3B3B3';
+
+/// 方案二的单类词标记：加粗 / 下划线线型 / 灰底纹。
+///
+/// 课标词（初中 / 必修 / 选修）统一不区分，保持默认 TNR 常规体；
+/// 「真题词」不参与标注（它只是“在真题文档里出现但不在标注类型内”的词）。
+class ExportScheme2Style {
+  final bool bold;
+
+  /// OOXML `w:u` 取值（'single' / 'dotted'）；null 表示无下划线。
+  final String? underline;
+
+  /// OOXML `w:shd` 填充色（无 # 前缀）；null 表示无底纹。
+  final String? shadeFill;
+
+  const ExportScheme2Style({
+    this.bold = false,
+    this.underline,
+    this.shadeFill,
+  });
+}
+
+/// 方案二：类别 -> 标记组合（用户指定的简化映射）。
+///
+/// - 课标词（初中 / 必修 / 选修）：默认字体，不标注；
+/// - 拓展词：加粗；
+/// - 超标词：单线下划线；
+/// - 专有词：30% 灰底纹。
+/// 未筛选词不标注（导出前会被拦截，要求先归类完毕）。
+const Map<String, ExportScheme2Style> kExportScheme2Styles = {
+  ExportCategory.standardJunior: ExportScheme2Style(),
+  ExportCategory.standardCompulsory: ExportScheme2Style(),
+  ExportCategory.standardElective: ExportScheme2Style(),
+  ExportCategory.extend: ExportScheme2Style(bold: true),
+  ExportCategory.overLimit: ExportScheme2Style(underline: 'single'),
+  ExportCategory.proper: ExportScheme2Style(shadeFill: kExportScheme2ShadeFill),
+};
+
+/// 取某类词在方案二下的标记；未筛选 / 真题词 / 其他 / 未知返回 null，
+/// 表示不标注（正文仍是 TNR 常规体）。
+ExportScheme2Style? exportScheme2StyleOf(String? category) =>
+    category == null ? null : kExportScheme2Styles[category];
+
+/// 导出文档中的标注说明文本（各格式共用，保证说明与实际标注一致）。
+///
+/// [scheme] 与用户在导出弹窗中的选择一致：方案一描述七类配色，
+/// 方案二描述加粗 / 下划线 / 灰底纹映射。
+String exportAnnotateLegend({
+  ExportAnnotateScheme scheme = ExportAnnotateScheme.color,
+}) {
+  if (scheme == ExportAnnotateScheme.typography) {
+    return '标注说明（黑白打印可辨）：课标词（初中/必修/选修）默认字体不标注；'
+        '拓展词 加粗；超标词 单线下划线；专有词 30% 灰底纹；'
+        '真题词不标注。全文西文统一 $kExportTypographyFont 常规体。';
+  }
+  return '标注说明：初中课标词 黑色；必修课标词 深蓝色；选修课标词 浅蓝色；'
+      '拓展词 深绿色；超标词 红色；专有词 紫色（仅用颜色区分，不加粗）。';
+}

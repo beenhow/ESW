@@ -40,8 +40,9 @@ void _logGlobalError(String phase, Object error, StackTrace? stack) {
       if (stack != null) 'STACK:\n$stack',
       '',
     ];
-    File('$dir/esw_crash.log')
-        .writeAsStringSync(lines.join('\n'), mode: FileMode.append);
+    File(
+      '$dir/esw_crash.log',
+    ).writeAsStringSync(lines.join('\n'), mode: FileMode.append);
   } catch (_) {}
 }
 
@@ -88,7 +89,7 @@ void main() async {
     EswPerf.startStallWatch();
     const winSize = Size(1200, 680);
     const winMinSize = Size(900, 600);
-    const winTitle = '真题课标词 v1.5.8';
+    const winTitle = '真题课标词 v1.6.0';
     final swWin = Stopwatch()..start();
     // 5 个窗口设置互不依赖：并行发起，省掉串行平台往返（每个 ~5ms，冷启动更久）。
     // 逐项打点用于确认「谁来承担启动期平台往返成本」。
@@ -104,8 +105,10 @@ void main() async {
     final winSetup = Platform.environment['ESW_WIN_SETUP'] != '1'
         ? Future<void>.value()
         : Future.wait<void>([
-            timed('titleBarStyle',
-                windowManager.setTitleBarStyle(TitleBarStyle.hidden)),
+            timed(
+              'titleBarStyle',
+              windowManager.setTitleBarStyle(TitleBarStyle.hidden),
+            ),
             timed('title', windowManager.setTitle(winTitle)),
             timed('size', windowManager.setSize(winSize)),
             timed('alignment', windowManager.setAlignment(Alignment.center)),
@@ -155,6 +158,20 @@ class EswApp extends StatelessWidget {
       title: 'ESW',
       debugShowCheckedModeBanner: false,
       theme: EswTheme.light,
+      // 全局字号倍率兜底：页面内由 EswResponsive.wrap 缩放，但弹窗 / 浮层 /
+      // 底部面板是在 wrap 之外通过 Navigator / Overlay 挂载的，拿不到页面缩放。
+      // 部分 ROM 系统字号默认可达 1.3，会把这些弹窗里的按钮文字顶出按钮边界
+      // （表现为文字过大、被挤压看不清）。这里在 MaterialApp 层统一收窄到
+      // 0.85~1.20，使全 App 弹窗文字与页面保持同一套适度缩放。
+      builder: (context, child) {
+        final mq = MediaQuery.of(context);
+        final raw = mq.textScaler.scale(14) / 14;
+        final factor = raw.clamp(0.85, 1.20);
+        return MediaQuery(
+          data: mq.copyWith(textScaler: TextScaler.linear(factor)),
+          child: child ?? const SizedBox.shrink(),
+        );
+      },
       home: const AndroidEswApp(),
     );
   }
