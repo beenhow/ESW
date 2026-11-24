@@ -23,6 +23,12 @@ bool _isUpperLetter(String c) {
   return u >= 0x41 && u <= 0x5A;
 }
 
+bool _isAsciiLetter(String c) {
+  if (c.isEmpty) return false;
+  final u = c.codeUnitAt(0);
+  return (u >= 0x41 && u <= 0x5A) || (u >= 0x61 && u <= 0x7A);
+}
+
 /// 单行空白规范化：制表符/不换行空格/全角空格 → 空格，连续空格压成一个。
 String normalizeLineText(String raw) {
   var s = raw.replaceAll('\u00A0', ' ').replaceAll('\u3000', ' ');
@@ -51,6 +57,64 @@ List<String> splitOptionMarkers(String line) {
     starts.add(i);
     letters.add(m.group(1)!);
   }
+
+  // 补齐缺少点号的选项标记（`B. satisfaction C bitterness D. politeness`）。
+  // 只在整行确实是选项列表时推断，避免误伤正文：
+  //  - 同一行至少已有 2 个带点标记；
+  //  - 第一个带点标记必须在行首 / 纯题号之后，或行首本身就是「A 文本」这种
+  //    缺失点号的首个选项（2020 浙江「A At 8:30. B. ...」）；
+  //  - 缺号字母必须正好落在前后带点标记的连续序列里（B → C → D）；
+  //  - 缺号字母后必须跟空格 + 字母，`A 8:30`、`D.C.`、`A. M.` 不会命中。
+  // 只记录位置用于断行，不回写标点，保持「只增删空白与换行」的约定。
+  if (starts.length >= 2) {
+    final head0 = line.substring(0, starts[0]).trim();
+    final head0IsNumber = RegExp(r'^\d{1,3}[.．、]?$').hasMatch(head0);
+    final bareAtZero = line.length >= 3 &&
+        line[0].codeUnitAt(0) >= 0x41 &&
+        line[0].codeUnitAt(0) <= 0x48 &&
+        line[1] == ' ' &&
+        _isAsciiLetter(line[2]) &&
+        line[0].codeUnitAt(0) + 1 == letters[0].codeUnitAt(0);
+    final allowInfer = starts[0] == 0 || head0IsNumber || bareAtZero;
+    if (allowInfer) {
+      final extras = <int>[];
+      final extraLetters = <String>[];
+      for (var i = 0; i < line.length; i++) {
+        final c = line[i];
+        final u = c.codeUnitAt(0);
+        if (u < 0x41 || u > 0x48) continue; // 只认大写 A-H
+        if (i > 0 && line[i - 1] != ' ') continue; // 前面必须是行首或空格
+        if (starts.contains(i)) continue; // 已是带点标记
+        var j = i + 1;
+        if (j >= line.length || line[j] != ' ') continue;
+        while (j < line.length && line[j] == ' ') {
+          j++;
+        }
+        // 选项正文以字母开头；`A 8:30` 这类时间不拆
+        if (j >= line.length || !_isAsciiLetter(line[j])) continue;
+        final before = starts.where((s) => s < i).toList();
+        final after = starts.where((s) => s > i).toList();
+        final beforeOk = before.isNotEmpty &&
+            letters[starts.indexOf(before.last)].codeUnitAt(0) + 1 == u;
+        final afterOk = after.isNotEmpty &&
+            u + 1 == letters[starts.indexOf(after.first)].codeUnitAt(0);
+        final isLeadingBare = before.isEmpty && afterOk;
+        final isMiddle = beforeOk && afterOk;
+        final isTrailing = beforeOk && after.isEmpty && starts.length >= 2;
+        if (isLeadingBare || isMiddle || isTrailing) {
+          extras.add(i);
+          extraLetters.add(c);
+        }
+      }
+      for (var k = 0; k < extras.length; k++) {
+        var at = starts.indexWhere((s) => s > extras[k]);
+        if (at < 0) at = starts.length;
+        starts.insert(at, extras[k]);
+        letters.insert(at, extraLetters[k]);
+      }
+    }
+  }
+
   if (starts.length < 2) return <String>[line];
 
   var bestStart = 0, bestLen = 1;
@@ -185,9 +249,142 @@ const Map<int, String> _foldLatin1 = {
   0xDF: 'ss', 0xD0: 'D', 0xF0: 'd', 0xDE: 'TH', 0xFE: 'th',
 };
 
-/// 统一词 token：ASCII 字母串，前后不得紧邻字母/数字（与旧 `\b[a-zA-Z]{2,}\b`
-/// 的边界语义一致，但作用在 foldWordText 折叠后的文本上）。
-final RegExp wordTokenRegExp = RegExp(r'(?<![A-Za-z0-9])[A-Za-z]+(?![A-Za-z0-9])');
+/// 撇号字符：直撇号 `'`、弯撇号 `‘ ’`、修饰字母撇号 `ʼ`。
+///
+/// 缩略形式（couldn't / it's / o'clock）里的撇号是**词内字符**，不是分隔符。
+/// 当成分隔符会切出 `couldn` + `t`，单字母 `t` 再被 minLength 过滤掉，
+/// 检测结果里就只剩 `couldn`，撇号后的 `'t` 整段丢失。
+const String apostropheChars = "'\u2018\u2019\u02BC";
+
+/// 带内部点的缩写词元（a.m. / U.S. / e.g. / D.C.）。
+///
+/// 至少两段字母、段间必须有句点，末尾句点可选。要求「至少两段」是为了
+/// 不把普通单词后的句号（was. / It.）吞进词元；`a.m. It` 中的句末点
+/// 仍只属于 a.m.，不会把后一个词并进来。
+const String _dottedAbbrBody = r'[A-Za-z]+(?:\.[A-Za-z]+)+\.?';
+const String _plainWordBody = "[A-Za-z]+(?:[$apostropheChars][A-Za-z]+)*";
+
+/// 统一词 token：ASCII 字母串（允许内部含撇号）或带内部点的缩写，
+/// 前后不得紧邻字母/数字。作用在 foldWordText 折叠后的文本上，因此
+/// 直撇号即可覆盖弯撇号。
+final RegExp wordTokenRegExp = RegExp(
+  "(?<![A-Za-z0-9])(?:$_dottedAbbrBody|$_plainWordBody)(?![A-Za-z0-9])",
+);
+
+/// 标注/高亮用词边界：与 [wordTokenRegExp] 同源（保留撇号缩略形式与
+/// 带点缩写），但不带前后断言、可直接作用于**未折叠**原文，便于在 docx
+/// run、表格单元格、PDF 单行等片段内逐词遍历着色。
+final RegExp annotatedWordRegExp = RegExp(
+  "(?:$_dottedAbbrBody|$_plainWordBody)",
+);
+
+/// 查表键：先折叠（弯撇号→直撇号、连字/变音/全角），再小写。
+///
+/// 词表与分类映射都以折叠后的小写为键；原文里的 `couldn’t` 必须与词表里的
+/// `couldn't` 命中同一条，否则会落到「未筛选」。
+String wordLookupKey(String token) => foldWordText(token).toLowerCase();
+
+/// 原文定位/高亮用的关键词正则（与 [wordTokenRegExp] 同一口径）。
+///
+/// 与旧的 `\b关键词\b` 字面量匹配相比：
+///  - 撇号等价：原文是弯撇号（couldn’t / couldn‘t / couldnʼt）也能命中直撇号关键词；
+///  - 按完整词形匹配：前后不得紧邻字母/数字，不会命中更长单词的内部片段；
+///  - 大小写不敏感。
+///
+/// [keyword] 先经 [foldWordText] 折叠，因此全角字符、连字、变音字母与非标准
+/// 撇号都会归一；关键词为空时返回永不匹配的正则。
+RegExp keywordMatchRegExp(String keyword) {
+  final kw = foldWordText(keyword).trim();
+  if (kw.isEmpty) return RegExp(r'(?!)');
+  // 带内部点的缩写允许省略末尾点：a.m. 与 a.m、Mr. 与 Mr 走同一正则。
+  final isDotted = kw.contains('.');
+  final core = isDotted && kw.endsWith('.')
+      ? kw.substring(0, kw.length - 1)
+      : kw;
+  var body = core
+      .split(RegExp('[$apostropheChars]'))
+      .map(RegExp.escape)
+      .join('[$apostropheChars]');
+  if (isDotted) body = '$body\\.?';
+  return RegExp(
+    '(?<![A-Za-z0-9])$body(?![A-Za-z0-9])',
+    caseSensitive: false,
+  );
+}
+
+/// 关键词在 [text] 中第 [occurrence] 次完整词形命中的起始下标（0 起）。
+///
+/// 找不到返回 -1；与 [keywordMatchRegExp] 同口径（撇号等价、整词匹配）。
+int keywordMatchOffset(String text, String keyword, {int occurrence = 0}) {
+  var i = 0;
+  for (final m in keywordMatchRegExp(keyword).allMatches(text)) {
+    if (i == occurrence) return m.start;
+    i++;
+  }
+  return -1;
+}
+
+/// 无法按后缀规则推出的缩略基形。
+const Map<String, String> _irregularBases = <String, String>{
+  "can't": 'can',
+  "won't": 'will',
+  "shan't": 'shall',
+};
+
+/// 查词表用的候选键。
+///
+/// 普通词首个元素是完整词形本身；带点缩写先尝试省略末尾点的形式
+/// （a.m. → a.m，a.m → a.m. 均回退到词库实际写法）。
+///
+/// 分词按用户要求保留完整词形（couldn't / China's），而四个词库收录的都是基形
+/// （could / China）。若只用完整词形查表，所有格与缩略形式会整段丢失分类，
+/// 课标词命中数会凭空减少（如 China's 找不到 China），故按后缀回退到基形。
+List<String> wordLookupKeys(String token) {
+  final full = wordLookupKey(token);
+  final keys = <String>[];
+  // 末尾点可省略：a.m. 与 a.m 视为同一词条。带点形式先尝试去点后的词形，
+  // 这样 Mr. 会归到词表头词 Mr（若两者都存在），a.m. 则会回退到 a.m.。
+  if (full.endsWith('.')) {
+    final trimmed = full.substring(0, full.length - 1);
+    if (trimmed.length >= 2) keys.add(trimmed);
+  }
+  if (!keys.contains(full)) keys.add(full);
+  if (!full.endsWith('.') && full.contains('.')) keys.add('$full.');
+  final irregular = _irregularBases[full];
+  if (irregular != null) keys.add(irregular);
+  for (final suffix in const <String>[
+    "'s", "n't", "'re", "'ve", "'ll", "'d", "'m", "'",
+  ]) {
+    if (!full.endsWith(suffix)) continue;
+    final base = full.substring(0, full.length - suffix.length);
+    if (base.length < 2 || keys.contains(base)) continue;
+    keys.add(base);
+  }
+  return keys;
+}
+
+/// 在词表集合里按 [wordLookupKeys] 的顺序查找，返回命中的键（未命中为 null）。
+String? matchWordListKey(Set<String> lowerKeySet, String token) {
+  for (final key in wordLookupKeys(token)) {
+    if (lowerKeySet.contains(key)) return key;
+  }
+  return null;
+}
+
+/// 在「小写词形 → 分类」映射里按 [wordLookupKeys] 查找分类，未命中为 null。
+String? categoryOfWord(Map<String, String> lowerCategory, String token) {
+  for (final key in wordLookupKeys(token)) {
+    final cat = lowerCategory[key];
+    if (cat != null) return cat;
+  }
+  return null;
+}
+
+/// 两个词形是否指向同一词条（大小写不敏感，带点缩写末尾点可省略）。
+bool isSameLookupWord(String a, String b) {
+  final kb = wordLookupKeys(b).toSet();
+  return wordLookupKeys(a).any(kb.contains);
+}
 
 /// 选项字母粘连：≥2 字母 + A-H。
 ///

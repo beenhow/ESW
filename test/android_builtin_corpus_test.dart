@@ -8,7 +8,7 @@ import 'package:esw/shared/builtin_corpus.dart';
 import 'package:esw/shared/text_normalize.dart';
 
 /// Android 内置真题自检：
-///  - 98 套资产可读取、年份可提取、无 BOM；
+///  - 119 套资产可读取、年份可提取、无 BOM；
 ///  - 2015 安徽卷规范化后不产生 itB / ofB / toC / AsC 等粘连 token；
 ///  - 分词口径与 Windows 一致（同一正则 + 同一粘连剥离规则）；
 ///  - 释放/隐藏/恢复不覆盖用户同名文件。
@@ -17,11 +17,11 @@ void main() {
   final root = Directory('assets/gaokao');
   final indexFile = File('${root.path}/index.json');
 
-  test('内置 98 套真题可读取且年份/字符数正常', () {
+  test('内置 119 套真题可读取且年份/字符数正常', () {
     expect(indexFile.existsSync(), isTrue);
     final json = jsonDecode(indexFile.readAsStringSync()) as Map<String, dynamic>;
     final papers = (json['papers'] as List).cast<Map<String, dynamic>>();
-    expect(papers.length, 98);
+    expect(papers.length, 119);
     expect((json['version'] as num).toInt(), greaterThanOrEqualTo(2));
 
     final years = <int>{};
@@ -83,14 +83,14 @@ void main() {
     expect(fixed, contains('Dr. A. Smith'));
   });
 
-  testWidgets('检测页可见内置 98 套，且不再提供隐藏入口', (tester) async {
+  testWidgets('检测页可见内置 119 套，且不再提供隐藏入口', (tester) async {
     final ctrl = TextEditingController();
     final focus = FocusNode();
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
           body: DetectPage(
-            corpusCount: 98,
+            corpusCount: 119,
             textbookCount: 0,
             yearHits: const {2015: 10},
             textbookHits: const {},
@@ -109,9 +109,9 @@ void main() {
       ),
     );
     await tester.pump();
-    expect(find.textContaining('共 98 份真题'), findsOneWidget);
+    expect(find.textContaining('共 119 份真题'), findsOneWidget);
     // 隐藏入口已按用户要求移除，语料统计只保留「共 N 份真题」这一行
-    expect(find.textContaining('内置真题 98 套'), findsNothing);
+    expect(find.textContaining('内置真题 119 套'), findsNothing);
     expect(find.textContaining('点此隐藏'), findsNothing);
     ctrl.dispose();
     focus.dispose();
@@ -132,13 +132,13 @@ void main() {
         papers: index.papers,
       );
       expect(installed, isNotNull);
-      expect(installed!.length, 98);
+      expect(installed!.length, 119);
       // 用户同名文件不被覆盖，内置改为可区分文件名
       expect(await userFile.readAsString(), 'USER-OWNED');
       expect(installed.contains('2015安徽（内置）.txt'), isTrue);
 
       final removed = await BuiltinCorpus.removeFlat(corpusDir: corpusDir);
-      expect(removed.length, 98);
+      expect(removed.length, 119);
       expect(await userFile.exists(), isTrue);
       expect(await File('$corpusDir/2015安徽（内置）.txt').exists(), isFalse);
 
@@ -148,7 +148,7 @@ void main() {
         papers: index.papers,
       );
       expect(restored, isNotNull);
-      expect(restored!.length, 98);
+      expect(restored!.length, 119);
       expect(await userFile.readAsString(), 'USER-OWNED');
     } finally {
       temp.deleteSync(recursive: true);
@@ -165,3 +165,4 @@ List<String> _windowsTokens(String text) {
       glued.firstMatch(m.group(0)!)?.group(1) ?? m.group(0)!,
   ];
 }
+

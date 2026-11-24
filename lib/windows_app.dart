@@ -233,6 +233,11 @@ class WinEswApp extends StatelessWidget {
 /// 生产环境恒为 false，不改变任何功能行为。
 bool kEswStructureGuardTestMode = false;
 
+/// 最近查询历史测试种子：仅由 test/ 下的 widget 测试临时赋值。
+/// 用于在不依赖磁盘配置的情况下渲染「最近查询」展开态，验证小窗口不溢出。
+/// 生产环境恒为 null，不改变任何功能行为。
+List<String>? kEswTestWordHistory;
+
 /// 应用用户数据目录（Windows 为 `%LOCALAPPDATA%\ESW`）：
 /// 配置、调试日志、运行时产物统一落在这里，不写安装目录（安装目录可能只读）。
 /// 供 main.dart 记录崩溃日志等启动早期信息使用。
@@ -636,6 +641,8 @@ class _MainWindowState extends State<MainWindow>
   @override
   void initState() {
     super.initState();
+    final testHistory = kEswTestWordHistory;
+    if (testHistory != null) _wordHistory.addAll(testHistory);
     EswPerf.boot('app.initState');
     // 探针专用：仅在 ESW_PERF_PROBE 下注册打点定时器，生产/测试环境不注册
     // 任何回调与定时器（避免留下 pending Timer 影响结构守卫测试）。
@@ -785,11 +792,11 @@ class _MainWindowState extends State<MainWindow>
   /// 自动动作钩子（仅自动化取证使用；未设置 ESW_AUTO_ACTION 时零影响）。
   ///
   /// 环境变量：
-  ///   ESW_AUTO_ACTION    filter | query | export | maximize | resize
+  ///   ESW_AUTO_ACTION    filter | query | export | maximize | resize | history
   ///   ESW_AUTO_ACTION_MS 动作开始时刻（自 initState 起算，默认 6500）
+  ///   ESW_AUTO_RESIZE   query/history 动作前是否缩到最小窗口（1=是）
   ///   ESW_AUTO_DOC      export 动作前先导入检测的文档绝对路径
   ///   ESW_AUTO_QUERY    query 动作要检测的单词（默认 science）
-  ///   ESW_AUTO_RESIZE   query 动作检测完成后是否缩到最小窗口（1=是）
   ///   ESW_AUTO_EXPAND   query 动作检测完成后是否展开首套真题原文（1=是）
   ///   ESW_AUTO_CLICK_RESULT query 动作检测完成后是否点击第一条结果行（1=是）
   ///   ESW_AUTO_CLICK_TEXTBOOK query 动作检测完成后是否点击第一条教材结果（1=是）
@@ -909,6 +916,17 @@ class _MainWindowState extends State<MainWindow>
         await _exportResultToWord();
         w('export.end ${DateTime.now().microsecondsSinceEpoch}');
       }
+    } else if (action == 'history') {
+      // 截图/取证用：展开「最近查询」（搜索框聚焦且输入为空），
+      // 用于验证小窗口下历史列表展开态无溢出。
+      if (Platform.environment['ESW_AUTO_RESIZE'] == '1') {
+        await windowManager.setSize(const Size(900, 600));
+        await Future<void>.delayed(const Duration(milliseconds: 800));
+      }
+      _searchController.clear();
+      _searchFocus.requestFocus();
+      if (mounted) setState(() {});
+      await Future<void>.delayed(const Duration(milliseconds: 1500));
     } else if (action == 'winning') {
       final doc = Platform.environment['ESW_AUTO_DOC'];
       if (doc != null && File(doc).existsSync()) {
@@ -2011,7 +2029,7 @@ class _MainWindowState extends State<MainWindow>
       put('builtinCollapsed', _builtinCollapsed);
       put('lastExportPath', _lastExportPath);
       put('wordHistory', _wordHistory);
-      // 仅记录用户在本应用内主动导入的语料文件（内置 98 套由内置链路释放，不写这里）
+      // 仅记录用户在本应用内主动导入的语料文件（内置 119 套由内置链路释放，不写这里）
       put('importedCorpusPaths', _userCorpusFiles.map((f) => f.path).toList());
       put('importedTextbookPaths', _textbookFiles.map((f) => f.path).toList());
       put('extendWords', _extendWords);
@@ -2798,18 +2816,21 @@ class _MainWindowState extends State<MainWindow>
       def = swEntryExact['def']!;
       matchedKey = raw;
     } else {
-      final lowerMatches = _standardWordsLower[word];
-      if (lowerMatches != null && lowerMatches.isNotEmpty) {
+      // 大小写不敏感，并兼容带点缩写的末尾点省略（a.m. / a.m）
+      for (final key in wordLookupKeys(raw)) {
+        final lowerMatches = _standardWordsLower[key];
+        if (lowerMatches == null || lowerMatches.isEmpty) continue;
         final swEntry = _standardWords[lowerMatches.first]!;
         isStandard = true;
         cat = swEntry['category']!;
         pos = swEntry['pos']!;
         def = swEntry['def']!;
         matchedKey = lowerMatches.first;
+        break;
       }
     }
     // 2) 查拓展词（走小写索引 O(1) 判命中，避免线性扫描 + 逐词 toLowerCase）
-    final isExtend = _extendWordsLower.contains(word);
+    final isExtend = wordLookupKeys(raw).any(_extendWordsLower.contains);
     // 3) 搜索真题语料
     int totalFreq = 0;
     final results = <ResultRow>[];
@@ -3169,6 +3190,17 @@ class _MainWindowState extends State<MainWindow>
       final w = entry.key; // 小写
       final original = wordCaseMap[w] ?? w; // 原始大小写
       final freq = entry.value;
+      // 词形保留完整（couldn't / China's），查表按「完整词形 → 基形」回退，
+      // 否则所有格与缩略形式会整段丢失词库分类。
+      final keys = wordLookupKeys(original);
+      String? remembered;
+      for (final key in keys) {
+        final mem = _classificationMemory[key];
+        if (mem != null) {
+          remembered = mem;
+          break;
+        }
+      }
       // 真题词＝在真题语料中出现过（叠加口径，可与课标/拓展/超标/专有重合）
       final inCorpus = corpusFreqMap.containsKey(w);
       // 词库归属（互斥口径）：历史归类 > 超标 > 拓展 > 课标 > 专有；
@@ -3176,11 +3208,11 @@ class _MainWindowState extends State<MainWindow>
       // 并在未筛选列等待用户手动归类）
       final cat = resolveFilterCategory(
         inCorpus: inCorpus,
-        inStandard: _standardWordsLowerKeySet.contains(w),
-        inExtend: _extendWordsLower.contains(w),
-        inChaoGang: chaoGangLowerSet.contains(w),
-        inProper: extraLowerSet.contains(w),
-        remembered: _classificationMemory[w],
+        inStandard: matchWordListKey(_standardWordsLowerKeySet, original) != null,
+        inExtend: matchWordListKey(_extendWordsLower, original) != null,
+        inChaoGang: matchWordListKey(chaoGangLowerSet, original) != null,
+        inProper: matchWordListKey(extraLowerSet, original) != null,
+        remembered: remembered,
       );
       words.add(
         _ImportedWord(
@@ -3273,7 +3305,7 @@ class _MainWindowState extends State<MainWindow>
                               ),
                             ),
                             const SizedBox(width: kGap8),
-                            GlassVersionBadge(version: 'v1.6.0'),
+                            GlassVersionBadge(version: 'v1.6.2'),
                           ],
                         ),
                       ),
@@ -3391,13 +3423,6 @@ class _MainWindowState extends State<MainWindow>
                               decoration: const BoxDecoration(
                                 color: GlassTheme.green,
                                 shape: BoxShape.circle,
-                                boxShadow: [
-                                  BoxShadow(
-                                    color: Color(0x5522C55E),
-                                    blurRadius: 3,
-                                    spreadRadius: 1,
-                                  ),
-                                ],
                               ),
                             ),
                             const SizedBox(width: kGap7),
@@ -3845,7 +3870,8 @@ class _MainWindowState extends State<MainWindow>
     final loaded = _corpusReaderTexts[path] ?? '';
     int? anchor = matchOffset;
     if (anchor == null && keyword.isNotEmpty) {
-      final i = loaded.toLowerCase().indexOf(keyword.toLowerCase());
+      // 与共用分词同口径（撇号等价、整词匹配）；找不到时 keywordMatchOffset 返回 -1
+      final i = keywordMatchOffset(loaded, keyword);
       if (i >= 0) anchor = i;
     }
     if (anchor != null) _corpusReaderAnchors[path] = anchor;
@@ -3882,7 +3908,9 @@ class _MainWindowState extends State<MainWindow>
 
   // ==================== 工具栏（文档导入 + 搜索输入框） ====================
   // ④-1 搜索行：高 40，属右栏内容区（骨架要求：不属于工具栏）
-  Widget _buildSearchRow() {
+  // [historyMaxHeight] 由内容区按剩余高度预算下发，保证历史列表展开时
+  // 下方筛选/词频/结果表仍保有最低可用高度（小窗口不溢出）。
+  Widget _buildSearchRow({required double historyMaxHeight}) {
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -3916,15 +3944,8 @@ class _MainWindowState extends State<MainWindow>
                     decoration: BoxDecoration(
                       // 对齐示意图：搜索输入框四角内缩 5~6 -> r6（与卡片 r8 区分，示意图中输入框更"方"）
                       borderRadius: BorderRadius.circular(GlassTheme.rSm),
-                      boxShadow: _searchFocus.hasFocus
-                          ? const [
-                              BoxShadow(
-                                color: Color(0x1F4462F2), // focus 外圈
-                                blurRadius: 8,
-                                spreadRadius: 3,
-                              ),
-                            ]
-                          : null,
+                      // 聚焦态只靠 1.5px 强调色描边（focusedBorder）表达，
+                      // 不再叠加向外扩散的蓝色光晕。
                     ),
                     child: ConstrainedBox(
                     constraints: const BoxConstraints(minHeight: 40),
@@ -4129,11 +4150,13 @@ class _MainWindowState extends State<MainWindow>
             ],
           ),
         ),
-          // 最近查询历史：内嵌推压式，展开时把下方内容推下去，不遮挡释义与词库
+          // 最近查询历史：内嵌推压式，展开时把下方内容推下去，不遮挡释义与词库。
+          // 高度按预算上限展开；空间不足时列表内部滚动，绝不低于下方内容所需高度。
           if (_searchFocus.hasFocus &&
               _searchController.text.isEmpty &&
-              _wordHistory.isNotEmpty)
-            _buildHistoryList(),
+              _wordHistory.isNotEmpty &&
+              historyMaxHeight >= GlassTheme.dp(72))
+            _buildHistoryList(maxHeight: historyMaxHeight),
         if (_searchController.text.isNotEmpty && _detectedWord.isNotEmpty)
           _buildWordDefBanner(),
       ],
@@ -4147,74 +4170,94 @@ class _MainWindowState extends State<MainWindow>
   static const double _kSectionGap = kGap12;
 
   Widget _buildRightContent() {
-    return Column(
-      key: const ValueKey('region-content'),
-      children: [
-        // 视觉修正②：搜索行距工具栏分隔线补 16 上边距（规范 §4.10⑤：
-        // 「上边线 = 搜索行距工具栏分隔线 = 16」）。原为 0 → 搜索行顶着工具栏过挤。
-        const SizedBox(height: kGap16),
-        _buildSearchRow(),
-        Expanded(
-          child: _inImportedMode
-              ? _buildImportedTextPanel()
-              : LayoutBuilder(
-                  builder: (context, constraints) {
-                    // 自适应分配：年份面板常态保持设计高度，窗口变矮时按可用
-                    // 高度线性收缩；剩余高度全部留给结果表。筛选行改为内容
-                    // 自适应高度（可换行），不再以固定高度裁切/压住下方区块。
-                    final yearHeight = (constraints.maxHeight * 0.34)
-                        .clamp(GlassTheme.dp(96), GlassTheme.hWordPanel)
-                        .toDouble();
-                    return Padding(
-                      // 内容区栅格统一：左右 20、下 16，内部所有区块之间统一 _kSectionGap(12)
-                      padding: const EdgeInsets.fromLTRB(
-                          kGap20, _kSectionGap, kGap20, kGap16),
-                      child: Column(
-                        children: [
-                          if (_cameFromImportedMode &&
-                              _searchController.text.isNotEmpty) ...[
-                            _buildReturnToImportedBar(),
-                            const SizedBox(height: _kSectionGap),
-                          ],
-                          _buildFilterChips(),
-                          const SizedBox(height: _kSectionGap),
-                          SizedBox(
-                            height: yearHeight,
-                            child: _buildYearDistribution(),
-                          ),
-                          const SizedBox(height: _kSectionGap),
-                          Expanded(
-                            child: GlassPanel(
-                              key: const ValueKey('region-table'),
-                              sigma: 0, // 任务④：结果表为常驻大面板，模糊不可见 → 关闭
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // 最近查询展开态的高度预算：搜索行区域内（上方 16 + 搜索行 + 历史列表上边距 8）
+        // 之外，至少要给下方「筛选行 + 词频面板 + 结果表」留下可用的最低高度，
+        // 否则 900×600 及更小窗口展开历史列表时下方区块会溢出。
+        // 预算不足 dp(72) 时历史列表整体收起（仅在极小压力尺寸出现）。
+        final reserved = kGap16 + GlassTheme.hSearchRow + kGap8;
+        final lowerMin = kGap12 /* 内容区上内边距 */
+            + kGap16 /* 内容区下内边距 */
+            + GlassTheme.hFilterRow * 2 /* 筛选行最多两行 */
+            + _kSectionGap * 2 /* 两处区块间距 */
+            + GlassTheme.dp(96) /* 词频面板下限 */
+            + GlassTheme.dp(160) /* 结果表表头 + 至少一行 */
+            ;
+        final historyMaxHeight = (constraints.maxHeight - reserved - lowerMin)
+            .clamp(0.0, GlassTheme.dp(240));
 
-                              // 对齐示意图：结果面板表头带与面板顶沿齐平（示意图 y462 面板顶=表头带顶）
-                              padding: EdgeInsets.zero,
-                              radius: GlassTheme.rXl,
-                              child: Column(
-                                children: [
-                                  _buildResultHeader(),
-                                  Expanded(
-                                    child: RepaintBoundary(
-                                      child: _buildResultList(),
-                                    ),
-                                  ),
-                                ],
+        return Column(
+          key: const ValueKey('region-content'),
+          children: [
+            // 视觉修正②：搜索行距工具栏分隔线补 16 上边距（规范 §4.10⑤：
+            // 「上边线 = 搜索行距工具栏分隔线 = 16」）。原为 0 → 搜索行顶着工具栏过挤。
+            const SizedBox(height: kGap16),
+            _buildSearchRow(historyMaxHeight: historyMaxHeight),
+            Expanded(
+              child: _inImportedMode
+                  ? _buildImportedTextPanel()
+                  : LayoutBuilder(
+                      builder: (context, constraints) {
+                        // 自适应分配：年份面板常态保持设计高度，窗口变矮时按可用
+                        // 高度线性收缩；剩余高度全部留给结果表。筛选行改为内容
+                        // 自适应高度（可换行），不再以固定高度裁切/压住下方区块。
+                        final yearHeight = (constraints.maxHeight * 0.34)
+                            .clamp(GlassTheme.dp(96), GlassTheme.hWordPanel)
+                            .toDouble();
+                        return Padding(
+                          // 内容区栅格统一：左右 20、下 16，内部所有区块之间统一 _kSectionGap(12)
+                          padding: const EdgeInsets.fromLTRB(
+                              kGap20, _kSectionGap, kGap20, kGap16),
+                          child: Column(
+                            children: [
+                              if (_cameFromImportedMode &&
+                                  _searchController.text.isNotEmpty) ...[
+                                _buildReturnToImportedBar(),
+                                const SizedBox(height: _kSectionGap),
+                              ],
+                              _buildFilterChips(),
+                              const SizedBox(height: _kSectionGap),
+                              SizedBox(
+                                height: yearHeight,
+                                child: _buildYearDistribution(),
                               ),
-                            ),
+                              const SizedBox(height: _kSectionGap),
+                              Expanded(
+                                child: GlassPanel(
+                                  key: const ValueKey('region-table'),
+                                  sigma: 0, // 任务④：结果表为常驻大面板，模糊不可见 → 关闭
+
+                                  // 对齐示意图：结果面板表头带与面板顶沿齐平（示意图 y462 面板顶=表头带顶）
+                                  padding: EdgeInsets.zero,
+                                  radius: GlassTheme.rXl,
+                                  child: Column(
+                                    children: [
+                                      _buildResultHeader(),
+                                      Expanded(
+                                        child: RepaintBoundary(
+                                          child: _buildResultList(),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ],
                           ),
-                        ],
-                      ),
-                    );
-                  },
-                ),
-        ),
-      ],
+                        );
+                      },
+                    ),
+            ),
+          ],
+        );
+      },
     );
   }
 
-  /// 最近查询历史列表（内嵌推压式）：置于输入框与释义区之间，展开时推压下方内容
-  Widget _buildHistoryList() {
+  /// 最近查询历史列表（内嵌推压式）：置于输入框与释义区之间，展开时推压下方内容。
+  /// [maxHeight] 由内容区预算下发，列表内部可滚动，不挤占下方区块的最低高度。
+  Widget _buildHistoryList({required double maxHeight}) {
     return Container(
       // 与搜索框、释义长条、统计面板共用同一条 kGap20 内边距基准（横向对齐一致）
       margin: const EdgeInsets.only(left: kGap20, right: kGap20, top: kGap8),
@@ -4236,7 +4279,7 @@ class _MainWindowState extends State<MainWindow>
               ],
             ),
             child: ConstrainedBox(
-        constraints: const BoxConstraints(maxHeight: 240),
+        constraints: BoxConstraints(maxHeight: maxHeight),
         child: ListView(
           shrinkWrap: true,
           padding: EdgeInsets.zero,
@@ -4385,7 +4428,7 @@ class _MainWindowState extends State<MainWindow>
   /// 检测单词信息居中长条（分类 + 词性 + 释义，显示在搜索框正下方）
   Widget _buildWordDefBanner() {
     // 走小写索引 O(1) 判命中（_detectedWord 可能保留原文大小写，统一转小写查询）
-    final isExtend = _extendWordsLower.contains(_detectedWord.toLowerCase());
+    final isExtend = wordLookupKeys(_detectedWord).any(_extendWordsLower.contains);
     final isStandard = _detectedCategory != null;
     final chipColor = isExtend
         ? AppTheme.green
@@ -4868,9 +4911,12 @@ class _MainWindowState extends State<MainWindow>
         final lower = iw.word.toLowerCase();
         var level = '';
         if (iw.category == '课标词') {
-          final keys = _standardWordsLower[lower];
-          if (keys != null && keys.isNotEmpty) {
-            level = _standardWords[keys.first]?['category'] ?? '';
+          for (final k in wordLookupKeys(iw.word)) {
+            final keys = _standardWordsLower[k];
+            if (keys != null && keys.isNotEmpty) {
+              level = _standardWords[keys.first]?['category'] ?? '';
+              break;
+            }
           }
         }
         wordCatMap[lower] = exportAnnotateCategoryOfDetected(
@@ -5458,10 +5504,14 @@ class _MainWindowState extends State<MainWindow>
     final counts = <String, int>{'初中': 0, '必修': 0, '选修': 0};
     for (final w in _importedWords) {
       if (w.category != '课标词') continue;
-      final keys = _standardWordsLower[w.word.toLowerCase()];
-      final cat = (keys != null && keys.isNotEmpty)
-          ? (_standardWords[keys.first]?['category'] ?? '')
-          : '';
+      String cat = '';
+      for (final k in wordLookupKeys(w.word)) {
+        final keys = _standardWordsLower[k];
+        if (keys != null && keys.isNotEmpty) {
+          cat = _standardWords[keys.first]?['category'] ?? '';
+          break;
+        }
+      }
       if (counts.containsKey(cat)) counts[cat] = counts[cat]! + 1;
     }
     return counts;
@@ -6485,7 +6535,7 @@ try {
                           style: TextStyle(
                             fontSize: 11,
                             fontWeight: selected
-                                ? FontWeight.w700
+                                ? FontWeight.w600
                                 : FontWeight.w500,
                             color: selected ? Colors.white : color,
                           ),
@@ -6907,7 +6957,7 @@ try {
                   maxLines: 1,
                   style: TextStyle(
                     fontSize: GlassTheme.fSmall,
-                    fontWeight: FontWeight.w700,
+                    fontWeight: FontWeight.w600,
                     color: active ? GlassTheme.ink : GlassTheme.ink3,
                     height: 1,
                   ),
@@ -7338,7 +7388,7 @@ try {
     );
   }
 
-  /// 真题文件行：年份徽标 + 卷别名 + 内置标记（两级信息，便于 98 套内置真题扫读）。
+  /// 真题文件行：年份徽标 + 卷别名 + 内置标记（两级信息，便于 119 套内置真题扫读）。
   Widget _buildCorpusFileRow(CorpusFile file, {String? firstPath}) {
     final selected =
         file.path == _activePathOf(_corpusFiles, _activeCorpusPath,
@@ -7628,7 +7678,8 @@ try {
     final loaded = _corpusReaderTexts[path] ?? '';
     int? anchor = matchOffset;
     if (anchor == null && keyword.isNotEmpty) {
-      final i = loaded.toLowerCase().indexOf(keyword.toLowerCase());
+      // 与共用分词同口径（撇号等价、整词匹配）；找不到时 keywordMatchOffset 返回 -1
+      final i = keywordMatchOffset(loaded, keyword);
       if (i >= 0) anchor = i;
     }
     if (anchor != null) _corpusReaderAnchors[path] = anchor;
@@ -7682,9 +7733,7 @@ try {
       }
       var off = matchOffset;
       if (off == null || off < 0) {
-        off = keyword.isEmpty
-            ? 0
-            : text.toLowerCase().indexOf(keyword.toLowerCase());
+        off = keyword.isEmpty ? 0 : keywordMatchOffset(text, keyword);
         if (off < 0) off = 0;
       }
       final total = text.length;
@@ -7862,12 +7911,12 @@ try {
     // （主界面独立「添加拓展词」入口仍走弹窗，行为保持不变）。
     final presetBase = initialBase?.trim().toLowerCase() ?? '';
     if (presetBase.isNotEmpty &&
-        _standardWordsLowerKeySet.contains(presetBase)) {
+        matchWordListKey(_standardWordsLowerKeySet, presetBase) != null) {
       _applyExtendConversion(word, presetBase, _wordOwnCategory(word));
       return true;
     }
     // 已是拓展词：弹窗降级为「修改课标词根」，不重复计数、不重复入列
-    final alreadyExtend = _extendWordsLower.contains(word.toLowerCase());
+    final alreadyExtend = wordLookupKeys(word).any(_extendWordsLower.contains);
     final result = await _showExtendWordDialog(
       extendWord: word,
       dialogTitle:
@@ -7968,9 +8017,11 @@ try {
                 ).showSnackBar(const SnackBar(content: Text('请选择或输入课标词')));
                 return;
               }
-              if (!_standardWordsLowerKeySet.contains(
-                selectedBase.toLowerCase(),
-              )) {
+              if (matchWordListKey(
+                    _standardWordsLowerKeySet,
+                    selectedBase.toLowerCase(),
+                  ) ==
+                  null) {
                 ScaffoldMessenger.of(
                   ctx,
                 ).showSnackBar(const SnackBar(content: Text('请输入有效的课标词')));
@@ -8250,7 +8301,6 @@ try {
                   fontSize: GlassTheme.fMicro,
                   fontWeight: FontWeight.w600,
                   color: GlassTheme.ink3,
-                  letterSpacing: 1,
                   height: 1,
                 ),
               ),
@@ -8266,7 +8316,6 @@ try {
                   fontSize: GlassTheme.fMicro,
                   fontWeight: FontWeight.w600,
                   color: GlassTheme.ink3,
-                  letterSpacing: 1,
                   height: 1,
                 ),
               ),
@@ -8283,7 +8332,6 @@ try {
                   fontSize: GlassTheme.fMicro,
                   fontWeight: FontWeight.w600,
                   color: GlassTheme.ink3,
-                  letterSpacing: 1,
                   height: 1,
                 ),
               ),
@@ -8299,72 +8347,82 @@ try {
     final examCount = _filteredResults.length;
     final textbookCount = _filteredTextbookResults.length;
     if (examCount == 0 && textbookCount == 0) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Container(
-              width: 64,
-              height: 64,
-              decoration: const BoxDecoration(
-                // 第三关 ④：渐变只允许三处，空状态圆改纯色淡靛蓝
-                color: Color(0x1A4462F2), // rgba(68,98,242,.10)
-                shape: BoxShape.circle,
-              ),
-              child: const Icon(
-                Icons.search,
-                size: 28,
-                color: GlassTheme.accentInk,
-              ),
-            ),
-            const SizedBox(height: kGap12),
-            Text(
-              _selectedYear != null
-                  ? '$_selectedYear年无匹配结果'
-                  : '输入单词即可查看检测结果',
-              style: const TextStyle(
-                fontSize: 13.5,
-                fontWeight: FontWeight.w600,
-                color: GlassTheme.ink2,
-              ),
-            ),
-            const SizedBox(height: kGap8),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: kGap12, vertical: kGap6),
-              decoration: BoxDecoration(
-                color: const Color(0x0F18181B), // 灰色徽标 rgba(24,24,27,0.06)
-                borderRadius: BorderRadius.circular(999),
-              ),
-              child: Text.rich(
-                TextSpan(
-                  children: [
-                    TextSpan(
-                      text: '按 ',
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: GlassTheme.ink3,
+      // 空状态可滚动：窗口较矮（或历史列表展开压缩结果表）时，
+      // 内容不足一屏居中显示，超出时内部滚动，避免纵向溢出被裁切。
+      return LayoutBuilder(
+        builder: (context, constraints) => SingleChildScrollView(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(minHeight: constraints.maxHeight),
+            child: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 64,
+                    height: 64,
+                    decoration: const BoxDecoration(
+                      // 第三关 ④：渐变只允许三处，空状态圆改纯色淡靛蓝
+                      color: Color(0x1A4462F2), // rgba(68,98,242,.10)
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(
+                      Icons.search,
+                      size: 28,
+                      color: GlassTheme.accentInk,
+                    ),
+                  ),
+                  const SizedBox(height: kGap12),
+                  Text(
+                    _selectedYear != null
+                        ? '$_selectedYear年无匹配结果'
+                        : '输入单词即可查看检测结果',
+                    style: const TextStyle(
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w600,
+                      color: GlassTheme.ink2,
+                    ),
+                  ),
+                  const SizedBox(height: kGap8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: kGap12, vertical: kGap6),
+                    decoration: BoxDecoration(
+                      color: const Color(0x0F18181B), // 灰色徽标 rgba(24,24,27,0.06)
+                      borderRadius: BorderRadius.circular(999),
+                    ),
+                    child: Text.rich(
+                      TextSpan(
+                        children: [
+                          TextSpan(
+                            text: '按 ',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: GlassTheme.ink3,
+                            ),
+                          ),
+                          const TextSpan(
+                            text: 'Enter',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: GlassTheme.accentInk,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          TextSpan(
+                            text: ' 快捷检测',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: GlassTheme.ink3,
+                            ),
+                          ),
+                        ],
                       ),
                     ),
-                    const TextSpan(
-                      text: 'Enter',
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: GlassTheme.accentInk,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                    TextSpan(
-                      text: ' 快捷检测',
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: GlassTheme.ink3,
-                      ),
-                    ),
-                  ],
-                ),
+                  ),
+                ],
               ),
             ),
-          ],
+          ),
         ),
       );
     }
@@ -8618,7 +8676,7 @@ try {
     final coreEnd = value.selection.end -
         (selText.length - selText.trimRight().length);
     final isWord = RegExp(
-      r"^[a-zA-Z]+(?:['’][a-zA-Z]+)*$",
+      r"^(?:[a-zA-Z]+(?:\.[a-zA-Z]+)+\.?|[a-zA-Z]+(?:['’][a-zA-Z]+)*)$",
     ).hasMatch(selected);
     return AdaptiveTextSelectionToolbar.buttonItems(
       anchors: state.contextMenuAnchors,
@@ -8844,22 +8902,17 @@ try {
   }
 
   /// 取关键词第 [occurrence] 次出现的位置（0 起）；越界返回最后一次命中，
-  /// 完全找不到时按单词边界兜底，仍找不到返回 0。
+  /// 完全找不到返回 0。口径与共用分词一致：撇号等价、按完整词形匹配。
   int _keywordOccurrenceOffset(String text, String keyword, int occurrence) {
-    final lowerText = text.toLowerCase();
-    final lowerKw = keyword.toLowerCase();
-    var from = 0;
-    var found = -1;
-    for (var i = 0; i <= occurrence; i++) {
-      final at = lowerText.indexOf(lowerKw, from);
-      if (at < 0) break;
-      found = at;
-      from = at + lowerKw.length;
+    if (keyword.isEmpty) return 0;
+    var count = 0;
+    var last = -1;
+    for (final m in keywordMatchRegExp(keyword).allMatches(text)) {
+      last = m.start;
+      if (count == occurrence) return m.start;
+      count++;
     }
-    if (found >= 0) return found;
-    final m = RegExp('\\b${RegExp.escape(keyword)}\\b', caseSensitive: false)
-        .firstMatch(text);
-    return m?.start ?? 0;
+    return last < 0 ? 0 : last;
   }
 
   /// 窗口尺寸变化后，按各自锚点把左右原文重新定位到关键词处。
@@ -10826,7 +10879,7 @@ try {
                               overflow: TextOverflow.ellipsis,
                               style: const TextStyle(
                                 fontSize: 14,
-                                fontWeight: FontWeight.w700,
+                                fontWeight: FontWeight.w600,
                                 color: GlassTheme.ink,
                                 height: 1.2,
                               ),
@@ -10969,15 +11022,15 @@ try {
                               height: 38,
                               alignment: Alignment.center,
                               decoration: BoxDecoration(
-                                gradient: GlassTheme.grad,
+                                color: GlassTheme.accent,
                                 borderRadius: BorderRadius.circular(
                                   GlassTheme.rMd,
                                 ),
                                 boxShadow: const [
                                   BoxShadow(
-                                    color: Color(0x334462F2),
-                                    blurRadius: 12,
-                                    offset: Offset(0, 4),
+                                    color: Color(0x1418181B),
+                                    blurRadius: 6,
+                                    offset: Offset(0, 2),
                                   ),
                                 ],
                               ),
@@ -10997,7 +11050,7 @@ try {
                                     '云端词库有更新',
                                     style: TextStyle(
                                       fontSize: 15,
-                                      fontWeight: FontWeight.w700,
+                                      fontWeight: FontWeight.w600,
                                       color: GlassTheme.ink,
                                       height: 1.2,
                                     ),
@@ -11113,7 +11166,7 @@ try {
   }
 
   void _checkUpdate() async {
-    const currentVersion = '1.6.0';
+    const currentVersion = '1.6.2';
     try {
       final response = await http
           .get(
@@ -11343,15 +11396,13 @@ class _HighlightController extends TextEditingController {
   }) {
     final text = this.text;
     final baseStyle = style ?? const TextStyle();
-    // 关键词匹配区间（keyword 为空时跳过，避免 \b\b 产生零宽匹配）
+    // 关键词匹配区间（keyword 为空时跳过，避免产生零宽匹配）
     final kwRanges = <({int start, int end})>[];
     if (_keyword.isNotEmpty) {
       var regex = _cachedRegex;
       if (regex == null || _cachedKeyword != _keyword) {
-        regex = RegExp(
-          '\\b${RegExp.escape(_keyword)}\\b',
-          caseSensitive: false,
-        );
+        // 与共用分词同口径：撇号等价（couldn’t 也能命中 couldn't）、按完整词形匹配
+        regex = keywordMatchRegExp(_keyword);
         _cachedRegex = regex;
         _cachedKeyword = _keyword;
       }
@@ -12092,8 +12143,8 @@ class _SyncStatusTag extends StatelessWidget {
         strike = true;
       case 'upload_local':
         label = '已上传';
-        fg = GlassTheme.violet;
-        bg = const Color(0x1F8B5CF6);
+        fg = GlassTheme.accentInk;
+        bg = GlassTheme.accentSoft;
     }
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: kGap8, vertical: kGap4),
@@ -12157,7 +12208,7 @@ class _SyncCardActionState extends State<_SyncCardAction> {
       bg = _pressed
           ? const Color(0x294462F2)
           : (hovered ? GlassTheme.accentSoft : const Color(0x8CFFFFFF));
-      border = hovered ? const Color(0xFFC7D2FE) : GlassTheme.line;
+      border = hovered ? GlassTheme.accentLine : GlassTheme.line;
       fg = hovered ? GlassTheme.accentInk : GlassTheme.ink2;
     }
     return MouseRegion(

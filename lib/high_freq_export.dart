@@ -29,6 +29,7 @@ import 'package:sqlite3/sqlite3.dart' as sqlite3;
 
 import 'shared/doc_extractor.dart';
 import 'shared/export_word_style.dart';
+import 'shared/text_normalize.dart';
 
 /// 导出结果统计信息
 class HighFreqExportResult {
@@ -358,7 +359,8 @@ Map<String, dynamic> _wordBankWorker(Map<String, dynamic> args) {
 
 // ----------------------------- 文本工具 -----------------------------
 
-final RegExp _wordRe = RegExp(r"[a-zA-Z']+");
+// 与检测/标注共用同一分词口径：带点缩写（a.m. / U.S.）视为一个词元
+final RegExp _wordRe = wordTokenRegExp;
 final RegExp _sentenceRe = RegExp(r'[^.!?。！？]+[.!?。！？]');
 final RegExp _hanRe = RegExp(r'[\u4e00-\u9fa5]');
 final RegExp _trailNumRe = RegExp(r'\d+\.\s*$');
@@ -695,11 +697,21 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
   final stdCategory = <String, String>{}; // 课标词(小写) -> 类型（初中/必修/选修等）
   for (final k in stdJson.keys) {
     final lk = k.toLowerCase();
-    stdSet.add(lk);
-    lowerToOrig.putIfAbsent(lk, () => k);
     final meta = stdJson[k] as Map<String, dynamic>?;
     final cat = (meta?['category'] as String?)?.trim();
-    if (cat != null && cat.isNotEmpty) stdCategory.putIfAbsent(lk, () => cat);
+    // 末尾点可省略：a.m. 与 a.m、Mr. 与 Mr 归同一条目；普通词不扩展
+    final variants = <String>[lk];
+    if (lk.endsWith('.')) {
+      final trimmed = lk.substring(0, lk.length - 1);
+      if (trimmed.length >= 2) variants.add(trimmed);
+    } else if (lk.contains('.')) {
+      variants.add('$lk.');
+    }
+    for (final v in variants) {
+      stdSet.add(v);
+      lowerToOrig.putIfAbsent(v, () => k);
+      if (cat != null && cat.isNotEmpty) stdCategory.putIfAbsent(v, () => cat);
+    }
     final exts = meta?['extensions'];
     if (exts is List) {
       for (final ex in exts) {

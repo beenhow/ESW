@@ -89,7 +89,7 @@ void main() async {
     EswPerf.startStallWatch();
     const winSize = Size(1200, 680);
     const winMinSize = Size(900, 600);
-    const winTitle = '真题课标词 v1.6.0';
+    const winTitle = '真题课标词 v1.6.2';
     final swWin = Stopwatch()..start();
     // 5 个窗口设置互不依赖：并行发起，省掉串行平台往返（每个 ~5ms，冷启动更久）。
     // 逐项打点用于确认「谁来承担启动期平台往返成本」。

@@ -500,4 +500,59 @@ void main() {
       expect(spans.any((s) => s.text == m), isFalse, reason: 'PDF 不应插入编号 $m');
     }
   });
+
+  test('撇号缩略形式：整词标注，不拆成 couldn + t', () {
+    const text = "We couldn't stay. It's o'clock and they don't know.";
+    const cases = <({String original, String key, String cat})>[
+      (original: "couldn't", key: "couldn't", cat: '拓展词'),
+      (original: "It's", key: "it's", cat: '超标词'),
+      (original: "o'clock", key: "o'clock", cat: '专有词'),
+      (original: "don't", key: "don't", cat: '拓展词'),
+    ];
+    final cats = <String, String>{
+      for (final c in cases) c.key: c.cat,
+    };
+
+    // 1) DOCX 重生成路径：命中 run 的文本必须是完整缩略形式
+    final xml = docxAnnotatedParagraphXml(text, cats, colorBold: false);
+    for (final c in cases) {
+      expect(
+        xml.contains(docxRunXml(c.original, kExpect[c.cat]!.$1)),
+        isTrue,
+        reason: '${c.original} 应整体成为一个标注 run',
+      );
+    }
+    expect(
+      xml.contains('<w:t xml:space="preserve">couldn</w:t>'),
+      isFalse,
+      reason: '不得截断成 couldn',
+    );
+
+    // 2) DOCX 原地标注：弯撇号原文命中小写词条，且整词替换
+    final curlyXml = readDocumentXml(
+      annotateDocxBytes(
+        srcBytes: buildDocx([
+          '<w:p><w:r><w:t xml:space="preserve">We couldn\u2019t stay.</w:t></w:r></w:p>',
+        ]),
+        catByLower: const {"couldn't": '拓展词'},
+        colorBold: false,
+      ),
+    );
+    expect(
+      curlyXml.contains(docxRunXml('couldn\u2019t', kExpect['拓展词']!.$1)),
+      isTrue,
+      reason: '弯撇号缩略形式应整体标注',
+    );
+
+    // 3) PDF 路径：整词作为一个 span
+    final widget = pdfAnnotatedLine(text, cats, loadExportFont()) as pw.RichText;
+    final spans = (widget.text as pw.TextSpan).children!.cast<pw.TextSpan>();
+    for (final c in cases) {
+      expect(
+        spans.any((s) => s.text == c.original),
+        isTrue,
+        reason: 'PDF 应输出完整词元 ${c.original}',
+      );
+    }
+  });
 }

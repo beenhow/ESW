@@ -35,7 +35,7 @@ const calendarFlexSet = <String>{
 void main() {
   test('export high freq xlsx smoke', () async {
     // 全部输入取自项目内置资产，不依赖本机外部真题目录 / 用户配置目录：
-    //  - 语料：assets/gaokao/txt（内置 98 套真题）
+    //  - 语料：assets/gaokao/txt（内置 119 套真题）
     //  - 词典：assets/standard_words.json + assets/ecdict.db
     final root = Directory.current.path;
     final corpusDir = p.join(root, 'assets', 'gaokao', 'txt');
@@ -79,11 +79,11 @@ void main() {
     sw.stop();
     // ignore: avoid_print
     print('ELAPSED_SECONDS=${sw.elapsedMilliseconds / 1000.0}');
-    expect(result.corpusFileCount, 98,
-        reason: '语料应恰好为内置 98 套真题');
+    expect(result.corpusFileCount, 119,
+        reason: '语料应恰好为内置 119 套真题');
     final exported = result.exportedWords;
     expect(exported, greaterThan(2500),
-        reason: '内置 98 套真题应覆盖绝大多数高频课标词');
+        reason: '内置 119 套真题应覆盖绝大多数高频课标词');
     expect(exported, lessThanOrEqualTo(3000), reason: '词表上限为 3000');
     expect(result.xlsxBytes.length, greaterThan(100000),
         reason: 'xlsx 字节不应过小');

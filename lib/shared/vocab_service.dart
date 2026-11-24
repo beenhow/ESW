@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'doc_extractor.dart';
+import 'text_normalize.dart';
 
 /// 单词分类常量
 const wordCategories = ['真题词', '课标词', '拓展词', '超标词', '专有词'];
@@ -93,37 +94,38 @@ class VocabService {
 
   /// 查询单词信息
   Map<String, String?> lookup(String word) {
-    final lower = word.toLowerCase();
     // 精确匹配
     if (standardWords.containsKey(word)) {
       return standardWords[word]!;
     }
-    // 大小写不敏感
-    final matches = standardWordsLower[lower];
-    if (matches != null && matches.isNotEmpty) {
-      return standardWords[matches.first]!;
+    // 大小写不敏感，并兼容带点缩写的末尾点省略
+    for (final key in wordLookupKeys(word)) {
+      final matches = standardWordsLower[key];
+      if (matches != null && matches.isNotEmpty) {
+        return standardWords[matches.first]!;
+      }
     }
     return {};
   }
 
   /// 判断是否课标词
   bool isStandard(String word) {
-    return standardWordsLowerKeySet.contains(word.toLowerCase());
+    return wordLookupKeys(word).any(standardWordsLowerKeySet.contains);
   }
 
   /// 判断是否拓展词
   bool isExtend(String word) {
-    return extendWordsLowerSet.contains(word.toLowerCase());
+    return wordLookupKeys(word).any(extendWordsLowerSet.contains);
   }
 
   /// 判断是否超标词
   bool isChaoGang(String word) {
-    return chaoGangLowerSet.contains(word.toLowerCase());
+    return wordLookupKeys(word).any(chaoGangLowerSet.contains);
   }
 
   /// 判断是否专有词
   bool isExtra(String word) {
-    return extraLowerSet.contains(word.toLowerCase());
+    return wordLookupKeys(word).any(extraLowerSet.contains);
   }
 
   /// 获取单词的分类记忆
@@ -397,9 +399,9 @@ class VocabService {
 
   /// 判断单词当前的手动分类（不含课标词/其他）
   String? _classifyManually(String lower) {
-    if (extendWordsLowerSet.contains(lower)) return '拓展词';
-    if (chaoGangLowerSet.contains(lower)) return '超标词';
-    if (extraLowerSet.contains(lower)) return '专有词';
+    if (isExtend(lower)) return '拓展词';
+    if (isChaoGang(lower)) return '超标词';
+    if (isExtra(lower)) return '专有词';
     return null;
   }
 
@@ -407,7 +409,7 @@ class VocabService {
   String? _classify(String lower) {
     final man = _classifyManually(lower);
     if (man != null) return man;
-    if (standardWordsLowerKeySet.contains(lower)) return '课标词';
+    if (isStandard(lower)) return '课标词';
     return null;
   }
 
@@ -447,7 +449,7 @@ class VocabService {
   /// 查找最佳课标词匹配（编辑距离启发式）
   String? findBestSyllabusMatch(String word) {
     final lower = word.toLowerCase();
-    if (standardWordsLowerKeySet.contains(lower)) return word;
+    if (isStandard(lower)) return word;
     if (extendReverseIndex.containsKey(lower)) return extendReverseIndex[lower];
 
     // 前缀匹配

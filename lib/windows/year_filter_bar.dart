@@ -73,7 +73,7 @@ class YearFilterBar extends StatelessWidget {
       child: GlassPanel(
         radius: GlassTheme.rXl,
         sigma: 0, // 常驻大面板：模糊不可见，关掉省光栅开销
-        padding: const EdgeInsets.fromLTRB(kGap16, kGap12, kGap16, 0),
+        padding: const EdgeInsets.fromLTRB(kGap16, kGap12, kGap16, kGap8),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -109,6 +109,8 @@ class YearFilterBar extends StatelessWidget {
                     const gap = kGap6;
                     const minCellW = 40.0;
                     const maxCellW = 120.0;
+                    const minCellH = 22.0;
+                    const naturalCellH = 42.0;
                     final maxW = constraints.maxWidth;
                     final maxH = constraints.maxHeight;
                     if (maxW <= 0 || maxH <= 0) return const SizedBox.shrink();
@@ -116,79 +118,112 @@ class YearFilterBar extends StatelessWidget {
                     final n = textbookItems.length + years.length;
                     if (n <= 0) return const SizedBox.shrink();
 
-                    // 该宽度下最多能放几列（每格不小于最小可读格宽），再按设计基准 13 列封顶
-                    final colsFit = ((maxW + gap) / (minCellW + gap)).floor();
-                    final int colsRaw =
-                        colsFit.clamp(1, n < 13 ? n : 13).toInt();
-                    // 刚好需要两行时均分列数，避免出现「11+1」这种孤格、整体不对称
-                    final int rowsNeeded = (n / colsRaw).ceil();
-                    final int cols = (rowsNeeded == 2 && n > colsRaw)
-                        ? (n / 2).ceil()
-                        : colsRaw;
-                    var cellW = ((maxW - (cols - 1) * gap) / cols)
-                        .clamp(minCellW, maxCellW)
-                        .toDouble();
-                    // 极窄窗口单列时仍需保证不横向溢出
-                    if (cellW > maxW) cellW = maxW;
-
-                    // 年份格排在教材格之前：教材文件可能很多（整册/整文件夹导入），
-                    // 年份作为主要筛选维度必须始终可见，不能被挤到滚动区下方。
-                    final yearBoxes = <Widget>[
-                      for (final y in years)
-                        _yearCell(
-                          year: y,
-                          count: yearCounts[y] ?? 0,
-                          selected: selectedYear == y,
-                          cellW: cellW,
-                          onTap: () => onSelectYear(y),
-                        ),
-                    ];
-                    final textbookBoxes = <Widget>[
-                      for (final t in textbookItems)
-                        _textbookCell(
-                          name: t.name.replaceAll(RegExp(r'\.[^.]+$'), ''),
-                          count: textbookCounts[t.path] ?? 0,
-                          selected: selectedTextbook == t.path,
-                          cellW: cellW,
-                          onTap: () => onSelectTextbook(t.path),
-                        ),
-                    ];
-
-                    // 年份与教材各自成行：教材格永远从新的一行开始，不与年份格混排
-                    final rows = <Widget>[];
-                    void addRows(List<Widget> cells) {
-                      for (var i = 0; i < cells.length; i += cols) {
-                        final end = (i + cols).clamp(i, cells.length);
-                        rows.add(
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            spacing: gap,
-                            children: cells.sublist(i, end),
-                          ),
-                        );
-                      }
+                    // 年份与教材各自成段（教材永远从新行开始），因此列数按
+                    // 两段共同的行数预算求解，保证总行数不超过面板可用高度。
+                    int rowsFor(int cols) {
+                      final ry =
+                          years.isEmpty ? 0 : (years.length + cols - 1) ~/ cols;
+                      final rt = textbookItems.isEmpty
+                          ? 0
+                          : (textbookItems.length + cols - 1) ~/ cols;
+                      return ry + rt;
                     }
 
-                    addRows(yearBoxes);
-                    addRows(textbookBoxes);
-                    final grid = Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        for (var i = 0; i < rows.length; i++) ...[
-                          if (i > 0) const SizedBox(height: gap),
-                          rows[i],
+                    // 宽度能给到的最大列数（每格不小于最小可读宽度）
+                    final colsMax =
+                        ((maxW + gap) / (minCellW + gap)).floor().clamp(1, n).toInt();
+                    // 高度能容纳的最大行数（每格不小于最小可读高度）
+                    final rowsMax =
+                        ((maxH + gap) / (minCellH + gap)).floor().clamp(1, n).toInt();
+
+                    // 目标：年份段、教材段各自尽量压成一行（列数取两段中较长者），
+                    // 列数越多行数越少；若行数仍超出高度预算，再向右加列。
+                    final longestSection = years.length > textbookItems.length
+                        ? years.length
+                        : textbookItems.length;
+                    var cols = colsMax < longestSection ? colsMax : longestSection;
+                    while (cols < colsMax && rowsFor(cols) > rowsMax) {
+                      cols++;
+                    }
+                    final rows = rowsFor(cols);
+                    // 列数确定后按列均分宽度（含格间距）
+                    // 高度按 rows 均分（下限 22、上限 42），保证整块收进面板
+
+                    final cellW = ((maxW - (cols - 1) * gap) / cols)
+                        .clamp(minCellW, maxCellW)
+                        .toDouble();
+                    // 行高按可用高度均分，并限制在「最小可读 ~ 设计自然高」之间；
+                    // 高度充裕时保持自然高并整体居中（不拉成巨型方块）。
+                    final cellH = ((maxH - (rows - 1) * gap) / rows)
+                        .clamp(minCellH, naturalCellH)
+                        .toDouble();
+
+                    final yearCells = <Widget>[
+                      for (final y in years)
+                        KeyedSubtree(
+                          key: ValueKey('year-cell-$y'),
+                          child: _yearCell(
+                            year: y,
+                            count: yearCounts[y] ?? 0,
+                            selected: selectedYear == y,
+                            cellW: cellW,
+                            cellH: cellH,
+                            onTap: () => onSelectYear(y),
+                          ),
+                        ),
+                    ];
+                    final textbookCells = <Widget>[
+                      for (final t in textbookItems)
+                        KeyedSubtree(
+                          key: ValueKey('textbook-cell-${t.path}'),
+                          child: _textbookCell(
+                            name: t.name.replaceAll(RegExp(r'\.[^.]+$'), ''),
+                            count: textbookCounts[t.path] ?? 0,
+                            selected: selectedTextbook == t.path,
+                            cellW: cellW,
+                            cellH: cellH,
+                            onTap: () => onSelectTextbook(t.path),
+                          ),
+                        ),
+                    ];
+
+                    // 用 Wrap 自动换行：宽度变化、年份/教材数量增加时按列数预算
+                    // 自动折行，不需要手动切分行数组。
+                    final grid = SizedBox(
+                      width: maxW,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          if (yearCells.isNotEmpty)
+                            Wrap(
+                              spacing: gap,
+                              runSpacing: gap,
+                              alignment: WrapAlignment.center,
+                              children: yearCells,
+                            ),
+                          if (yearCells.isNotEmpty && textbookCells.isNotEmpty)
+                            const SizedBox(height: gap),
+                          if (textbookCells.isNotEmpty)
+                            Wrap(
+                              spacing: gap,
+                              runSpacing: gap,
+                              alignment: WrapAlignment.center,
+                              children: textbookCells,
+                            ),
                         ],
-                      ],
+                      ),
                     );
-                    // 不再用 FittedBox 整体缩放：格子数量多时按比例缩到几个像素会
-                    // 完全不可读（用户反馈「年份框都乱了」）。改为保持最小可读格宽，
-                    // 超出可用高度时在面板内纵向滚动；内容不足一屏时垂直居中。
-                    // 行高按两行文字 + 上下内边距估算（约 42），用于判断是否需要滚动条。
-                    final rowsHeight = rows.length * 42.0 + (rows.length - 1) * gap;
+
+                    // 正常情况 rows*cellH 已收进面板高度，无需滚动；
+                    // 仅在极端尺寸（如数百个教材格 + 极矮面板）且已缩到最小
+                    // 可读格高时，才退回面板内滚动，绝不溢出到筛选行/结果表。
+                    final contentHeight =
+                        rows * cellH + (rows > 0 ? (rows - 1) * gap : 0);
                     return _ScrollableGrid(
                       viewportHeight: maxH,
-                      scrollable: rowsHeight > maxH,
-                      child: SizedBox(width: maxW, child: grid),
+                      scrollable: contentHeight > maxH + 0.5,
+                      child: grid,
                     );
                   },
                 ),
@@ -222,6 +257,7 @@ class YearFilterBar extends StatelessWidget {
     required int count,
     required bool selected,
     required double cellW,
+    required double cellH,
     required VoidCallback onTap,
   }) {
     return Material(
@@ -237,39 +273,47 @@ class YearFilterBar extends StatelessWidget {
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 180),
             width: cellW,
-            padding: const EdgeInsets.symmetric(horizontal: kGap4, vertical: kGap6),
+            height: cellH,
+            padding: EdgeInsets.symmetric(
+              horizontal: kGap4,
+              vertical: _cellVerticalPadding(cellH),
+            ),
             decoration: BoxDecoration(
-              color: selected ? GlassTheme.violet : const Color(0x0F18181B),
+              color: selected ? GlassTheme.accent : const Color(0x0F18181B),
               borderRadius: BorderRadius.circular(GlassTheme.rMd),
               border: Border.all(color: Colors.transparent),
             ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                FittedBox(
-                  fit: BoxFit.scaleDown,
-                  child: Text(
-                    name,
-                    maxLines: 1,
-                    softWrap: false,
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  FittedBox(
+                    fit: BoxFit.scaleDown,
+                    child: Text(
+                      name,
+                      maxLines: 1,
+                      softWrap: false,
+                      style: TextStyle(
+                        fontSize: 10.5,
+                        fontWeight: FontWeight.w600,
+                        height: 1.0,
+                        color: selected ? Colors.white : GlassTheme.ink2,
+                      ),
+                    ),
+                  ),
+                  SizedBox(height: _cellInnerGap(cellH)),
+                  Text(
+                    '$count',
                     style: TextStyle(
-                      fontSize: 10.5,
+                      fontSize: 12,
                       fontWeight: FontWeight.w600,
                       height: 1.0,
                       color: selected ? Colors.white : GlassTheme.ink2,
                     ),
                   ),
-                ),
-                const SizedBox(height: kGap4),
-                Text(
-                  '$count',
-                  style: TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                    color: selected ? Colors.white : GlassTheme.ink2,
-                  ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
@@ -282,6 +326,7 @@ class YearFilterBar extends StatelessWidget {
     required int count,
     required bool selected,
     required double cellW,
+    required double cellH,
     required VoidCallback onTap,
   }) {
     final label = (year % 100).toString().padLeft(2, '0');
@@ -298,51 +343,66 @@ class YearFilterBar extends StatelessWidget {
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 180),
             width: cellW,
-            padding: const EdgeInsets.symmetric(horizontal: kGap6, vertical: kGap6),
+            height: cellH,
+            padding: EdgeInsets.symmetric(
+              horizontal: kGap6,
+              vertical: _cellVerticalPadding(cellH),
+            ),
             decoration: BoxDecoration(
               // 渐变只允许主按钮 / 徽标 / 选中胶囊三处，年份格有数据态用纯色淡靛蓝
               color: selected
-                  ? GlassTheme.violet
+                  ? GlassTheme.accent
                   : (count > 0 ? GlassTheme.accentSoft : const Color(0x73FFFFFF)),
               borderRadius: BorderRadius.circular(GlassTheme.rMd),
               border: Border.all(
                 color: selected
                     ? Colors.transparent
-                    : (count > 0 ? const Color(0xFFC7D2FE) : Colors.transparent),
+                    : (count > 0 ? const Color(0x334462F2) : Colors.transparent),
               ),
             ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  label,
-                  style: TextStyle(
-                    fontSize: 10.5,
-                    fontWeight: FontWeight.w600,
-                    height: 1.0,
-                    color: selected
-                        ? Colors.white
-                        : (count > 0 ? GlassTheme.accentInk : GlassTheme.ink2),
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    label,
+                    style: TextStyle(
+                      fontSize: 10.5,
+                      fontWeight: FontWeight.w600,
+                      height: 1.0,
+                      color: selected
+                          ? Colors.white
+                          : (count > 0 ? GlassTheme.accentInk : GlassTheme.ink2),
+                    ),
                   ),
-                ),
-                const SizedBox(height: kGap4),
-                Text(
-                  '$count',
-                  style: TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                    color: selected
-                        ? Colors.white
-                        : (count > 0 ? GlassTheme.accentInk : GlassTheme.ink2),
+                  SizedBox(height: _cellInnerGap(cellH)),
+                  Text(
+                    '$count',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      height: 1.0,
+                      color: selected
+                          ? Colors.white
+                          : (count > 0 ? GlassTheme.accentInk : GlassTheme.ink2),
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
       ),
     );
   }
+
+  /// 单元格高度收紧时同步压缩上下内边距，保证两行文字仍放得下且不溢出。
+  double _cellVerticalPadding(double cellH) =>
+      ((cellH - 23) / 2).clamp(0.5, kGap6);
+
+  /// 行高不足 30 时进一步收紧标签与计数的间距。
+  double _cellInnerGap(double cellH) => cellH >= 38 ? kGap4 : (cellH >= 30 ? 2 : 1);
 
   Widget _clearChip(String label, VoidCallback onTap) {
     return GestureDetector(

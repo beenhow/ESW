@@ -46,7 +46,7 @@ import 'shared/scan_ocr_service.dart';
 import 'dictionary_service.dart';
 
 /// 安卓端当前版本号（显示与更新比较的唯一来源，发布版需与 pubspec 保持一致）。
-const String kAndroidAppVersion = '1.6.0';
+const String kAndroidAppVersion = '1.6.2';
 
 /// 原生 docx→PDF 通道：WebView 按 docx 原排版渲染后逐页写出 PDF。
 const MethodChannel _docxPdfChannel = MethodChannel('esw/docx_pdf');
@@ -1002,7 +1002,7 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     return '$dir/corpus';
   }
 
-  /// 首启释放内置真题（98 套）到应用私有 corpus 目录，并复用现有扫描/统计链路。
+  /// 首启释放内置真题（119 套）到应用私有 corpus 目录，并复用现有扫描/统计链路。
   ///
   /// - 版本标记 + 原子写由 [BuiltinCorpus.installFlat] 负责；
   /// - 用户自行导入的同名文件不覆盖（改写为「{id}（内置）.txt」）；
@@ -2898,8 +2898,8 @@ class _ExamPaperViewerState extends State<_ExamPaperViewer> {
     final chunks = <String>[];
     final n = text.length;
     if (n == 0) return chunks;
-    // 优先在空白/常见标点处断开，避免切在单词中间
-    final boundary = RegExp(r'[\s\u3000，。；：！？、,.!?;:()（）\[\]"\u0027]');
+    // 优先在空白/常见标点处断开，避免切在单词中间（撇号是词内字符，不在此断开）
+    final boundary = RegExp(r'[\s\u3000，。；：！？、,.!?;:()（）\[\]"]');
     var start = 0;
     while (start < n) {
       var end = start + maxChunk;
@@ -3053,7 +3053,9 @@ class _ExamPaperViewerState extends State<_ExamPaperViewer> {
     final content = _selectedContent;
     final word = content?.plainText.trim() ?? '';
     if (word.isEmpty) return const SizedBox.shrink();
-    final isWord = RegExp(r"^[a-zA-Z]+(?:['“][a-zA-Z]+)*$").hasMatch(word);
+    final isWord = RegExp(
+      r"^(?:[a-zA-Z]+(?:\.[a-zA-Z]+)+\.?|[a-zA-Z]+(?:['“][a-zA-Z]+)*)$",
+    ).hasMatch(word);
     if (!isWord) {
       return AdaptiveTextSelectionToolbar.buttonItems(
         anchors: state.contextMenuAnchors,
@@ -4130,21 +4132,39 @@ class _AnalysisPageState extends State<_AnalysisPage> {
       _words = freqMap.entries.map((e) {
         final lower = e.key;
         final original = caseMap[lower] ?? lower;
-        String cat;
-        if (widget.vocab.classificationMemory.containsKey(lower)) {
-          cat = widget.vocab.classificationMemory[lower]!;
-        } else if (widget.vocab.isStandard(original)) {
-          cat = '课标词';
-        } else if (widget.vocab.isExtend(original)) {
-          cat = '拓展词';
-        } else if (widget.vocab.isChaoGang(original)) {
-          cat = '超标词';
-        } else if (widget.vocab.isExtra(original)) {
-          cat = '专有词';
-        } else {
-          cat = '其他';
+        // 词形保留完整（couldn't / China's），查表按「完整词形 → 基形」回退，
+        // 否则所有格与缩略形式会整段丢失课标/拓展/超标/专有分类。
+        final keys = wordLookupKeys(original);
+        String? cat;
+        for (final key in keys) {
+          final remembered = widget.vocab.classificationMemory[key];
+          if (remembered != null) {
+            cat = remembered;
+            break;
+          }
         }
-        return _AnalyzedWord(word: original, frequency: e.value, category: cat);
+        if (cat == null) {
+          for (final key in keys) {
+            if (widget.vocab.isStandard(key)) {
+              cat = '课标词';
+              break;
+            } else if (widget.vocab.isExtend(key)) {
+              cat = '拓展词';
+              break;
+            } else if (widget.vocab.isChaoGang(key)) {
+              cat = '超标词';
+              break;
+            } else if (widget.vocab.isExtra(key)) {
+              cat = '专有词';
+              break;
+            }
+          }
+        }
+        return _AnalyzedWord(
+          word: original,
+          frequency: e.value,
+          category: cat ?? '其他',
+        );
       }).toList()..sort((a, b) => b.frequency.compareTo(a.frequency));
 
       _categoryCounts = {};
@@ -4161,14 +4181,16 @@ class _AnalysisPageState extends State<_AnalysisPage> {
           .map((aw) => aw.word.toLowerCase())
           .toSet();
       final annotatedPhrases = <String>{};
-      final wordPattern = RegExp(r'\b[a-zA-Z]{2,}\b');
+      // 与分词口径一致：撇号缩略形式（couldn't）整体当作一个词，不在此处切断
+      final wordPattern = wordTokenRegExp;
       bool isAsciiLetter(int u) =>
           (u >= 0x41 && u <= 0x5A) || (u >= 0x61 && u <= 0x7A);
       bool isSep(int u) => u == 0x20 || u == 0x09 || u == 0x2D; // 空格 / 制表 / 连字符
       // 用 allMatches 遍历所有词（替代逐位指针推进，避免 O(N^2) 与跨行跳词）
       for (final m in wordPattern.allMatches(_text)) {
         final w = m.group(0)!;
-        if (!importedWordsLower.contains(w.toLowerCase())) {
+        if (w.length < 2) continue;
+        if (!wordLookupKeys(w).any(importedWordsLower.contains)) {
           continue;
         }
         // 直接从原文本 m.end 处匹配中文注解，避免创建 O(N) 子串
@@ -4186,7 +4208,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
           }
           if (q == p) break; // 前方不是单词，停止回溯
           final pw = _text.substring(q, p);
-          if (!importedWordsLower.contains(pw.toLowerCase())) break;
+          if (!importedWordsLower.contains(wordLookupKey(pw))) break;
           phraseStart = q;
         }
         annotatedPhrases.add(_text.substring(phraseStart, m.end).trim());
@@ -6547,7 +6569,6 @@ class _SourcePopupViewer extends StatefulWidget {
 
 class _SourcePopupViewerState extends State<_SourcePopupViewer> {
   static const double _fontSize = 16.0;
-  static final _wordRegex = RegExp(r'\b[a-zA-Z]{2,}\b');
 
   final ScrollController _scrollCtrl = ScrollController();
 
@@ -6571,7 +6592,8 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
     final chunks = <String>[];
     final n = text.length;
     if (n == 0) return chunks;
-    final boundary = RegExp(r'[\s\u3000，。；：！？、,.!?;:()（）\[\]"\u0027]');
+    // 撇号不参与切块：撇号是词内字符（couldn't），在此切断会把一个词分到两个块
+    final boundary = RegExp(r'[\s\u3000，。；：！？、,.!?;:()（）\[\]"]');
     var start = 0;
     while (start < n) {
       var end = start + maxChunk;
@@ -6603,12 +6625,12 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
   void initState() {
     super.initState();
     _text = widget.text;
-    _lowerKey = widget.keyword.toLowerCase();
+    _lowerKey = wordLookupKey(widget.keyword);
     _chunks = _splitChunks(_text);
 
     _catByLower = <String, String>{};
     for (final w in widget.words) {
-      _catByLower.putIfAbsent(w.word.toLowerCase(), () => w.category);
+      _catByLower.putIfAbsent(wordLookupKey(w.word), () => w.category);
     }
 
     final offset = _locateTargetOffset();
@@ -6625,8 +6647,8 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
   int _locateTargetOffset() {
     var acc = 0;
     for (final line in _text.split('\n')) {
-      for (final m in _wordRegex.allMatches(line.toLowerCase())) {
-        if (m.group(0) == _lowerKey) return acc + m.start;
+      for (final m in wordTokenRegExp.allMatches(line.toLowerCase())) {
+        if (wordLookupKey(m.group(0)!) == _lowerKey) return acc + m.start;
       }
       acc += line.length + 1; // +1 换行符
     }
@@ -6664,12 +6686,12 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
   List<TextSpan> _buildChunkSpan(String line) {
     final spans = <TextSpan>[];
     int lastEnd = 0;
-    for (final m in _wordRegex.allMatches(line)) {
+    for (final m in wordTokenRegExp.allMatches(line)) {
       final word = m.group(0)!;
       if (m.start > lastEnd) {
         spans.add(TextSpan(text: line.substring(lastEnd, m.start)));
       }
-      if (word.toLowerCase() == _lowerKey) {
+      if (isSameLookupWord(word, _lowerKey)) {
         spans.add(
           TextSpan(
             text: word,
@@ -6682,7 +6704,7 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
           ),
         );
       } else {
-        final cat = _catByLower[word.toLowerCase()];
+        final cat = categoryOfWord(_catByLower, word);
         if (cat != null && cat != '课标词' && cat != '其他') {
           spans.add(
             TextSpan(
@@ -6722,7 +6744,9 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
     SelectableRegionState state,
   ) {
     final word = _selectedContent?.plainText.trim() ?? '';
-    final isWord = RegExp(r"^[a-zA-Z]+(?:['’\-][a-zA-Z]+)*$").hasMatch(word);
+    final isWord = RegExp(
+      r"^(?:[a-zA-Z]+(?:\.[a-zA-Z]+)+\.?|[a-zA-Z]+(?:['’\-][a-zA-Z]+)*)$",
+    ).hasMatch(word);
     if (!isWord) {
       return AdaptiveTextSelectionToolbar.buttonItems(
         anchors: state.contextMenuAnchors,
@@ -7193,6 +7217,26 @@ class _FilterChip extends StatelessWidget {
 /// 异步扫描所有 corpus 语料文件，统计给定单词的出现次数。
 /// 只遍历文件一次，使用联合正则一次性匹配所有单词，避免逐个单词重复扫描。
 /// 使用 readAsString（异步）+ 每 10 个文件让出事件循环，避免阻塞 UI 线程。
+/// 语料索引的格式版本。分词规则变更（如撇号缩略形式整体作为一个词元）后，
+/// 必须让设备上已写盘的 corpus_index.json 失效重建，否则词频仍按旧词元查表，
+/// `couldn't` 会一直命中 0 次。
+const int _corpusIndexSchema = 2;
+
+/// 解析语料索引文件；格式版本不符或内容损坏返回 null（触发重建）。
+Map<String, int>? _decodeCorpusIndex(String json) {
+  try {
+    final decoded = jsonDecode(json) as Map<String, dynamic>;
+    if (decoded['schema'] != _corpusIndexSchema) return null;
+    final words = decoded['words'];
+    if (words is! Map) return null;
+    return <String, int>{
+      for (final e in words.entries) e.key.toString(): (e.value as num).toInt(),
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
 /// 加载 corpus 全量词频索引。
 /// 首次调用时扫描 corpus 目录下所有 .txt，按单词（长度>=3）统计出现次数并写入 corpus_index.json；后续调用直接读内容字 Map，毫秒级响应，彻底解决逐文件扫描转圈问题。
 Future<Map<String, int>> _loadCorpusIndex(
@@ -7202,11 +7246,14 @@ Future<Map<String, int>> _loadCorpusIndex(
   final indexFile = File('$corpusPath/corpus_index.json');
   if (indexFile.existsSync()) {
     try {
-      final json = await indexFile.readAsString();
-      final decoded = jsonDecode(json) as Map<String, dynamic>;
-      return {for (final e in decoded.entries) e.key: (e.value as num).toInt()};
+      final cached = _decodeCorpusIndex(await indexFile.readAsString());
+      if (cached != null) return cached;
+      // 旧版索引：分词口径已变，删除后重建
+      try {
+        await indexFile.delete();
+      } catch (_) {}
     } catch (_) {
-      // 索引损坏则重建
+      // 索引读失败则重建
     }
   }
 
@@ -7222,9 +7269,7 @@ Future<Map<String, int>> _loadCorpusIndex(
   // worker 写盘后由 UI 侧统一读回（避免大 Map 跨 isolate 拷贝驻留内存）
   if (!indexFile.existsSync()) return {};
   try {
-    final json = await indexFile.readAsString();
-    final decoded = jsonDecode(json) as Map<String, dynamic>;
-    return {for (final e in decoded.entries) e.key: (e.value as num).toInt()};
+    return _decodeCorpusIndex(await indexFile.readAsString()) ?? {};
   } catch (_) {
     return {};
   }
@@ -7268,7 +7313,9 @@ Map<String, int> _buildCorpusIndexSync(
   }
 
   try {
-    indexFile.writeAsStringSync(jsonEncode(index));
+    indexFile.writeAsStringSync(
+      jsonEncode({'schema': _corpusIndexSchema, 'words': index}),
+    );
   } catch (_) {
     // 写盘失败不阻塞调用方
   }
@@ -7525,24 +7572,31 @@ Map<String, dynamic> _analyzeTextWorker(Map<String, dynamic> args) {
       freqMap.entries.map((e) {
         final lower = e.key;
         final original = caseMap[lower] ?? lower;
-        String cat;
-        if (classMem.containsKey(lower)) {
-          cat = classMem[lower]!;
-        } else if (standard.contains(lower)) {
-          cat = '课标词';
-        } else if (extend.contains(lower)) {
-          cat = '拓展词';
-        } else if (chaogang.contains(lower)) {
-          cat = '超标词';
-        } else if (extra.contains(lower)) {
-          cat = '专有词';
-        } else {
-          cat = '其他';
+        // 与 UI 侧一致：完整词形查不到时回退基形（China's → China）
+        final keys = wordLookupKeys(original);
+        String? cat;
+        for (final key in keys) {
+          final remembered = classMem[key];
+          if (remembered != null) {
+            cat = remembered;
+            break;
+          }
+        }
+        if (cat == null) {
+          if (matchWordListKey(standard, original) != null) {
+            cat = '课标词';
+          } else if (matchWordListKey(extend, original) != null) {
+            cat = '拓展词';
+          } else if (matchWordListKey(chaogang, original) != null) {
+            cat = '超标词';
+          } else if (matchWordListKey(extra, original) != null) {
+            cat = '专有词';
+          }
         }
         return <String, dynamic>{
           'word': original,
           'frequency': e.value,
-          'category': cat,
+          'category': cat ?? '其他',
         };
       }).toList()..sort(
         (a, b) => (b['frequency'] as int).compareTo(a['frequency'] as int),
@@ -7568,7 +7622,8 @@ Map<String, dynamic> _analyzeTextWorker(Map<String, dynamic> args) {
   bool isSep(int u) => u == 0x20 || u == 0x09 || u == 0x2D; // 空格 / 制表 / 连字符
   for (final m in wordTokenRegExp.allMatches(text)) {
     final w = m.group(0)!;
-    if (!importedWordsLower.contains(w.toLowerCase())) continue;
+    if (w.length < 2) continue;
+    if (!wordLookupKeys(w).any(importedWordsLower.contains)) continue;
     if (parenChineseRegex.matchAsPrefix(text, m.end) == null) continue;
     int phraseStart = m.start;
     while (phraseStart > 0) {
@@ -7582,7 +7637,7 @@ Map<String, dynamic> _analyzeTextWorker(Map<String, dynamic> args) {
       }
       if (q == p) break;
       final pw = text.substring(q, p);
-      if (!importedWordsLower.contains(pw.toLowerCase())) break;
+      if (!importedWordsLower.contains(wordLookupKey(pw))) break;
       phraseStart = q;
     }
     annotatedPhrases.add(text.substring(phraseStart, m.end).trim());

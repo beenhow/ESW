@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 1.6.0+25
+version: 1.6.2+27
 
 environment:
   sdk: ^3.9.2
@@ -81,7 +81,7 @@ flutter:
     # Android 端 PDF 导出用中文字体（Noto Sans SC，SIL OFL；TTF 轮廓，pdf 包可解析）
     - assets/fonts/NotoSansSC-Regular.ttf
     - assets/fonts/NotoSansSC-Bold.ttf
-    # 内置真题：98 套精校版高考真题（txt + index.json，构建期由 tool/convert_gaokao.dart 生成）
+    # 内置真题：119 套精校版高考真题（txt + index.json，构建期由 tool/convert_gaokao.dart 生成）
     - assets/gaokao/index.json
     - assets/gaokao/txt/
     # Android 端「按原 docx 排版导出 PDF」：WebView 离线渲染 docx（jszip + docx-preview，MIT）

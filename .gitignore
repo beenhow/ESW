@@ -71,3 +71,10 @@ scripts/shared_vocab_current.json
 ESW网页版.html
 scripts/.gh_token
 scripts/out.txt
+
+# 本地语料导入工作目录 / 临时脚本 / 截图（仅本机使用）
+2026-11-23/
+2026-11-24/
+.tmp_docxfix/
+shots/
+publish_gh_*.ps1

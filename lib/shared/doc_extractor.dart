@@ -171,7 +171,15 @@ String _decodeAsText(List<int> bytes) {
     if (_looksLikeText(s, 50)) return s;
   } catch (_) {}
   final s = utf8.decode(bytes, allowMalformed: true);
-  return s.replaceAll(RegExp(r'[^\x20-\x7E\u4e00-\u9fff\u3000-\u303f\uff00-\uffef\r\n\t]'), ' ');
+  // 保留弯撇号（U+2018/U+2019）与修饰撇号（U+02BC）：撇号是缩略形式的词内字符，
+  // 被替换成空格会让 couldn’t 在分词前就断成 couldn 和 t。
+  return s.replaceAll(
+    RegExp(
+      r'[^\x20-\x7E\u4e00-\u9fff\u3000-\u303f\uff00-\uffef'
+      '\u2018\u2019\u02BC\r\n\t]',
+    ),
+    ' ',
+  );
 }
 
 // ---------------------------------------------------------------------------

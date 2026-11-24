@@ -27,6 +27,7 @@ import 'package:archive/archive.dart';
 import 'package:xml/xml.dart';
 
 import 'export_word_style.dart';
+import 'text_normalize.dart';
 
 const String _wordNs =
     'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
@@ -89,7 +90,6 @@ const List<String> _rPrOrder = [
   'rtl', 'cs', 'em', 'lang', 'eastAsianLayout', 'specVanish', 'oMath',
 ];
 
-final RegExp _wordRe = RegExp(r'[a-zA-Z]+');
 final RegExp _rPrChildTagRe = RegExp(r'<w:([a-zA-Z]+)(?:[^>]*)?/>');
 
 /// 在源 docx 字节上原地标注并追加明细节，返回标注后的 docx 字节。
@@ -168,8 +168,8 @@ void _annotateDocument(
     if (text.isEmpty) continue;
     // 命中区间：[word, start, end, category]
     final hits = <(String, int, int, String)>[];
-    for (final m in _wordRe.allMatches(text)) {
-      final cat = catByLower[m.group(0)!.toLowerCase()];
+    for (final m in annotatedWordRegExp.allMatches(text)) {
+      final cat = categoryOfWord(catByLower, m.group(0)!);
       if (cat != null) hits.add((m.group(0)!, m.start, m.end, cat));
     }
     if (hits.isEmpty) continue;

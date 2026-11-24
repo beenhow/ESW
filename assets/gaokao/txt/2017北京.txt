@@ -286,12 +286,12 @@ D. Ambitious and professional.
 B
 Inspiring young minds!
 TOKNOW Magazine is a big hit in the world of children's publishing, bringing a unique combination of challenging ideas and good fun to young fans every month.
-What is so special about TOKNOW magazine? Well, it has no ads or promotions inside— instead it is jam-packed with serious ideas. TOKNOW makes complex ideas attractive and accessible to children, who can become involved in advanced concepts and even philosophy(哲学)—and they will soon discover that TOKNOW feels more like a club than just a magazine.What’s inside? Every month the magazine introduces a fresh new topic with articles, experiments and creative things to make — the magazine also explores philosophy and well-being to make sure young readers have a balanced take on life.Sounds too good to be true?
+Sounds too good to be true?
 What is so special about TOKNOW magazine?
 Well, it has no ads or promotions inside—
 instead it is jam-packed with serious ideas.
 TOKNOW makes complex ideas attractive and
-accessible to children, who can become involved in advanced concepts and even philosophy(哲学)—and they will soon discover that TOKNOW feels more like a club than just a magazine.
+accessible to children, who can become involved in advanced concepts and even philosophy (哲学)—and they will soon discover that TOKNOW feels more like a club than just a magazine.
 
 What’s inside?
 Every month the magazine introduces a fresh new topic with articles, experiments and creative things to make — the magazine also explores philosophy and well-being to make sure young readers have a balanced take on life.
@@ -367,7 +367,7 @@ C. command armies of killer robots
 D. work faster than a mathematician
 68. Machines with specific purposes are associated with living things partly because they might be able to.
 A. prevent themselves from being destroyed
-B achieve their original goals independently
+B. achieve their original goals independently
 C. do anything successfully with given orders
 D. beat humans in international chess matches
 69. According to some researchers, we can use firewalls to ______.

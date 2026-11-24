@@ -145,6 +145,62 @@ void main() {
     });
   }
 
+  // 「最近查询」展开态回归：搜索框聚焦 + 历史列表展开时，同样要求零溢出，
+  // 且下方筛选/词频/结果表仍保有可见高度（历史列表按预算收缩并内部滚动）。
+  for (final size in const [
+    Size(1200, 680),
+    Size(900, 600),
+    Size(820, 560),
+    Size(700, 520),
+  ]) {
+    testWidgets(
+        '最近查询展开 ${size.width.toInt()}×${size.height.toInt()}：无溢出且下方区块可见',
+        (tester) async {
+      addTearDown(tester.view.reset);
+      kEswTestWordHistory = List<String>.generate(10, (i) => 'word$i');
+      addTearDown(() => kEswTestWordHistory = null);
+
+      final errors = <String>[];
+      final prev = FlutterError.onError;
+      FlutterError.onError = (d) => errors.add(d.exceptionAsString());
+
+      tester.view.physicalSize = size;
+      tester.view.devicePixelRatio = 1.0;
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpWidget(const WinEswApp());
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 100));
+
+      // 聚焦搜索框：输入为空且有历史时展开「最近查询」
+      await tester.tap(find.byType(TextField));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 200));
+
+      FlutterError.onError = prev;
+      // 让 onTap 里 2s 的历史计时器自然结束，避免 pending timer
+      await tester.pump(const Duration(seconds: 3));
+
+      expect(errors, isEmpty,
+          reason: '尺寸 $size 展开最近查询时出现渲染错误：${summarize(errors)}');
+      expect(find.text('最近查询'), findsOneWidget,
+          reason: '尺寸 $size 下最近查询列表应正常展开');
+
+      for (final k in kRegionKeys) {
+        final f = find.byKey(ValueKey(k));
+        expect(f, findsOneWidget, reason: '尺寸 $size 下缺少区域 $k');
+        final r = tester.getRect(f);
+        expect(r.height, greaterThan(0), reason: '$k 高度必须为正');
+        expect(r.bottom, lessThanOrEqualTo(size.height + 0.01),
+            reason: '$k 在最近查询展开时被挤出窗口底部');
+      }
+
+      // 结果表不能被历史列表挤到不可见（历史列表按预算收缩）
+      expect(tester.getSize(find.byKey(const ValueKey('region-table'))).height,
+          greaterThan(60),
+          reason: '最近查询展开时结果表仍需保留可读高度');
+    });
+  }
+
   testWidgets('缩放系数换算：基准/下限/上限', (tester) async {
     addTearDown(tester.view.reset);
     GlassTheme.uiScale = 1.0;

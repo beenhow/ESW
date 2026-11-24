@@ -101,7 +101,7 @@ class EswDialog {
 
   static const TextStyle titleStyle = TextStyle(
     fontSize: fTitle,
-    fontWeight: FontWeight.w700,
+    fontWeight: FontWeight.w600,
     color: GlassTheme.ink,
     height: 1.25,
   );
@@ -246,12 +246,12 @@ class EswDialogShell extends StatelessWidget {
             height: 24,
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(8),
-              gradient: GlassTheme.grad,
+              color: GlassTheme.accent,
               boxShadow: const [
                 BoxShadow(
-                  color: Color(0x334462F2),
-                  blurRadius: 8,
-                  offset: Offset(0, 2),
+                  color: Color(0x1418181B),
+                  blurRadius: 4,
+                  offset: Offset(0, 1),
                 ),
               ],
             ),
@@ -460,12 +460,9 @@ class _EswDialogPrimaryActionState extends State<EswDialogPrimaryAction> {
               boxShadow: enabled
                   ? [
                       BoxShadow(
-                        color: (widget.danger
-                                ? const Color(0xFFE5484D)
-                                : GlassTheme.accent)
-                            .withValues(alpha: hovered ? 0.34 : 0.24),
-                        blurRadius: hovered ? 14 : 10,
-                        offset: const Offset(0, 3),
+                        color: const Color(0x1F18181B),
+                        blurRadius: hovered ? 10 : 6,
+                        offset: const Offset(0, 2),
                       ),
                     ]
                   : null,
@@ -562,7 +559,7 @@ class _EswDialogGhostActionState extends State<EswDialogGhostAction> {
               border: Border.all(
                 color: hoverBlueOn
                     ? const Color(0xFF2F6BFF)
-                    : (hovered ? const Color(0xFFC7D2FE) : GlassTheme.line),
+                    : (hovered ? GlassTheme.accentLine : GlassTheme.line),
               ),
             ),
             child: Row(

@@ -78,7 +78,7 @@ void main() {
       }
     }
 
-    // 高频统计基线（内置 98 套真题 + 课标词库），用于比对排版是否同源。
+    // 高频统计基线（内置 119 套真题 + 课标词库），用于比对排版是否同源。
     final base = await HighFreqExporter.export(
       corpusDir: corpusDir,
       standardWordsRaw: stdRaw,
@@ -89,8 +89,8 @@ void main() {
     );
     File(p.join(outDir.path, 'ESW-base.xlsx'))
         .writeAsBytesSync(base.xlsxBytes);
-    expect(base.corpusFileCount, 98,
-        reason: '基线统计应只覆盖内置 98 套真题');
+    expect(base.corpusFileCount, 119,
+        reason: '基线统计应只覆盖内置 119 套真题');
     expect(base.exportedWords, greaterThan(0), reason: '基线应导出高频词');
     // ignore: avoid_print
     print('BASELINE files=${base.corpusFileCount} '

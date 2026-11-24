@@ -14,6 +14,7 @@ import 'package:pdf/pdf.dart' as pwpdf;
 import 'package:pdf/widgets.dart' as pw;
 
 import 'export_word_style.dart';
+import 'text_normalize.dart';
 
 // ==================== DOCX（无底纹，仅字色 + 字重） ====================
 
@@ -84,7 +85,7 @@ String docxAnnotatedParagraphXml(
   bool colorBold = true,
   bool annotateUnfiltered = true,
 }) {
-  final regex = RegExp(r'[a-zA-Z]+');
+  final regex = annotatedWordRegExp;
   final typographyMode = scheme == ExportAnnotateScheme.typography;
 
   String oneLine(String line) {
@@ -94,7 +95,7 @@ String docxAnnotatedParagraphXml(
       final word = m.group(0)!;
       final plain = line.substring(lastEnd, m.start);
       if (plain.isNotEmpty) runs.add(docxRunXml(plain, '000000'));
-      final cat = catByLower[word.toLowerCase()];
+      final cat = categoryOfWord(catByLower, word);
       if (typographyMode) {
         // 全文统一 TNR；课标词 / 真题词无标记，其余按简化映射标注
         final style = exportScheme2StyleOf(cat);
@@ -130,8 +131,11 @@ String docxAnnotatedParagraphXml(
 /// 生成 DOCX 段落：按英文单词边界拆分，[words] 中的单词（大小写不敏感）
 /// 用加粗黑色 run 输出，其余文本用普通黑色 run（用于例句/明细加粗强调）。
 String docxParagraphWithBoldWordsXml(String text, List<String> words) {
-  final targets = words.map((w) => w.toLowerCase()).toSet();
-  final regex = RegExp(r'[a-zA-Z]+');
+  final targets = <String>{};
+  for (final w in words) {
+    targets.addAll(wordLookupKeys(w));
+  }
+  final regex = annotatedWordRegExp;
   final runs = <String>[];
   int lastEnd = 0;
   for (final m in regex.allMatches(text)) {
@@ -139,7 +143,8 @@ String docxParagraphWithBoldWordsXml(String text, List<String> words) {
     final plain = text.substring(lastEnd, m.start);
     if (plain.isNotEmpty) runs.add(docxRunXml(plain, '000000'));
     runs.add(
-      docxRunXml(word, '000000', bold: targets.contains(word.toLowerCase())),
+      docxRunXml(word, '000000',
+          bold: wordLookupKeys(word).any(targets.contains)),
     );
     lastEnd = m.end;
   }
@@ -208,7 +213,7 @@ pw.Widget pdfAnnotatedLine(
               ),
       );
 
-  final regex = RegExp(r'[a-zA-Z]+');
+  final regex = annotatedWordRegExp;
   final spans = <pw.TextSpan>[];
   int lastEnd = 0;
   for (final m in regex.allMatches(line)) {
@@ -217,7 +222,7 @@ pw.Widget pdfAnnotatedLine(
     if (plain.isNotEmpty) {
       spans.add(pw.TextSpan(text: plain, style: plainStyle()));
     }
-    final cat = catByLower[word.toLowerCase()];
+    final cat = categoryOfWord(catByLower, word);
     if (typographyMode) {
       final style = exportScheme2StyleOf(cat);
       spans.add(pw.TextSpan(

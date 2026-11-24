@@ -676,7 +676,7 @@ class _WordBankPageState extends State<WordBankPage> {
             }
           },
           child: Text(
-            'V1.6.0 · github.com/beenhow/ESW',
+            'V1.6.2 · github.com/beenhow/ESW',
             style: EswText.caption.copyWith(color: EswColors.textSecondary),
           ),
         ),

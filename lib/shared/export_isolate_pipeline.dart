@@ -21,6 +21,7 @@ import 'export_annotate_markup.dart';
 import 'export_extra_table.dart';
 import 'export_word_style.dart';
 import 'inplace_docx_annotator.dart';
+import 'text_normalize.dart';
 
 // ==========================================================================
 // 载荷约定（由 windows_app 侧构建，键名在此集中说明，两端保持一致）
@@ -153,7 +154,7 @@ Map<String, Object?> buildExportExamplesWorker(Map<String, Object?> a) {
     for (final w in extendQueryWords)
       w: <({String example, String year, bool isPhrase})>[],
   };
-  final fileWordRe = RegExp(r'[a-zA-Z]+');
+  final fileWordRe = wordTokenRegExp;
   final yearPrefixRe = RegExp(r'^(\d{4})');
   for (final cf in corpus) {
     final fileText = (cf['text'] as String?) ?? '';
@@ -656,12 +657,12 @@ int writeDetectionRtfWorker(Map<String, Object?> p) {
   }
 
   String oneLineRtf(String line) {
-    final regex = RegExp(r'[a-zA-Z]+');
+    final regex = annotatedWordRegExp;
     final runs = <String>[];
     int lastEnd = 0;
     for (final m in regex.allMatches(line)) {
       final word = m.group(0)!;
-      final cat = wordCatMap[word.toLowerCase()];
+      final cat = categoryOfWord(wordCatMap, word);
       final plain = line.substring(lastEnd, m.start);
       if (plain.isNotEmpty) runs.add(esc(plain));
       final spec = exportWordStyleOf(cat);

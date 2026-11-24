@@ -14,6 +14,7 @@ analyzer:
     - legacy_unused_dart/**
     - temp/**
     - ESW_backup_20261014/**
+    - TCSV/**  # 其它工程 / 本地临时目录（非本项目源码，见 .gitignore）
 
 linter:
   # The lint rules applied to this project can be customized in the

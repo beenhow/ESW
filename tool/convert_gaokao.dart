@@ -46,6 +46,20 @@ List<String> extractLines(List<int> bytes) {
 String _stripBom(String s) =>
     s.startsWith('\uFEFF') ? s.substring(1) : s;
 
+/// index 版本号自增：应用按 version 决定是否重新释放内置语料到 corpus/v{N}。
+/// 读取已有 index.json 的 version 并 +1；不存在或无法解析时从 1 开始。
+int _nextVersion(String outDir) {
+  final f = File('$outDir/index.json');
+  if (!f.existsSync()) return 1;
+  try {
+    final m = jsonDecode(_stripBom(f.readAsStringSync()));
+    if (m is Map && m['version'] is num) {
+      return (m['version'] as num).toInt() + 1;
+    }
+  } catch (_) {}
+  return 1;
+}
+
 void main(List<String> args) {
   final srcDir = args.isNotEmpty
       ? args[0]
@@ -121,8 +135,8 @@ void main(List<String> args) {
   });
 
   final index = {
-    // v2：保留制表符/软换行分隔 + 选项标记断行（修复 A. itB. that 粘连）
-    'version': 2,
+    // 版本号每次全量重生成自增，触发应用把新语料重新释放到 corpus/v{N}
+    'version': _nextVersion(outDir),
     'generatedAt': DateTime.now().toIso8601String().split('T').first,
     'count': papers.length,
     'totalChars': totalChars,

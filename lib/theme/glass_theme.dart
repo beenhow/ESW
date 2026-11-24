@@ -57,14 +57,16 @@ class GlassTheme {
   static const Color accent = Color(0xFF4462F2); // 唯一强调色（靛蓝，规范 1.1）
   static const Color accentInk = Color(0xFF3348CF); // 强调色深版（hover/选中文字）
   static const Color accentSoft = Color(0x174462F2); // 选中态底色 rgba(68,98,242,0.09)
-  static const Color violet = Color(0xFF8B5CF6); // 渐变副色
+  static const Color accentLine = Color(0x594462F2); // 强调色描边 rgba(68,98,242,0.35)
+  static const Color violet = Color(0xFF8B5CF6); // 历史遗留副色（仅保留常量，界面不再使用）
   static const Color green = Color(0xFF22C55E); // 同步状态绿点
 
-  /// 主渐变（按钮 / 选中胶囊 / logo / 版本徽标），120deg ≈ 左上偏下→右下偏上
+  /// 主渐变（按钮 / 选中胶囊），120deg ≈ 左上偏下→右下偏上。
+  /// 同一色相的明度微调，不再做蓝→紫跨色相渐变。
   static const LinearGradient grad = LinearGradient(
     begin: Alignment(-0.866, -0.5),
     end: Alignment(0.866, 0.5),
-    colors: [accent, violet],
+    colors: [Color(0xFF4B68F5), Color(0xFF3C55DC)],
   );
 
   // ── 字号层级（全站仅 5 档） ──
@@ -580,18 +582,18 @@ class GlassGradientButton extends StatefulWidget {
   /// 按钮高度；为空时按当前窗口缩放系数取 GlassTheme.hToolBtn/hSearchBtn。
   final double? height;
 
-  /// 按压时加深渐变（两色各乘 0.94）
+  /// 按压时加深渐变（同色相，整体压暗约 6%）
   static const LinearGradient gradPressed = LinearGradient(
     begin: Alignment(-0.866, -0.5),
     end: Alignment(0.866, 0.5),
-    colors: [Color(0xFF405CE4), Color(0xFF8357E7)],
+    colors: [Color(0xFF3E56DC), Color(0xFF3348C4)],
   );
 
-  /// 悬停时轻微提亮渐变（两色各乘 1.04，与 gradPressed 的 0.94 对应；第三关 ⑤）
+  /// 悬停时轻微提亮渐变（同色相，与 gradPressed 对应；第三关 ⑤）
   static const LinearGradient gradHover = LinearGradient(
     begin: Alignment(-0.866, -0.5),
     end: Alignment(0.866, 0.5),
-    colors: [Color(0xFF4766FC), Color(0xFF9160FF)],
+    colors: [Color(0xFF5471FF), Color(0xFF425CE8)],
   );
 
   @override
@@ -641,9 +643,9 @@ Widget build(BuildContext context) {
             boxShadow: enabled
                 ? const [
                     BoxShadow(
-                      color: Color(0x523F3FEB), // rgba(80,80,235,0.32) 主按钮投影
-                      blurRadius: 12,
-                      offset: Offset(0, 4),
+                      color: Color(0x1A18181B), // 中性落影，去掉原本的蓝色光晕
+                      blurRadius: 6,
+                      offset: Offset(0, 2),
                     ),
                   ]
                 : null,
@@ -770,7 +772,7 @@ Widget build(BuildContext context) {
                     ? GlassTheme.accentSoft
                     : const Color(0x8CFFFFFF)), // rgba(255,255,255,0.55) 玻璃底（规范 2.2）
           border: Border.all(
-            color: hovered ? const Color(0xFFC7D2FE) : GlassTheme.line,
+            color: hovered ? GlassTheme.accentLine : GlassTheme.line,
           ),
           boxShadow: const [
             BoxShadow(
@@ -875,24 +877,24 @@ Widget build(BuildContext context) {
           height: GlassTheme.hChip,
           padding: const EdgeInsets.symmetric(horizontal: kGap13), // 第二关遗留：水平内衬 12→13
           decoration: BoxDecoration(
-            gradient: selected ? GlassTheme.grad : null,
+            // 选中态用实色强调，不用渐变：同一屏只有少数元素承担颜色
             color: selected
-                ? null
+                ? GlassTheme.accent
                 : (_pressed
                       ? const Color(0x294462F2) // rgba(68,98,242,0.16) 按压加深（第三关 ⑤）
                       : (hovered ? GlassTheme.accentSoft : Colors.transparent)),
-            borderRadius: BorderRadius.circular(999),
+            borderRadius: BorderRadius.circular(GlassTheme.rMd),
             border: Border.all(
               color: selected
                   ? Colors.transparent
-                  : (hovered ? const Color(0xFFC7D2FE) : GlassTheme.line),
+                  : (hovered ? GlassTheme.accentLine : GlassTheme.line),
             ),
             boxShadow: selected
                 ? const [
                     BoxShadow(
-                      color: Color(0x475050EB), // rgba(80,80,235,0.28)
-                      blurRadius: 8,
-                      offset: Offset(0, 3),
+                      color: Color(0x1418181B), // 中性落影，去掉彩色光晕
+                      blurRadius: 4,
+                      offset: Offset(0, 1),
                     ),
                   ]
                 : null,
@@ -1034,7 +1036,10 @@ class GlowDot extends StatelessWidget {
   }
 }
 
-/// 渐变 logo 徽标：ESW 文字徽标，高 20、最小宽 40、圆角 7、蓝紫渐变底（规范 4.3）
+/// 扁平 logo 徽标：ESW 文字徽标，高 20、最小宽 40、圆角 7、纯强调色底（规范 4.3）
+///
+/// 由渐变底 + 宽字距改为单色底 + 常规字距：小块 logo 上的跨色相渐变会读成模板感，
+/// 单色块更像一个被明确决定过的品牌标记。
 class GlassLogo extends StatelessWidget {
   const GlassLogo({super.key});
 
@@ -1046,14 +1051,7 @@ class GlassLogo extends StatelessWidget {
       alignment: Alignment.center,
       padding: const EdgeInsets.symmetric(horizontal: kGap7),
       decoration: BoxDecoration(
-        // 第三轮清单第 10 项：蓝→紫 120° 渐变（#4462F2 → #8B5CF6），
-        // 紫色在 65% 处即完全呈现，保证 40×20 的小徽标右下角也能辨识出紫色。
-        gradient: const LinearGradient(
-          begin: Alignment(-0.866, -0.5),
-          end: Alignment(0.866, 0.5),
-          colors: [Color(0xFF4462F2), Color(0xFF8B5CF6)],
-          stops: [0.0, 0.65],
-        ),
+        color: GlassTheme.accent,
         borderRadius: BorderRadius.circular(7),
       ),
       child: const Text(
@@ -1061,8 +1059,8 @@ class GlassLogo extends StatelessWidget {
         style: TextStyle(
           color: Colors.white,
           fontSize: 9.5,
-          fontWeight: FontWeight.w800,
-          letterSpacing: 1.2,
+          fontWeight: FontWeight.w600,
+          letterSpacing: 0.4,
           height: 1,
         ),
       ),
@@ -1070,7 +1068,7 @@ class GlassLogo extends StatelessWidget {
   }
 }
 
-/// 版本徽标（accent-soft 底 + accent-ink 字）
+/// 版本号：低调的元信息文字（不再用强调色胶囊）
 class GlassVersionBadge extends StatelessWidget {
   const GlassVersionBadge({super.key, required this.version});
 
@@ -1078,20 +1076,12 @@ class GlassVersionBadge extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: GlassTheme.s8, vertical: kGap4),
-      decoration: BoxDecoration(
-        color: GlassTheme.accentSoft,
-        borderRadius: BorderRadius.circular(999),
-      ),
-      child: Text(
-        version,
-        style: const TextStyle(
-          fontSize: GlassTheme.fMicro,
-          color: GlassTheme.accentInk,
-          fontWeight: FontWeight.w600,
-          height: 1,
-        ),
+    return Text(
+      version,
+      style: const TextStyle(
+        fontSize: GlassTheme.fMicro,
+        color: GlassTheme.ink3,
+        height: 1,
       ),
     );
   }

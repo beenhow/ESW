@@ -127,7 +127,7 @@ void main() {
     );
     expect(
       src.contains("if (presetBase.isNotEmpty &&") &&
-          src.contains('_standardWordsLowerKeySet.contains(presetBase)) {'),
+          src.contains('matchWordListKey(_standardWordsLowerKeySet, presetBase) != null) {'),
       isTrue,
       reason: '短路条件必须是「已预设且为有效课标词」',
     );

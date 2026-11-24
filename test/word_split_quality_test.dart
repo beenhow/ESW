@@ -46,6 +46,48 @@ void main() {
       expect(extractWordTokens('PhD MBA GPA'), <String>['PhD', 'MBA', 'GPA']);
     });
 
+    test('撇号缩略形式整体成词（couldn\'t 不再被截成 couldn）', () {
+      const text =
+          "I couldn't believe it. Don't stop — we're late; I've won't can't "
+          "o'clock it's students' books.";
+      final tokens =
+          extractWordTokens(text).map((e) => e.toLowerCase()).toList();
+      expect(tokens, containsAll(<String>[
+        "couldn't",
+        "don't",
+        "we're",
+        "i've",
+        "won't",
+        "can't",
+        "o'clock",
+        "it's",
+        // 复数所有格只在词尾带撇号，词元仍是 students
+        'students',
+      ]));
+      for (final bad in ['couldn', 'don', 'won', 'clock']) {
+        expect(tokens.contains(bad), isFalse, reason: '出现截断 token: $bad');
+      }
+    });
+
+    test('弯撇号与直撇号归一为同一词元', () {
+      final straight = extractWordTokens("It's fine. I don't know.");
+      final curly = extractWordTokens('It\u2019s fine. I don\u2019t know.');
+      expect(straight, containsAll(<String>["It's", "don't"]));
+      expect(curly, straight);
+    });
+
+    test('查词表按「完整词形 → 基形」回退，所有格不丢分类', () {
+      expect(wordLookupKeys("China's"), <String>["china's", 'china']);
+      expect(wordLookupKeys("couldn't"), <String>["couldn't", 'could']);
+      expect(wordLookupKeys("won't"), <String>["won't", 'will', 'wo']);
+      expect(wordLookupKeys("students'"), <String>["students'", 'students']);
+      expect(wordLookupKeys("o'clock"), <String>["o'clock"]);
+      expect(wordLookupKeys("China's").any(<String>{'china'}.contains), isTrue);
+      expect(wordLookupKeys("can't").any(<String>{'can'}.contains), isTrue);
+      expect(wordLookupKeys("we're").any(<String>{'we'}.contains), isTrue);
+      expect(wordLookupKeys('couldn').any(<String>{'china'}.contains), isFalse);
+    });
+
     test('多选项粘连行经规范化后不残留 realB 类 token', () {
       final text = normalizeText('49.A. realB. perfectC. clearD. possible');
       final tokens = extractWordTokens(text);
@@ -144,6 +186,53 @@ void main() {
       } finally {
         temp.deleteSync(recursive: true);
       }
+    });
+  });
+
+  group('原文定位/高亮正则（撇号等价 + 整词）', () {
+    test('直撇号关键词命中弯撇号原文', () {
+      const keyword = "couldn't";
+      for (final text in <String>[
+        "I couldn't go.",
+        'I couldn\u2019t go.', // ’
+        'I couldn\u2018t go.', // ‘
+        'I couldn\u02BCt go.', // ʼ
+        'I COULDN\u2019T go.',
+      ]) {
+        final m = keywordMatchRegExp(keyword).firstMatch(text);
+        expect(m, isNotNull, reason: '未命中：$text');
+        expect(text.substring(m!.start, m.end).toLowerCase().replaceAll('\u2019', "'"),
+            contains("couldn"));
+      }
+    });
+
+    test('弯撇号关键词同样命中原文字面写法', () {
+      expect(
+        keywordMatchRegExp('couldn\u2019t').hasMatch("I couldn't go."),
+        isTrue,
+      );
+    });
+
+    test('按完整词形匹配，不命中更长单词内部', () {
+      final re = keywordMatchRegExp('he');
+      expect(re.hasMatch('he is here'), isTrue);
+      expect(re.hasMatch('the hero'), isFalse);
+      // 缩略词不会退化成截断形式
+      expect(keywordMatchRegExp("couldn't").hasMatch('couldn go'), isFalse);
+      expect(keywordMatchRegExp("couldn't").hasMatch('couldnX go'), isFalse);
+    });
+
+    test('第 N 次命中下标与原文一致', () {
+      const text = "It couldn\u2019t work. They couldn't either.";
+      expect(keywordMatchOffset(text, "couldn't"), text.indexOf('couldn'));
+      final second = keywordMatchOffset(text, "couldn't", occurrence: 1);
+      expect(second, text.indexOf('couldn', text.indexOf('couldn') + 1));
+      expect(keywordMatchOffset(text, "couldn't", occurrence: 2), -1);
+    });
+
+    test('空关键词不产生零宽命中', () {
+      expect(keywordMatchRegExp('').hasMatch('anything'), isFalse);
+      expect(keywordMatchOffset('anything', ''), -1);
     });
   });
 }
