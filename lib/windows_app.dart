@@ -632,7 +632,6 @@ class _MainWindowState extends State<MainWindow>
   static const int _maxContextHalf = 30;
 
   /// 单词检测预编译正则
-  static final RegExp _wordTokenRegex = RegExp(r'\b[a-zA-Z]{2,}\b');
   static final RegExp _yearPrefixRegex = RegExp(r'^(\d{4})');
   static final RegExp _whitespaceRegex = RegExp(r'[\s\n\u3000]');
   static final RegExp _anyWhitespaceChar = RegExp(r'\s');
@@ -2802,35 +2801,24 @@ class _MainWindowState extends State<MainWindow>
       });
       _debugLog('[Detect] sync-querying setState seq=$seq');
     }
-    // 1) 查课标词库（优先精确匹配，再大小写不敏感匹配）
+    // 1) 查课标词库（大小写敏感；大写写法可命中同名小写词条，反之不行）
     bool isStandard = false;
     String cat = '';
     String pos = '';
     String def = '';
-    String matchedKey = '';
-    final swEntryExact = _standardWords[raw];
-    if (swEntryExact != null) {
+    final standardKey = findWordEntryKey(_standardWords, raw);
+    if (standardKey != null) {
+      final swEntry = _standardWords[standardKey]!;
       isStandard = true;
-      cat = swEntryExact['category']!;
-      pos = swEntryExact['pos']!;
-      def = swEntryExact['def']!;
-      matchedKey = raw;
-    } else {
-      // 大小写不敏感，并兼容带点缩写的末尾点省略（a.m. / a.m）
-      for (final key in wordLookupKeys(raw)) {
-        final lowerMatches = _standardWordsLower[key];
-        if (lowerMatches == null || lowerMatches.isEmpty) continue;
-        final swEntry = _standardWords[lowerMatches.first]!;
-        isStandard = true;
-        cat = swEntry['category']!;
-        pos = swEntry['pos']!;
-        def = swEntry['def']!;
-        matchedKey = lowerMatches.first;
-        break;
-      }
+      cat = swEntry['category']!;
+      pos = swEntry['pos']!;
+      def = swEntry['def']!;
+    } else if (isWordEntryHit(_standardWords, raw)) {
+      // 连字符复合词：各部分均为课标词，整体按课标词处理（无单条级别/释义）
+      isStandard = true;
     }
-    // 2) 查拓展词（走小写索引 O(1) 判命中，避免线性扫描 + 逐词 toLowerCase）
-    final isExtend = wordLookupKeys(raw).any(_extendWordsLower.contains);
+    // 2) 查拓展词（大小写敏感；大写写法可命中同名小写词条）
+    final isExtend = matchWordEntryKey(_extendWords.toSet(), raw) != null;
     // 3) 搜索真题语料
     int totalFreq = 0;
     final results = <ResultRow>[];
@@ -2972,7 +2960,8 @@ class _MainWindowState extends State<MainWindow>
     _debugLog('[Detect] final-setState seq=$seq raw="$raw" filter=$filter '
         'freq=$totalFreq');
     setState(() {
-      _detectedWord = matchedKey.isNotEmpty ? matchedKey : word;
+      // 展示完整词元（haven't 不再回写成基形 have）
+      _detectedWord = word;
       _activeFilter = filter;
       _detectedCategory = isStandard && cat.isNotEmpty ? cat : null;
       _wordPos = pos;
@@ -3180,11 +3169,11 @@ class _MainWindowState extends State<MainWindow>
         }
       }
     }
-    // 词库小写索引：未筛选判定需要「四个词库全不收录」，此处一次性建索引
-    final chaoGangLowerSet =
-        _manualChaoGangWords.map((e) => e.toLowerCase()).toSet();
-    final extraLowerSet =
-        _manualExtraWords.map((e) => e.toLowerCase()).toSet();
+    // 词库索引：未筛选判定需要「四个词库全不收录」。
+    // 手动词表与课标词库同口径：精确匹配优先，大写写法可回退到同名小写词条。
+    final extendKeySet = _extendWords.toSet();
+    final chaoGangKeySet = _manualChaoGangWords.toSet();
+    final extraKeySet = _manualExtraWords.toSet();
     final words = <_ImportedWord>[];
     for (final entry in freqMap.entries) {
       final w = entry.key; // 小写
@@ -3208,10 +3197,10 @@ class _MainWindowState extends State<MainWindow>
       // 并在未筛选列等待用户手动归类）
       final cat = resolveFilterCategory(
         inCorpus: inCorpus,
-        inStandard: matchWordListKey(_standardWordsLowerKeySet, original) != null,
-        inExtend: matchWordListKey(_extendWordsLower, original) != null,
-        inChaoGang: matchWordListKey(chaoGangLowerSet, original) != null,
-        inProper: matchWordListKey(extraLowerSet, original) != null,
+        inStandard: isWordEntryHit(_standardWords, original),
+        inExtend: matchWordEntryKey(extendKeySet, original) != null,
+        inChaoGang: matchWordEntryKey(chaoGangKeySet, original) != null,
+        inProper: matchWordEntryKey(extraKeySet, original) != null,
         remembered: remembered,
       );
       words.add(
@@ -3305,7 +3294,7 @@ class _MainWindowState extends State<MainWindow>
                               ),
                             ),
                             const SizedBox(width: kGap8),
-                            GlassVersionBadge(version: 'v1.6.2'),
+                            GlassVersionBadge(version: 'v1.6.3'),
                           ],
                         ),
                       ),
@@ -4011,7 +4000,7 @@ class _MainWindowState extends State<MainWindow>
                       // 检测是否为多单词文本（粘贴场景），自动切换导入模式
                       final trimmed = _searchController.text.trim();
                       if (trimmed.contains(_anyWhitespaceChar) &&
-                          _wordTokenRegex.allMatches(trimmed).length >= 2) {
+                          extractWordTokens(trimmed).length >= 2) {
                         _importedFileName = null;
                         _analyzeImportedText();
                       } else if (trimmed.isEmpty) {
@@ -4428,7 +4417,8 @@ class _MainWindowState extends State<MainWindow>
   /// 检测单词信息居中长条（分类 + 词性 + 释义，显示在搜索框正下方）
   Widget _buildWordDefBanner() {
     // 走小写索引 O(1) 判命中（_detectedWord 可能保留原文大小写，统一转小写查询）
-    final isExtend = wordLookupKeys(_detectedWord).any(_extendWordsLower.contains);
+    final isExtend =
+        matchWordEntryKey(_extendWords.toSet(), _detectedWord) != null;
     final isStandard = _detectedCategory != null;
     final chipColor = isExtend
         ? AppTheme.green
@@ -4739,39 +4729,44 @@ class _MainWindowState extends State<MainWindow>
     );
   }
 
-  /// 导出前置拦截：存在未筛选词时禁止导出，引导用户先去筛选列归类。
+  /// 导出前提示：存在未筛选词时，用户可先去筛选列归类，也可直接继续导出。
   ///
-  /// 方案一 / 方案二共用同一导出入口，因此两套方案都会被拦下。
-  Future<void> _promptUnfilteredBeforeExport(int count) async {
-    if (!mounted) return;
-    final go = await showDialog<bool>(
+  /// 返回 true 表示用户选择「继续导出」。
+  Future<bool> _promptUnfilteredBeforeExport(int count) async {
+    if (!mounted) return false;
+    final choice = await showDialog<String>(
       context: context,
       builder: (dctx) => _glassDialog(
         EswDialogShell(
           title: '还有未筛选的词',
           subtitle: '当前检测结果中仍有 $count 个未筛选的词。未筛选词不参与导出标注，'
-              '请先在筛选列把它们归类到课标词 / 拓展词 / 超标词 / 专有词，'
-              '全部归类完成后再导出。',
+              '你可以先去筛选列把它们归类到课标词 / 拓展词 / 超标词 / 专有词，'
+              '也可以直接继续导出。',
           icon: Icons.filter_alt_off,
           body: const SizedBox.shrink(),
           actions: EswDialogActions(
             children: [
               EswDialogTextAction(
                 label: '取消',
-                onPressed: () => Navigator.pop(dctx, false),
+                onPressed: () => Navigator.pop(dctx),
+              ),
+              EswDialogTextAction(
+                label: '去筛选',
+                onPressed: () => Navigator.pop(dctx, 'filter'),
               ),
               EswDialogPrimaryAction(
-                label: '去筛选',
-                onPressed: () => Navigator.pop(dctx, true),
+                label: '继续导出',
+                onPressed: () => Navigator.pop(dctx, 'continue'),
               ),
             ],
           ),
         ),
       ),
     );
-    if (go == true && mounted) {
+    if (choice == 'filter' && mounted) {
       setState(() => _importedActiveFilter = '未筛选');
     }
+    return choice == 'continue';
   }
 
   /// 将导入的原文导出为 docx / pdf，按所选方案标注单词（纯 Dart 实现，无 Python 依赖）
@@ -4791,16 +4786,14 @@ class _MainWindowState extends State<MainWindow>
       ).showSnackBar(const SnackBar(content: Text('请先导入文本并完成检测后再导出')));
       return;
     }
-    // 前置拦截：仍有未筛选词时禁止导出（两套标注方案同一入口，均被拦下）。
-    // 未筛选词在导出中不再标注，必须先人工归类到课标 / 拓展 / 超标 / 专有。
+    // 导出前提示：仍有未筛选词时询问用户，选择继续则照常导出（未筛选词不标注）。
     final unfilteredCount = _importedFilterCounts['未筛选'] ?? 0;
     if (unfilteredCount > 0) {
-      // 自动化取证（ESW_AUTO_OUT）下不弹窗阻塞，直接终止导出
+      // 自动化取证（ESW_AUTO_OUT）下不弹窗，直接终止导出
       final autoOut = Platform.environment['ESW_AUTO_OUT'];
-      if (autoOut == null || autoOut.isEmpty) {
-        await _promptUnfilteredBeforeExport(unfilteredCount);
-      }
-      return;
+      if (autoOut != null && autoOut.isNotEmpty) return;
+      final proceed = await _promptUnfilteredBeforeExport(unfilteredCount);
+      if (!proceed || !mounted) return;
     }
     // 单词标注方案：导出前弹窗让用户二选一（方案一配色 / 方案二字体格式）。
     // 复用「选择导出格式」同一套弹窗骨架与选项块（EswDialogShell + EswOptionRow），
@@ -4911,13 +4904,8 @@ class _MainWindowState extends State<MainWindow>
         final lower = iw.word.toLowerCase();
         var level = '';
         if (iw.category == '课标词') {
-          for (final k in wordLookupKeys(iw.word)) {
-            final keys = _standardWordsLower[k];
-            if (keys != null && keys.isNotEmpty) {
-              level = _standardWords[keys.first]?['category'] ?? '';
-              break;
-            }
-          }
+          final key = findWordEntryKey(_standardWords, iw.word);
+          if (key != null) level = _standardWords[key]?['category'] ?? '';
         }
         wordCatMap[lower] = exportAnnotateCategoryOfDetected(
           category: iw.category,
@@ -5185,7 +5173,7 @@ class _MainWindowState extends State<MainWindow>
       for (final w in extendQueryWords)
         w: <({String example, String year, bool isPhrase})>[],
     };
-    final fileWordRe = RegExp(r'[a-zA-Z]+');
+    final fileWordRe = wordTokenRegExp;
     var corpusIdx = 0;
     for (final cf in _corpusFiles.where((f) => f.isSelected)) {
       corpusIdx++;
@@ -5243,7 +5231,7 @@ class _MainWindowState extends State<MainWindow>
         'words=${extendQueryWords.length}');
     // 例句偏好评分（宁缺毋滥口径）：不含汉字 > 无下划线 > 词数>=3 > 句子短
     final hanRe = RegExp(r'[\u4e00-\u9fff]');
-    final enWordRe = RegExp(r'[a-zA-Z]+');
+    final enWordRe = wordTokenRegExp;
     int wordCountOfUsage(String s) => enWordRe.allMatches(s).length;
     int gaokaoScore(String s) {
       var score = 0;
@@ -5408,9 +5396,9 @@ class _MainWindowState extends State<MainWindow>
     );
   }
 
-  /// 判断单词是否为课标词（小写匹配课标词库键）。
+  /// 判断单词是否为课标词（精确优先，大写写法可回退到同名小写词条）。
   bool _isStandardWord(String word) =>
-      _standardWordsLower.containsKey(word.toLowerCase());
+      findWordEntryKey(_standardWords, word) != null;
 
   /// 拓展词 → 课标原词：优先用户关联映射（extendBaseMap），其次反向索引，最后课标词库本身。
   String _baseWordOf(String word) {
@@ -5505,13 +5493,8 @@ class _MainWindowState extends State<MainWindow>
     for (final w in _importedWords) {
       if (w.category != '课标词') continue;
       String cat = '';
-      for (final k in wordLookupKeys(w.word)) {
-        final keys = _standardWordsLower[k];
-        if (keys != null && keys.isNotEmpty) {
-          cat = _standardWords[keys.first]?['category'] ?? '';
-          break;
-        }
-      }
+      final key = findWordEntryKey(_standardWords, w.word);
+      if (key != null) cat = _standardWords[key]?['category'] ?? '';
       if (counts.containsKey(cat)) counts[cat] = counts[cat]! + 1;
     }
     return counts;
@@ -6348,21 +6331,22 @@ try {
   void _onReturnToImportedMode() {
     // 重新归类：已加入拓展词手动超标词的单词应归类为对应类别
     final oldCounts = Map<String, int>.from(_savedImportedFilterCounts);
-    // 任务④（运行速度）：预建小写索引。原来用 List.contains 判断是 O(m) 线性
-    // 扫描且大小写敏感（易漏判），整体 O(n×m)；改为集合查找后为 O(n+m)。
-    final extendLower = _extendWordsLower;
-    final chaoGangLower =
-        _manualChaoGangWords.map((e) => e.toLowerCase()).toSet();
-    final extraLower = _manualExtraWords.map((e) => e.toLowerCase()).toSet();
+    // 任务④（运行速度）：预建索引。手动词表与课标词库同口径：
+    // 精确匹配优先，大写写法可回退到同名小写词条。
+    final extendKeys = _extendWords.toSet();
+    final chaoGangKeys = _manualChaoGangWords.toSet();
+    final extraKeys = _manualExtraWords.toSet();
     for (int i = 0; i < _savedImportedWords.length; i++) {
       final iw = _savedImportedWords[i];
-      final lower = iw.word.toLowerCase();
       String? newCat;
-      if (extendLower.contains(lower) && iw.category != '拓展词') {
+      if (matchWordEntryKey(extendKeys, iw.word) != null &&
+          iw.category != '拓展词') {
         newCat = '拓展词';
-      } else if (chaoGangLower.contains(lower) && iw.category != '超标词') {
+      } else if (matchWordEntryKey(chaoGangKeys, iw.word) != null &&
+          iw.category != '超标词') {
         newCat = '超标词';
-      } else if (extraLower.contains(lower) && iw.category != '专有词') {
+      } else if (matchWordEntryKey(extraKeys, iw.word) != null &&
+          iw.category != '专有词') {
         newCat = '专有词';
       }
       if (newCat != null) {
@@ -7916,7 +7900,8 @@ try {
       return true;
     }
     // 已是拓展词：弹窗降级为「修改课标词根」，不重复计数、不重复入列
-    final alreadyExtend = wordLookupKeys(word).any(_extendWordsLower.contains);
+    final alreadyExtend =
+        matchWordEntryKey(_extendWords.toSet(), word) != null;
     final result = await _showExtendWordDialog(
       extendWord: word,
       dialogTitle:
@@ -11166,7 +11151,7 @@ try {
   }
 
   void _checkUpdate() async {
-    const currentVersion = '1.6.2';
+    const currentVersion = '1.6.3';
     try {
       final response = await http
           .get(

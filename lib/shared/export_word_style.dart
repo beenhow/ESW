@@ -65,8 +65,8 @@ class ExportWordStyle {
 ///
 /// 表中保留历史字重（初中 / 必修 / 拓展加粗）供 Android 端沿用；
 /// Windows 端方案一通过 `colorBold: false` 关闭加粗，只靠颜色区分。
-/// 未筛选词在 Windows 导出前会被前置拦截（必须先归类），其历史样式仅保留
-/// 给 Android 与统计口径使用，不会出现在 Windows 导出文档中。
+/// 未筛选词不参与 Windows 导出标注（导出前会提示，用户可选择继续导出），其历史
+/// 样式仅保留给 Android 与统计口径使用，不会出现在 Windows 导出文档中。
 /// shadeHex 为各类规范色的极淡同色底纹，仅 PDF 导出原文标注使用。
 const Map<String, ExportWordStyle> kExportWordStyles = {
   // 初中课标词：黑色加粗
@@ -102,7 +102,7 @@ const Map<String, ExportWordStyle> kExportWordStyles = {
     colorHex: '800080',
     shadeHex: 'EBD9F0',
   ),
-  // 未筛选：土红色（Windows 导出已拦截，不会落盘）
+  // 未筛选：土红色（Windows 导出不标注，不会落盘）
   ExportCategory.unfiltered: ExportWordStyle(
     colorHex: 'A0522D',
     shadeHex: 'F0E0D6',
@@ -112,7 +112,7 @@ const Map<String, ExportWordStyle> kExportWordStyles = {
 /// 取某类词的规范样式；真题词 / 其他返回 null，表示不参与配色标注。
 ///
 /// Windows 导出通过 `annotateUnfiltered: false` 跳过未筛选词：
-/// 导出前已有前置拦截，双保险确保未筛选词绝不会被标记。
+/// 导出前会提示用户，选择继续导出时仍确保未筛选词不被标记。
 ExportWordStyle? exportWordStyleOf(String? category) =>
     category == null ? null : kExportWordStyles[category];
 
@@ -144,7 +144,7 @@ String standardExportCategory(String level) {
 ///   级别缺失时按初中处理（与 [standardExportCategory] 的统计口径一致）；
 /// - 拓展词 / 超标词 / 专有词：原样透传；
 /// - 未筛选 / 其他：真题语料出现过 → 「真题词」（叠加维度，不参与标注）；
-///   四库均不收录且未在语料出现 → 「未筛选」（导出不标注，且导出前会被拦截）。
+///   四库均不收录且未在语料出现 → 「未筛选」（导出不标注，导出前会提示是否继续）。
 String exportAnnotateCategoryOfDetected({
   required String category,
   String standardLevel = '',
@@ -218,7 +218,7 @@ class ExportScheme2Style {
 /// - 拓展词：加粗；
 /// - 超标词：单线下划线；
 /// - 专有词：30% 灰底纹。
-/// 未筛选词不标注（导出前会被拦截，要求先归类完毕）。
+/// 未筛选词不标注（导出前提示可继续，未筛选词保持不标注）。
 const Map<String, ExportScheme2Style> kExportScheme2Styles = {
   ExportCategory.standardJunior: ExportScheme2Style(),
   ExportCategory.standardCompulsory: ExportScheme2Style(),

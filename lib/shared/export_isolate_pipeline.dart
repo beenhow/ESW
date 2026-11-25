@@ -186,7 +186,7 @@ Map<String, Object?> buildExportExamplesWorker(Map<String, Object?> a) {
   }
 
   final hanRe = RegExp(r'[\u4e00-\u9fff]');
-  final enWordRe = RegExp(r'[a-zA-Z]+');
+  final enWordRe = wordTokenRegExp;
   int wordCountOfUsage(String s) => enWordRe.allMatches(s).length;
   int gaokaoScore(String s) {
     var score = 0;

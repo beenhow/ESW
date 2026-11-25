@@ -117,6 +117,11 @@
   "pos": "",
   "def": "vt.陪伴，伴随；伴奏\nvi.伴奏，伴唱"
  },
+ "according": {
+  "category": "初中",
+  "pos": "",
+  "def": "adj.相符的；一致的；相应的；和谐的；调和的\nadv.依照；根据；按照\nv.给予( accord的现在分词 )；使和谐一致；使符合；使适合"
+ },
  "according to": {
   "category": "初中",
   "pos": "",
@@ -344,7 +349,7 @@
   "def": "adj.害怕的；恐怕；担心的"
  },
  "Africa": {
-  "category": "必修",
+  "category": "初中",
   "pos": "",
   "def": "n. 非洲"
  },
@@ -572,7 +577,7 @@
   "def": "n.救护车；战时流动医院"
  },
  "America": {
-  "category": "必修",
+  "category": "初中",
   "pos": "",
   "def": "n. 美洲；美国"
  },
@@ -685,7 +690,7 @@
   "def": "n.蚂蚁"
  },
  "Antarctica": {
-  "category": "选修",
+  "category": "初中",
   "pos": "",
   "def": "n. 南极洲"
  },
@@ -955,7 +960,7 @@
   "def": "adj.惭愧的，感到难为情的；耻于……的"
  },
  "Asia": {
-  "category": "必修",
+  "category": "初中",
   "pos": "",
   "def": "n. 亚洲"
  },
@@ -2154,15 +2159,15 @@
   "pos": "",
   "def": "n.卷心菜，甘蓝菜，洋白菜"
  },
- "cafeteria": {
-  "category": "选修",
-  "pos": "",
-  "def": "n.自助餐厅"
- },
  "café": {
   "category": "必修",
   "pos": "",
   "def": "n.咖啡馆；小餐馆"
+ },
+ "cafeteria": {
+  "category": "选修",
+  "pos": "",
+  "def": "n.自助餐厅"
  },
  "cage": {
   "category": "选修",
@@ -2721,7 +2726,7 @@
   "def": "n. 中国"
  },
  "china": {
-  "category": "必修",
+  "category": "初中",
   "pos": "",
   "def": "n.china，瓷器\nadj.china，瓷制的"
  },
@@ -4016,7 +4021,7 @@
   "def": "n.债务；借款；罪过"
  },
  "decade": {
-  "category": "选修",
+  "category": "必修",
   "pos": "",
   "def": "n.十年，十年期；十"
  },
@@ -4041,7 +4046,7 @@
   "def": "vt.宣布，声明；断言，宣称\nvi.声明，宣布"
  },
  "decline": {
-  "category": "选修",
+  "category": "必修",
   "pos": "",
   "def": "n.下降；衰退；斜面\nvt.谢绝；婉拒\nvi.下降；衰落；谢绝"
  },
@@ -4071,7 +4076,7 @@
   "def": "n.鹿"
  },
  "defeat": {
-  "category": "选修",
+  "category": "必修",
   "pos": "",
   "def": "n.失败的事实；击败的行为\nvt.击败，战胜；挫败；使…失败"
  },
@@ -4154,7 +4159,7 @@
   "def": "vi.否认；拒绝\nvt.否定，否认；拒绝给予；拒绝…的要求"
  },
  "department": {
-  "category": "选修",
+  "category": "必修",
   "pos": "",
   "def": "n.部；部门；系；科；局"
  },
@@ -4404,7 +4409,7 @@
   ]
  },
  "direction": {
-  "category": "必修",
+  "category": "初中",
   "pos": "",
   "def": "n.方向；指导；趋势；用法说明"
  },
@@ -4741,7 +4746,7 @@
   "def": "n.连衣裙；女装\nvt.给…穿衣\nvi.穿衣"
  },
  "drill": {
-  "category": "选修",
+  "category": "必修",
   "pos": "",
   "def": "n.训练；钻孔机；钻子；播种机\nvt.钻孔；训练；条播\nvi.钻孔；训练"
  },
@@ -4827,12 +4832,12 @@
   "def": "prep.在…的时候，在…的期间"
  },
  "dust": {
-  "category": "选修",
+  "category": "初中",
   "pos": "",
   "def": "n.灰尘；尘埃；尘土\nvt.撒；拂去灰尘\nvi.拂去灰尘；化为粉末"
  },
  "duty": {
-  "category": "初中",
+  "category": "必修",
   "pos": "",
   "def": "n.责任；[税收] 关税；职务"
  },
@@ -5017,7 +5022,7 @@
   "def": "adj.高雅的，优雅的；讲究的；简炼的；简洁的"
  },
  "element": {
-  "category": "必修",
+  "category": "选修",
   "pos": "",
   "def": "n.元素；要素；原理；成分；自然环境",
   "extensions": [
@@ -5305,7 +5310,7 @@
   "def": "adv.特别；尤其；格外"
  },
  "essay": {
-  "category": "选修",
+  "category": "必修",
   "pos": "",
   "def": "n.散文；试图；随笔\nvt.尝试；对…做试验"
  },
@@ -5340,7 +5345,7 @@
   "def": "adj.种族的；人种的"
  },
  "Europe": {
-  "category": "必修",
+  "category": "初中",
   "pos": "",
   "def": "n. 欧洲"
  },
@@ -5562,7 +5567,7 @@
   "def": "n.实验，试验；尝试\nvi.尝试；进行实验"
  },
  "expert": {
-  "category": "初中",
+  "category": "必修",
   "pos": "",
   "def": "n.专家；行家；能手\nadj.熟练的；内行的；老练的\nvt.当专家；在…中当行家"
  },
@@ -5640,7 +5645,7 @@
   "def": "adj.非凡的；特别的；离奇的；临时的；特派的"
  },
  "extremely": {
-  "category": "必修",
+  "category": "选修",
   "pos": "",
   "def": "adv.非常，极其；极端地"
  },
@@ -5978,7 +5983,7 @@
   "def": "n.财政，财政学；金融\nvt.负担经费，供给…经费\nvi.筹措资金"
  },
  "financial": {
-  "category": "选修",
+  "category": "必修",
   "pos": "",
   "def": "adj.金融的；财政的，财务的"
  },
@@ -6114,7 +6119,7 @@
   "def": "n.地板，地面；楼层；基底；议员席\nvt.铺地板；打倒，击倒；（被困难）难倒"
  },
  "flour": {
-  "category": "选修",
+  "category": "初中",
   "pos": "",
   "def": "n.面粉；粉状物质\nvt.撒粉于；把…磨成粉"
  },
@@ -6271,7 +6276,7 @@
   "def": "n.正式的社交活动；夜礼服\nadj.正式的；拘谨的；有条理的"
  },
  "format": {
-  "category": "选修",
+  "category": "必修",
   "pos": "",
   "def": "n.格式；版式；开本\nvt.使格式化；规定…的格式\nvi.设计版式"
  },
@@ -6351,7 +6356,7 @@
   "def": "n.频率；频繁"
  },
  "frequently": {
-  "category": "必修",
+  "category": "选修",
   "pos": "",
   "def": "adv.频繁地，经常地；时常，屡次"
  },
@@ -6479,7 +6484,7 @@
   "def": "adj.更远的；深一层的\nvt.促进，助长；增进\nadv.进一步地；而且；更远地"
  },
  "furthermore": {
-  "category": "必修",
+  "category": "选修",
   "pos": "",
   "def": "adv.此外；而且"
  },
@@ -6976,12 +6981,12 @@
   "def": "n.男人，家伙\nvt.嘲弄，取笑\nvi.逃跑"
  },
  "gym": {
-  "category": "初中",
+  "category": "必修",
   "pos": "",
   "def": "n.健身房；体育；体育馆"
  },
  "gymnasium": {
-  "category": "初中",
+  "category": "必修",
   "pos": "",
   "def": "n.体育馆；健身房"
  },
@@ -7202,7 +7207,7 @@
   "def": "n.重物；严肃角色\nadj.沉重的；繁重的，巨大的；拥挤的；阴沉的\nadv.大量地；笨重地"
  },
  "height": {
-  "category": "初中",
+  "category": "必修",
   "pos": "",
   "def": "n.高地；高度；身高；顶点"
  },
@@ -7308,7 +7313,7 @@
   "def": "n.最精彩的部分；最重要的事情；加亮区\nvt.突出；强调；使显著；加亮"
  },
  "highway": {
-  "category": "必修",
+  "category": "选修",
   "pos": "",
   "def": "n.公路，大路；捷径"
  },
@@ -7346,6 +7351,11 @@
   "category": "选修",
   "pos": "",
   "def": "a.历史上著名的；有历史性的"
+ },
+ "historical": {
+  "category": "选修",
+  "pos": "",
+  "def": "adj.历史的；史学的；基于史实的"
  },
  "history": {
   "category": "初中",
@@ -7525,6 +7535,11 @@
   "pos": "",
   "def": "n.幽默，诙谐；心情\nvt.迎合，迁就；顺应"
  },
+ "humorous": {
+  "category": "必修",
+  "pos": "",
+  "def": "adj.诙谐的，幽默的；滑稽的，可笑的"
+ },
  "humour": {
   "category": "初中",
   "pos": "",
@@ -7566,7 +7581,7 @@
   "def": "n.丈夫\nvt.节约地使用（或管理）"
  },
  "hybrid": {
-  "category": "选修",
+  "category": "必修",
   "pos": "",
   "def": "n.杂种，混血儿；混合物\nadj.混合的；杂种的"
  },
@@ -7750,7 +7765,7 @@
   "def": "adj.难以置信的，惊人的"
  },
  "indeed": {
-  "category": "必修",
+  "category": "初中",
   "pos": "",
   "def": "adv.的确；实在；真正地；甚至\nint.真的（表示惊讶、怀疑、讽刺等）"
  },
@@ -7999,7 +8014,7 @@
   "def": "vi.解释；翻译\nvt.说明；口译"
  },
  "interrupt": {
-  "category": "选修",
+  "category": "必修",
   "pos": "",
   "def": "n.中断\nvt.中断；打断；插嘴；妨碍\nvi.打断；打扰"
  },
@@ -9079,7 +9094,7 @@
  "march": {
   "category": "必修",
   "pos": "",
-  "def": "n.三月"
+  "def": "行进；游行"
  },
  "marine": {
   "category": "选修",
@@ -9408,7 +9423,7 @@
   "def": "n.毫米；公厘"
  },
  "million": {
-  "category": "必修",
+  "category": "初中",
   "pos": "",
   "def": "num. 百万"
  },
@@ -10170,6 +10185,11 @@
   "pos": "",
   "def": "n.营养，营养学；营养品"
  },
+ "o’clock": {
+  "category": "初中",
+  "pos": "",
+  "def": "abbr.…点钟（等于of the clock）"
+ },
  "obey": {
   "category": "必修",
   "pos": "",
@@ -10287,6 +10307,11 @@
   "def": "n.油；石油；油画颜料\nvt.加油；涂油；使融化\nvi.融化；加燃油"
  },
  "OK": {
+  "category": "初中",
+  "pos": "",
+  "def": "adj.好的；不错的\nadv.行；很好\nint.好；可以\nvt.对…表示同意\nn.同意"
+ },
+ "ok": {
   "category": "初中",
   "pos": "",
   "def": "adj.好的；不错的\nadv.行；很好\nint.好；可以\nvt.对…表示同意\nn.同意"
@@ -10575,11 +10600,6 @@
   "pos": "",
   "def": "n.[化学] 氧气，[化学] 氧"
  },
- "o’clock": {
-  "category": "初中",
-  "pos": "",
-  "def": "abbr.…点钟（等于of the clock）"
- },
  "p.m.": {
   "category": "初中",
   "pos": "",
@@ -10633,7 +10653,10 @@
  "pair": {
   "category": "初中",
   "pos": "",
-  "def": "n.一对，一双，一副\nvt.把…组成一对"
+  "def": "n.一对，一双，一副\nvt.把…组成一对",
+  "extensions": [
+   "paris"
+  ]
  },
  "palace": {
   "category": "初中",
@@ -14768,11 +14791,6 @@
    "systems"
   ]
  },
- "T-shirt": {
-  "category": "初中",
-  "pos": "",
-  "def": "n.短袖圆领汗衫"
- },
  "table": {
   "category": "初中",
   "pos": "",
@@ -15622,6 +15640,11 @@
   "pos": "",
   "def": "n.尝试；努力；试验\nvt.试图，努力；试验；审判；考验\nvi.尝试；努力；试验"
  },
+ "T-shirt": {
+  "category": "初中",
+  "pos": "",
+  "def": "n.短袖圆领汗衫"
+ },
  "tube": {
   "category": "选修",
   "pos": "",
@@ -15655,7 +15678,10 @@
  "twice": {
   "category": "必修",
   "pos": "",
-  "def": "adv.两次；两倍"
+  "def": "adv.两次；两倍",
+  "extensions": [
+   "two"
+  ]
  },
  "twin": {
   "category": "选修",
@@ -16389,11 +16415,6 @@
   "pos": "",
   "def": "int.哎呀！什么？\nadv.为什么"
  },
- "Wi-Fi": {
-  "category": "必修",
-  "pos": "",
-  "def": "abbr.无线保真技术（wireless fidelity）；无线上网技术"
- },
  "wide": {
   "category": "初中",
   "pos": "",
@@ -16408,6 +16429,11 @@
   "category": "初中",
   "pos": "",
   "def": "n.妻子，已婚妇女；夫人"
+ },
+ "Wi-Fi": {
+  "category": "必修",
+  "pos": "",
+  "def": "abbr.无线保真技术（wireless fidelity）；无线上网技术"
  },
  "wild": {
   "category": "初中",
@@ -16742,5 +16768,794 @@
   "category": "初中",
   "pos": "",
   "def": "n.动物园"
+ },
+ "one": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 一"
+ },
+ "two": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 二"
+ },
+ "three": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 三"
+ },
+ "four": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 四"
+ },
+ "five": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 五"
+ },
+ "six": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 六"
+ },
+ "seven": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 七"
+ },
+ "eight": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 八"
+ },
+ "nine": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 九"
+ },
+ "ten": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 十"
+ },
+ "eleven": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 十一"
+ },
+ "twelve": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 十二"
+ },
+ "thirteen": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 十三"
+ },
+ "fourteen": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 十四"
+ },
+ "fifteen": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 十五"
+ },
+ "sixteen": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 十六"
+ },
+ "seventeen": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 十七"
+ },
+ "eighteen": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 十八"
+ },
+ "nineteen": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 十九"
+ },
+ "twenty": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 二十"
+ },
+ "thirty": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 三十"
+ },
+ "forty": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 四十"
+ },
+ "fifty": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 五十"
+ },
+ "sixty": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 六十"
+ },
+ "seventy": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 七十"
+ },
+ "eighty": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 八十"
+ },
+ "ninety": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 九十"
+ },
+ "hundred": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 百"
+ },
+ "thousand": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 千"
+ },
+ "first": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第一"
+ },
+ "second": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第二"
+ },
+ "third": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第三"
+ },
+ "fourth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第四"
+ },
+ "fifth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第五"
+ },
+ "sixth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第六"
+ },
+ "seventh": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第七"
+ },
+ "eighth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第八"
+ },
+ "ninth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第九"
+ },
+ "tenth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第十"
+ },
+ "eleventh": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第十一"
+ },
+ "twelfth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第十二"
+ },
+ "thirteenth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第十三"
+ },
+ "fourteenth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第十四"
+ },
+ "fifteenth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第十五"
+ },
+ "sixteenth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第十六"
+ },
+ "seventeenth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第十七"
+ },
+ "eighteenth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第十八"
+ },
+ "nineteenth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第十九"
+ },
+ "twentieth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第二十"
+ },
+ "thirtieth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第三十"
+ },
+ "fortieth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第四十"
+ },
+ "fiftieth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第五十"
+ },
+ "sixtieth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第六十"
+ },
+ "seventieth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第七十"
+ },
+ "eightieth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第八十"
+ },
+ "ninetieth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第九十"
+ },
+ "hundredth": {
+  "category": "初中",
+  "pos": "",
+  "def": "num. 第一百"
+ },
+ "January": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 一月"
+ },
+ "February": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 二月"
+ },
+ "March": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 三月"
+ },
+ "April": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 四月"
+ },
+ "May": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 五月"
+ },
+ "June": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 六月"
+ },
+ "July": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 七月"
+ },
+ "August": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 八月"
+ },
+ "September": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 九月"
+ },
+ "October": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 十月"
+ },
+ "November": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 十一月"
+ },
+ "December": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 十二月"
+ },
+ "Monday": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 周一"
+ },
+ "Tuesday": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 周二"
+ },
+ "Wednesday": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 周三"
+ },
+ "Thursday": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 周四"
+ },
+ "Friday": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 周五"
+ },
+ "Saturday": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 周六"
+ },
+ "Sunday": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 周日"
+ },
+ "Australia": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 澳大利亚"
+ },
+ "African": {
+  "category": "初中",
+  "pos": "",
+  "def": "adj. 非洲的；n. 非洲人"
+ },
+ "American": {
+  "category": "初中",
+  "pos": "",
+  "def": "adj. 美洲的；美国的；n. 美国人"
+ },
+ "Asian": {
+  "category": "初中",
+  "pos": "",
+  "def": "adj. 亚洲的；n. 亚洲人"
+ },
+ "Australian": {
+  "category": "初中",
+  "pos": "",
+  "def": "adj. 澳大利亚的；n. 澳大利亚人"
+ },
+ "Britain": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 英国"
+ },
+ "Canada": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 加拿大"
+ },
+ "England": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 英格兰；英国"
+ },
+ "France": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 法国"
+ },
+ "Germany": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 德国"
+ },
+ "India": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 印度"
+ },
+ "Italy": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 意大利"
+ },
+ "Japan": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 日本"
+ },
+ "London": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 伦敦"
+ },
+ "New York": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 纽约"
+ },
+ "New Zealand": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 新西兰"
+ },
+ "Paris": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 巴黎"
+ },
+ "Russia": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 俄罗斯"
+ },
+ "Singapore": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 新加坡"
+ },
+ "South Africa": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 南非"
+ },
+ "The Atlantic Ocean": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 大西洋"
+ },
+ "The Indian Ocean": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 印度洋"
+ },
+ "The Pacific Ocean": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 太平洋"
+ },
+ "The United Kingdom": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 英国"
+ },
+ "The UK": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 英国"
+ },
+ "The United States of America": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 美利坚合众国"
+ },
+ "The USA": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 美国"
+ },
+ "British": {
+  "category": "初中",
+  "pos": "",
+  "def": "adj. 英国的；n. 英国人"
+ },
+ "Canadian": {
+  "category": "初中",
+  "pos": "",
+  "def": "adj. 加拿大的；n. 加拿大人"
+ },
+ "European": {
+  "category": "初中",
+  "pos": "",
+  "def": "adj. 欧洲的；n. 欧洲人"
+ },
+ "French": {
+  "category": "初中",
+  "pos": "",
+  "def": "adj. 法国的；n. 法国人；法语"
+ },
+ "German": {
+  "category": "初中",
+  "pos": "",
+  "def": "adj. 德国的；n. 德国人；德语"
+ },
+ "Indian": {
+  "category": "初中",
+  "pos": "",
+  "def": "adj. 印度的；n. 印度人"
+ },
+ "Italian": {
+  "category": "初中",
+  "pos": "",
+  "def": "adj. 意大利的；n. 意大利人"
+ },
+ "Japanese": {
+  "category": "初中",
+  "pos": "",
+  "def": "adj. 日本的；n. 日本人；日语"
+ },
+ "New Zealander": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 新西兰人"
+ },
+ "Russian": {
+  "category": "初中",
+  "pos": "",
+  "def": "adj. 俄罗斯的；n. 俄罗斯人"
+ },
+ "Singaporean": {
+  "category": "初中",
+  "pos": "",
+  "def": "adj. 新加坡的；n. 新加坡人"
+ },
+ "South African": {
+  "category": "初中",
+  "pos": "",
+  "def": "adj. 南非的；n. 南非人"
+ },
+ "CPC(Communist Party of China)": {
+  "category": "初中",
+  "pos": "",
+  "def": "abbr. 中国共产党"
+ },
+ "PLA (People's Liberation Army)": {
+  "category": "初中",
+  "pos": "",
+  "def": "abbr. 中国人民解放军"
+ },
+ "PRC (People's Republic of China)": {
+  "category": "初中",
+  "pos": "",
+  "def": "abbr. 中华人民共和国"
+ },
+ "UN (United Nations)": {
+  "category": "初中",
+  "pos": "",
+  "def": "abbr. 联合国"
+ },
+ "UNESCO (United Nations Educational, Scientific and Cultural Organization)": {
+  "category": "初中",
+  "pos": "",
+  "def": "abbr. 联合国教科文组织"
+ },
+ "WHO (World Health Organization)": {
+  "category": "初中",
+  "pos": "",
+  "def": "abbr. 世界卫生组织"
+ },
+ "WTO (World Trade Organization)": {
+  "category": "初中",
+  "pos": "",
+  "def": "abbr. 世界贸易组织"
+ },
+ "Children's Day": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 儿童节"
+ },
+ "Double Ninth Festival": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 重阳节"
+ },
+ "Dragon Boat Festival": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 端午节"
+ },
+ "Labour Day": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 劳动节"
+ },
+ "Lantern Festival": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 元宵节"
+ },
+ "Mid-Autumn Festival": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 中秋节"
+ },
+ "National Day": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 国庆节"
+ },
+ "New Year's Day": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 元旦"
+ },
+ "PLA Day": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 建军节"
+ },
+ "Spring Festival": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 春节"
+ },
+ "Teachers' Day": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 教师节"
+ },
+ "Tomb-sweeping Day": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 清明节"
+ },
+ "Women's Day": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 妇女节"
+ },
+ "Mount Huangshan": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 黄山"
+ },
+ "Mount Qomolangma": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 珠穆朗玛峰"
+ },
+ "Mount Taishan": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 泰山"
+ },
+ "The Changjiang River": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 长江"
+ },
+ "The Yangtze River": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 长江"
+ },
+ "The Great Wall": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 长城"
+ },
+ "The Palace Museum": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 故宫博物院"
+ },
+ "The Yellow River": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 黄河"
+ },
+ "Tian'anmen Square": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 天安门广场"
+ },
+ "Beijing opera": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 京剧"
+ },
+ "Peking opera": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 京剧"
+ },
+ "Beijing roast duck": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 北京烤鸭"
+ },
+ "hot pot": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 火锅"
+ },
+ "lunar calendar": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 农历"
+ },
+ "mooncake": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 月饼"
+ },
+ "paper-cut": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 剪纸"
+ },
+ "qipao": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 旗袍"
+ },
+ "Spring Festival couplets": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 春联"
+ },
+ "spring roll": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 春卷"
+ },
+ "The Silk Road": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 丝绸之路"
+ },
+ "Traditional Chinese Medicine(TCM)": {
+  "category": "初中",
+  "pos": "",
+  "def": "n. 中医"
+ },
+ "effective": {
+  "category": "选修",
+  "pos": "adj.",
+  "def": "有效的；生效的",
+  "extensions": [
+   "effectiveness",
+   "effectively"
+  ]
  }
 }

@@ -46,7 +46,7 @@ import 'shared/scan_ocr_service.dart';
 import 'dictionary_service.dart';
 
 /// 安卓端当前版本号（显示与更新比较的唯一来源，发布版需与 pubspec 保持一致）。
-const String kAndroidAppVersion = '1.6.2';
+const String kAndroidAppVersion = '1.6.3';
 
 /// 原生 docx→PDF 通道：WebView 按 docx 原排版渲染后逐页写出 PDF。
 const MethodChannel _docxPdfChannel = MethodChannel('esw/docx_pdf');
@@ -4078,10 +4078,10 @@ class _AnalysisPageState extends State<_AnalysisPage> {
       final vocab = widget.vocab;
       final args = <String, dynamic>{
         'text': _text,
-        'standard': vocab.standardWordsLowerKeySet.toList(),
-        'extend': vocab.extendWordsLowerSet.toList(),
-        'chaogang': vocab.chaoGangLowerSet.toList(),
-        'extra': vocab.extraLowerSet.toList(),
+        'standard': vocab.standardWords.keys.toList(),
+        'extend': vocab.extendWordKeySet.toList(),
+        'chaogang': vocab.chaoGangWordKeySet.toList(),
+        'extra': vocab.extraWordKeySet.toList(),
         'classMem': Map<String, String>.from(vocab.classificationMemory),
       };
       final result = await _analyzeTextAsync(args);
@@ -5255,34 +5255,41 @@ class _AnalysisPageState extends State<_AnalysisPage> {
     );
   }
 
-  /// 导出前置拦截：存在未筛选词时终止导出，并提供直达「其他（未筛选）」筛选的入口。
-  Future<void> _promptUnfilteredBeforeExport(int count) async {
-    if (!mounted) return;
-    final go = await showEswConfirm(
+  /// 导出前提示：存在未筛选词时，用户可先去「其他（未筛选）」筛选，也可直接继续导出。
+  ///
+  /// 返回 true 表示用户选择「继续导出」。
+  Future<bool> _promptUnfilteredBeforeExport(int count) async {
+    if (!mounted) return false;
+    final choice = await showEswChoice<String>(
       context,
       title: '还有未筛选的词',
       message: '当前检测结果中仍有 $count 个未筛选的词。未筛选词不参与导出标注，'
-          '请先在筛选列把它们归类到课标词 / 拓展词 / 超标词 / 专有词，'
-          '全部归类完成后再导出。',
+          '你可以先去筛选列把它们归类到课标词 / 拓展词 / 超标词 / 专有词，'
+          '也可以直接继续导出。',
       icon: Icons.filter_alt_off_rounded,
-      cancelLabel: '取消',
-      okLabel: '去筛选',
+      choices: const [
+        EswDialogChoice(label: '继续导出', value: 'continue', primary: true),
+        EswDialogChoice(label: '去筛选', value: 'filter'),
+        EswDialogChoice(label: '取消', value: 'cancel'),
+      ],
     );
-    if (go && mounted) {
+    if (choice == 'filter' && mounted) {
       setState(() {
         _filter = '其他';
         _rebuildFiltered();
       });
     }
+    return choice == 'continue';
   }
 
   /// 导出分析结果：标注方案 → 导出格式（docx / pdf）→ 生成文件。
   Future<void> _exportResult() async {
-    // 前置拦截：仍有未筛选（安卓侧分类键为「其他」）的词时禁止导出。
+    // 导出前提示：仍有未筛选（安卓侧分类键为「其他」）的词时询问用户，
+    // 选择继续则照常导出（未筛选词不标注）。
     final unfilteredCount = _categoryCounts['其他'] ?? 0;
     if (unfilteredCount > 0) {
-      await _promptUnfilteredBeforeExport(unfilteredCount);
-      return;
+      final proceed = await _promptUnfilteredBeforeExport(unfilteredCount);
+      if (!proceed || !mounted) return;
     }
     // 标注方案：方案一（彩色）第一项且默认选中，可切方案二（字体格式）。
     final scheme = await _promptAnnotateScheme();
@@ -5503,7 +5510,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
           for (final w in extendQueryWords)
             w: <({String example, String year, bool isPhrase})>[],
         };
-    final fileWordRe = RegExp(r'[a-zA-Z]+');
+    final fileWordRe = wordTokenRegExp;
     final yearPrefixRe = RegExp(r'^(\d{4})');
     String corpusPath = '';
     try {
@@ -5558,7 +5565,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
     }
     // 例句偏好评分（宁缺毋滥口径）：不含汉字 > 无下划线 > 词数>=3 > 句子短
     final hanRe = RegExp(r'[\u4e00-\u9fff]');
-    final enWordRe = RegExp(r'[a-zA-Z]+');
+    final enWordRe = wordTokenRegExp;
     int wordCountOfUsage(String s) => enWordRe.allMatches(s).length;
     int gaokaoScore(String s) {
       var score = 0;
@@ -5793,7 +5800,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
             appendixParagraphsXml: appendix,
             scheme: scheme,
             // 方案一只靠颜色区分：不加粗，避免与原文自带加粗混淆；
-            // 未筛选词在任何方案下都不标注（导出前已前置拦截）。
+            // 未筛选词在任何方案下都不标注（导出前会提示，选择继续时仍不标注）。
             colorBold: false,
             annotateUnfiltered: false,
           );
@@ -7583,13 +7590,13 @@ Map<String, dynamic> _analyzeTextWorker(Map<String, dynamic> args) {
           }
         }
         if (cat == null) {
-          if (matchWordListKey(standard, original) != null) {
+          if (isWordSetHit(standard, original)) {
             cat = '课标词';
-          } else if (matchWordListKey(extend, original) != null) {
+          } else if (matchWordEntryKey(extend, original) != null) {
             cat = '拓展词';
-          } else if (matchWordListKey(chaogang, original) != null) {
+          } else if (matchWordEntryKey(chaogang, original) != null) {
             cat = '超标词';
-          } else if (matchWordListKey(extra, original) != null) {
+          } else if (matchWordEntryKey(extra, original) != null) {
             cat = '专有词';
           }
         }

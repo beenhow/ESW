@@ -262,9 +262,9 @@ const String apostropheChars = "'\u2018\u2019\u02BC";
 /// 不把普通单词后的句号（was. / It.）吞进词元；`a.m. It` 中的句末点
 /// 仍只属于 a.m.，不会把后一个词并进来。
 const String _dottedAbbrBody = r'[A-Za-z]+(?:\.[A-Za-z]+)+\.?';
-const String _plainWordBody = "[A-Za-z]+(?:[$apostropheChars][A-Za-z]+)*";
+const String _plainWordBody = "[A-Za-z]+(?:[$apostropheChars-][A-Za-z]+)*";
 
-/// 统一词 token：ASCII 字母串（允许内部含撇号）或带内部点的缩写，
+/// 统一词 token：ASCII 字母串（允许内部含撇号或连字符）或带内部点的缩写，
 /// 前后不得紧邻字母/数字。作用在 foldWordText 折叠后的文本上，因此
 /// 直撇号即可覆盖弯撇号。
 final RegExp wordTokenRegExp = RegExp(
@@ -302,9 +302,9 @@ RegExp keywordMatchRegExp(String keyword) {
       ? kw.substring(0, kw.length - 1)
       : kw;
   var body = core
-      .split(RegExp('[$apostropheChars]'))
+      .split(RegExp('[$apostropheChars-]'))
       .map(RegExp.escape)
-      .join('[$apostropheChars]');
+      .join('[-$apostropheChars]');
   if (isDotted) body = '$body\\.?';
   return RegExp(
     '(?<![A-Za-z0-9])$body(?![A-Za-z0-9])',
@@ -357,7 +357,10 @@ List<String> wordLookupKeys(String token) {
   ]) {
     if (!full.endsWith(suffix)) continue;
     final base = full.substring(0, full.length - suffix.length);
-    if (base.length < 2 || keys.contains(base)) continue;
+    // 单字母基形只保留 I / a（I've → I），其余过短基形丢弃
+    final shortOk = base.length == 1 &&
+        (base == 'I' || base == 'i' || base == 'a' || base == 'A');
+    if ((base.length < 2 && !shortOk) || keys.contains(base)) continue;
     keys.add(base);
   }
   return keys;
@@ -369,6 +372,104 @@ String? matchWordListKey(Set<String> lowerKeySet, String token) {
     if (lowerKeySet.contains(key)) return key;
   }
   return null;
+}
+
+/// 大小写敏感的查表键：只做字符折叠（弯撇号、连字、变音、全角），保留原始大小写。
+///
+/// 课标词库按大小写区分词条（China 中国 / china 瓷器），查表必须保留大小写。
+String wordLookupKeyExact(String token) => foldWordText(token);
+
+/// 大小写敏感的候选键，规则与 [wordLookupKeys] 一致（末尾点省略、所有格/缩略回退），
+/// 但保留原始大小写。
+List<String> wordLookupKeysExact(String token) {
+  final full = wordLookupKeyExact(token);
+  final lower = full.toLowerCase();
+  final keys = <String>[];
+  if (full.endsWith('.')) {
+    final trimmed = full.substring(0, full.length - 1);
+    if (trimmed.length >= 2) keys.add(trimmed);
+  }
+  if (!keys.contains(full)) keys.add(full);
+  if (!full.endsWith('.') && full.contains('.')) keys.add('$full.');
+  final irregular = _irregularBases[lower];
+  if (irregular != null) keys.add(irregular);
+  for (final suffix in const <String>[
+    "'s", "n't", "'re", "'ve", "'ll", "'d", "'m", "'",
+  ]) {
+    if (!lower.endsWith(suffix)) continue;
+    final base = full.substring(0, full.length - suffix.length);
+    // 单字母基形只保留 I / a（I've → I、a.m 之外的 a），其余过短基形丢弃
+    final shortOk = base.length == 1 &&
+        (base == 'I' || base == 'i' || base == 'a' || base == 'A');
+    if ((base.length < 2 && !shortOk) || keys.contains(base)) continue;
+    keys.add(base);
+  }
+  return keys;
+}
+
+/// 大小写敏感词库的取词规则：先精确匹配；未命中时，只允许回退到全小写词条。
+///
+/// 即小写词条可以被首字母大写、全大写写法命中（The → the，THE → the），
+/// 反过来不成立：小写写法不会命中大写词条（china ↛ China），
+/// 大小写词条同时存在时各自精确命中（China → China，china → china）。
+String? findWordEntryKey(Map<String, Object?> entries, String token) {
+  final keys = wordLookupKeysExact(token);
+  for (final key in keys) {
+    if (entries.containsKey(key)) return key;
+  }
+  for (final key in keys) {
+    final lower = key.toLowerCase();
+    if (lower == key) continue;
+    if (entries.containsKey(lower)) return lower;
+  }
+  return null;
+}
+
+/// 与 [findWordEntryKey] 同一规则的集合版本。
+String? matchWordEntryKey(Set<String> keys, String token) {
+  final candidates = wordLookupKeysExact(token);
+  for (final key in candidates) {
+    if (keys.contains(key)) return key;
+  }
+  for (final key in candidates) {
+    final lower = key.toLowerCase();
+    if (lower == key) continue;
+    if (keys.contains(lower)) return lower;
+  }
+  return null;
+}
+
+/// 连字符复合词按部分判定：整体未命中时拆开，所有组成部分都命中才算命中。
+List<String>? _compoundPartKeys(
+  String token,
+  String? Function(String part) lookup,
+) {
+  if (!token.contains('-')) return null;
+  final parts = token.split('-');
+  if (parts.length < 2) return null;
+  final hits = <String>[];
+  for (final part in parts) {
+    if (part.isEmpty) return null;
+    final hit = lookup(part);
+    if (hit == null) return null;
+    hits.add(hit);
+  }
+  return hits;
+}
+
+/// 词条命中判定（含连字符复合词回退）。
+///
+/// 先按 [findWordEntryKey] 找整体词条；整体不存在时，若 `harbor-side`
+/// 这类词按连字符拆开后的每一部分都命中词库，则整体视为命中。
+bool isWordEntryHit(Map<String, Object?> entries, String token) {
+  if (findWordEntryKey(entries, token) != null) return true;
+  return _compoundPartKeys(token, (p) => findWordEntryKey(entries, p)) != null;
+}
+
+/// [isWordEntryHit] 的集合版本。
+bool isWordSetHit(Set<String> keys, String token) {
+  if (matchWordEntryKey(keys, token) != null) return true;
+  return _compoundPartKeys(token, (p) => matchWordEntryKey(keys, p)) != null;
 }
 
 /// 在「小写词形 → 分类」映射里按 [wordLookupKeys] 查找分类，未命中为 null。
@@ -411,8 +512,15 @@ List<String> extractWordTokens(
   bool stripOptionGlue = true,
 }) {
   if (raw.isEmpty) return const <String>[];
+  // 部分来源（PDF/OCR/复制粘贴）会把撇号与词根之间插进空格：
+  // "haven 't" / "I ' ve" / "student 's"，先并回一个词，避免被切成
+  // haven + 丢弃的 t、ve 这类残片。
+  final folded = foldWordText(raw).replaceAllMapped(
+    RegExp(r"([A-Za-z]+)\s+'\s*(s|t|re|ve|ll|d|m)\b", caseSensitive: false),
+    (m) => "${m[1]}'${m[2]}",
+  );
   final out = <String>[];
-  for (final m in wordTokenRegExp.allMatches(foldWordText(raw))) {
+  for (final m in wordTokenRegExp.allMatches(folded)) {
     var token = m.group(0)!;
     if (token.length < minLength) continue;
     if (stripOptionGlue &&

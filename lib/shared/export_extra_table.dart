@@ -5,6 +5,8 @@
 /// 最终生成 DOCX 表格 XML 或纯文本表格，供 Android / Windows 导出结果文档在末尾追加。
 library;
 
+import 'text_normalize.dart';
+
 /// 单行拓展词数据
 class ExtendRowData {
   final String word; // 拓展词
@@ -126,8 +128,8 @@ String _stripOptionLetter(String w) {
   return w;
 }
 
-/// 句中单词拆分用（保持与 buildExtendSections 的词切分一致）。
-final RegExp _wordSplitRe = RegExp(r'[a-zA-Z]+');
+/// 句中单词拆分用（与统一分词 [wordTokenRegExp] 保持一致，撇号/连字符不切断）。
+final RegExp _wordSplitRe = wordTokenRegExp;
 
 /// 判断句子（保留原文大小写）是否包含目标单词（小写，已剥离选项字母）。
 ///

@@ -76,12 +76,44 @@ void main() {
       expect(curly, straight);
     });
 
+    test('连字符复合词整体成词（harbor-side 不再拆成两词）', () {
+      final tokens = extractWordTokens('a harbor-side view of well-known brands')
+          .map((e) => e.toLowerCase())
+          .toList();
+      expect(tokens, containsAll(<String>['harbor-side', 'well-known']));
+      expect(tokens.contains('harbor'), isFalse);
+      expect(tokens.contains('side'), isFalse);
+    });
+
+    test('撇号与词根之间被空格分开时也能并回整词', () {
+      expect(
+        extractWordTokens("haven 't I ' ve student 's").map((e) => e.toLowerCase()),
+        <String>["haven't", "i've", "student's"],
+      );
+    });
+
+    test('连字符复合词整体未命中时按部分回退', () {
+      final entries = <String, Object?>{
+        'harbor': <String, String?>{},
+        'side': <String, String?>{},
+        'well': <String, String?>{},
+        'known': <String, String?>{},
+      };
+      expect(isWordEntryHit(entries, 'harbor-side'), isTrue);
+      expect(isWordEntryHit(entries, 'well-known'), isTrue);
+      expect(isWordEntryHit(entries, 'harbor-mystery'), isFalse);
+      expect(isWordSetHit(<String>{'harbor', 'side'}, 'Harbor-Side'), isTrue);
+      expect(isWordSetHit(<String>{'Harbor', 'side'}, 'harbor-Side'), isFalse);
+      expect(isWordSetHit(<String>{'harbor'}, 'harbor-side'), isFalse);
+    });
+
     test('查词表按「完整词形 → 基形」回退，所有格不丢分类', () {
       expect(wordLookupKeys("China's"), <String>["china's", 'china']);
       expect(wordLookupKeys("couldn't"), <String>["couldn't", 'could']);
       expect(wordLookupKeys("won't"), <String>["won't", 'will', 'wo']);
       expect(wordLookupKeys("students'"), <String>["students'", 'students']);
       expect(wordLookupKeys("o'clock"), <String>["o'clock"]);
+      expect(wordLookupKeys("I've"), <String>["i've", 'i']);
       expect(wordLookupKeys("China's").any(<String>{'china'}.contains), isTrue);
       expect(wordLookupKeys("can't").any(<String>{'can'}.contains), isTrue);
       expect(wordLookupKeys("we're").any(<String>{'we'}.contains), isTrue);

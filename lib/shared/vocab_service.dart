@@ -30,16 +30,22 @@ class VocabService {
   final List<String> extendWords = [];
   /// 拓展词小写索引（O(1) 查找）
   final Set<String> extendWordsLowerSet = {};
+  /// 拓展词原始大小写集合（大小写敏感匹配）
+  final Set<String> extendWordKeySet = {};
   /// 拓展词→基础课标词映射
   final Map<String, String> extendBaseMap = {};
   /// 手动超标词
   final Set<String> manualChaoGangWords = {};
   /// 手动超标词小写索引
   final Set<String> chaoGangLowerSet = {};
+  /// 手动超标词原始大小写集合（大小写敏感匹配）
+  final Set<String> chaoGangWordKeySet = {};
   /// 手动专有词
   final Set<String> manualExtraWords = {};
   /// 手动专有词小写索引
   final Set<String> extraLowerSet = {};
+  /// 手动专有词原始大小写集合（大小写敏感匹配）
+  final Set<String> extraWordKeySet = {};
   /// 分类记忆：{lowercase → category}
   final Map<String, String> classificationMemory = {};
   /// 搜索历史
@@ -92,41 +98,28 @@ class VocabService {
     }
   }
 
-  /// 查询单词信息
+  /// 查询单词信息（大小写敏感，小写词条可被大写写法命中）。
+  ///
+  /// 大小写词条同时存在时各自精确命中（China 中国 / china 瓷器）；
+  /// 大写写法在库中没有对应大写词条时，才回退到同名小写词条。
   Map<String, String?> lookup(String word) {
-    // 精确匹配
-    if (standardWords.containsKey(word)) {
-      return standardWords[word]!;
-    }
-    // 大小写不敏感，并兼容带点缩写的末尾点省略
-    for (final key in wordLookupKeys(word)) {
-      final matches = standardWordsLower[key];
-      if (matches != null && matches.isNotEmpty) {
-        return standardWords[matches.first]!;
-      }
-    }
-    return {};
+    final key = findWordEntryKey(standardWords, word);
+    return key == null ? {} : standardWords[key]!;
   }
 
-  /// 判断是否课标词
-  bool isStandard(String word) {
-    return wordLookupKeys(word).any(standardWordsLowerKeySet.contains);
-  }
+  /// 判断是否课标词（大小写敏感；连字符复合词按部分判定）
+  bool isStandard(String word) => isWordEntryHit(standardWords, word);
 
-  /// 判断是否拓展词
-  bool isExtend(String word) {
-    return wordLookupKeys(word).any(extendWordsLowerSet.contains);
-  }
+  /// 判断是否拓展词（大小写敏感，小写词条可被大写写法命中）
+  bool isExtend(String word) => matchWordEntryKey(extendWordKeySet, word) != null;
 
-  /// 判断是否超标词
-  bool isChaoGang(String word) {
-    return wordLookupKeys(word).any(chaoGangLowerSet.contains);
-  }
+  /// 判断是否超标词（大小写敏感，小写词条可被大写写法命中）
+  bool isChaoGang(String word) =>
+      matchWordEntryKey(chaoGangWordKeySet, word) != null;
 
-  /// 判断是否专有词
-  bool isExtra(String word) {
-    return wordLookupKeys(word).any(extraLowerSet.contains);
-  }
+  /// 判断是否专有词（大小写敏感，小写词条可被大写写法命中）
+  bool isExtra(String word) =>
+      matchWordEntryKey(extraWordKeySet, word) != null;
 
   /// 获取单词的分类记忆
   String? getClassification(String word) {
@@ -156,6 +149,7 @@ class VocabService {
       extendReverseIndex[word.toLowerCase()] = baseWord.toLowerCase();
     }
     classificationMemory[word.toLowerCase()] = '拓展词';
+    _rebuildLowerSets();
   }
 
   /// 添加超标词
@@ -171,6 +165,7 @@ class VocabService {
     manualChaoGangWords.add(word);
     chaoGangLowerSet.add(lower);
     classificationMemory[word.toLowerCase()] = '超标词';
+    _rebuildLowerSets();
   }
 
   /// 添加专有词
@@ -186,6 +181,7 @@ class VocabService {
     manualExtraWords.add(word);
     extraLowerSet.add(lower);
     classificationMemory[word.toLowerCase()] = '专有词';
+    _rebuildLowerSets();
   }
 
   /// 整库恢复（跨端首次同步 bootstrap）：一次性写入云端分类词。
@@ -232,7 +228,7 @@ class VocabService {
   /// 返回新分类标签（'拓展词'/'超标词'/'专有词'），如果新旧相同则返回 null。
   String? reclassifyWord(String word, String newCategory) {
     final lower = word.toLowerCase();
-    final oldCat = _classify(lower);
+    final oldCat = _classify(word);
 
     // 先从旧分类中移除
     if (oldCat == '拓展词') {
@@ -256,20 +252,22 @@ class VocabService {
           extendWordsLowerSet.add(lower);
         }
         classificationMemory[lower] = '拓展词';
-        return '拓展词';
+        break;
       case '超标词':
         manualChaoGangWords.add(word);
         chaoGangLowerSet.add(lower);
         classificationMemory[lower] = '超标词';
-        return '超标词';
+        break;
       case '专有词':
         manualExtraWords.add(word);
         extraLowerSet.add(lower);
         classificationMemory[lower] = '专有词';
-        return '专有词';
+        break;
       default:
         return null;
     }
+    _rebuildLowerSets();
+    return newCategory;
   }
 
   /// 修改单词拼写：将 oldWord 改名为 newWord，保持原有分类与拓展词基础词关系不变。
@@ -286,14 +284,12 @@ class VocabService {
       return _renameCaseOnly(oldWord, newWord);
     }
     if (newWord.isEmpty) return false;
-    // 目标不能是课标词，也不能已存在于任一手动分类
-    if (standardWordsLowerKeySet.contains(newLower)) return false;
-    if (extendWordsLowerSet.contains(newLower) ||
-        chaoGangLowerSet.contains(newLower) ||
-        extraLowerSet.contains(newLower)) {
+    // 目标不能是课标词，也不能已存在于任一手动分类（均按大小写敏感匹配）
+    if (isStandard(newWord)) return false;
+    if (isExtend(newWord) || isChaoGang(newWord) || isExtra(newWord)) {
       return false;
     }
-    final oldCat = _classifyManually(oldLower);
+    final oldCat = _classifyManually(oldWord);
     if (oldCat == null) return false; // 源词不在手动词库中
 
     // 从旧分类移除
@@ -376,40 +372,46 @@ class VocabService {
     return changed;
   }
 
-  /// 重建三个手动词表的小写索引（在加载/合并数据后调用）
+  /// 重建三个手动词表的小写索引与大小写敏感集合（在加载/合并数据后调用）
   void _rebuildLowerSets() {
     extendWordsLowerSet.clear();
+    extendWordKeySet.clear();
     _extendWordsByFirstChar.clear();
     for (final w in extendWords) {
       final lw = w.toLowerCase();
       extendWordsLowerSet.add(lw);
+      extendWordKeySet.add(w);
       final fc = w.isNotEmpty ? w[0].toLowerCase() : '_';
       _extendWordsByFirstChar.putIfAbsent(fc, () => []);
       _extendWordsByFirstChar[fc]!.add(w);
     }
     chaoGangLowerSet.clear();
+    chaoGangWordKeySet.clear();
     for (final w in manualChaoGangWords) {
       chaoGangLowerSet.add(w.toLowerCase());
+      chaoGangWordKeySet.add(w);
     }
     extraLowerSet.clear();
+    extraWordKeySet.clear();
     for (final w in manualExtraWords) {
       extraLowerSet.add(w.toLowerCase());
+      extraWordKeySet.add(w);
     }
   }
 
   /// 判断单词当前的手动分类（不含课标词/其他）
-  String? _classifyManually(String lower) {
-    if (isExtend(lower)) return '拓展词';
-    if (isChaoGang(lower)) return '超标词';
-    if (isExtra(lower)) return '专有词';
+  String? _classifyManually(String word) {
+    if (isExtend(word)) return '拓展词';
+    if (isChaoGang(word)) return '超标词';
+    if (isExtra(word)) return '专有词';
     return null;
   }
 
   /// 综合分类
-  String? _classify(String lower) {
-    final man = _classifyManually(lower);
+  String? _classify(String word) {
+    final man = _classifyManually(word);
     if (man != null) return man;
-    if (isStandard(lower)) return '课标词';
+    if (isStandard(word)) return '课标词';
     return null;
   }
 
