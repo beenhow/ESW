@@ -439,6 +439,42 @@ String? matchWordEntryKey(Set<String> keys, String token) {
   return null;
 }
 
+/// 专有词查询键集合：专有词按小写归档，词条之间大小写不敏感。
+///
+/// 词库存 `Messy` 或 `MESSY` 视为同一条；拼音词条（xinjiang）与
+/// 全大写缩写（WTO）同样归入同一键。
+Set<String> properNounKeySet(Iterable<String> words) =>
+    words.map((w) => w.toLowerCase()).toSet();
+
+bool _hasUppercaseLetter(String token) {
+  for (final u in token.codeUnits) {
+    if (u >= 0x41 && u <= 0x5A) return true;
+  }
+  return false;
+}
+
+/// 专有词自动命中：只认大写写法（首字母大写 / 全大写 / 驼峰专名）。
+///
+/// 全小写写法即使该词条也收在专有词库里，也不自动归为专有词 —— 分类由用户
+/// 最终决定，这类词留在未筛选等用户确认。词条本身大小写不敏感（Messy /
+/// MESSY / messy 词条等价），命中后仍按「完整词形 → 基形」回退。
+bool isProperNounHit(Set<String> lowerEntries, String token) {
+  if (!_hasUppercaseLetter(token)) return false;
+  if (matchWordEntryKey(lowerEntries, token) != null) return true;
+  return _compoundPartKeys(
+        token,
+        (p) => matchWordEntryKey(lowerEntries, p),
+      ) !=
+      null;
+}
+
+/// 带撇号的缩略/所有格（I've / He's / China's）是否应按基形归课标词。
+///
+/// 这类词元不能因为含大写字母（句首 I / He）就被专有词抢走：基形命中课标
+/// 就按课标词算；只有基形不在课标里，才继续考虑专有词。
+bool apostropheBaseInStandard(String token, bool standardHit) =>
+    standardHit && token.contains("'");
+
 /// 连字符复合词按部分判定：整体未命中时拆开，所有组成部分都命中才算命中。
 List<String>? _compoundPartKeys(
   String token,
@@ -502,6 +538,16 @@ bool _isAllCaps(String token) {
   return true;
 }
 
+/// 末尾 A-H 是否属于缩写内部的大写块（如 MoMA 的 MA）。
+///
+/// 真缩写末尾字母前面也是大写，剥离会把 MoMA 切成 MoM；
+/// 而 itB / ofB 这类选项粘连，末尾字母前面是小写，仍需剥离。
+bool _hasUppercaseBeforeOptionLetter(String token) {
+  if (token.length < 2) return false;
+  final prev = token.codeUnitAt(token.length - 2);
+  return prev >= 0x41 && prev <= 0x5A;
+}
+
 /// 从任意文本提取统一词 token（已折叠连字/变音/全角，并剥离选项字母粘连）。
 ///
 /// 两端（Windows / Android）以及语料统计、年份命中统计都应使用本方法，
@@ -528,7 +574,9 @@ List<String> extractWordTokens(
         !_isAllCaps(token) &&
         !_optionGlueExceptions.contains(token) &&
         // McA/McB/McC 这类三字母人名缩写不按选项粘连处理
-        !(token.length == 3 && token.startsWith('Mc'))) {
+        !(token.length == 3 && token.startsWith('Mc')) &&
+        // MoMA 这类真缩写：末尾 A-H 紧跟大写，属于缩写块，不能剥离
+        !_hasUppercaseBeforeOptionLetter(token)) {
       final glued = _optionGlueRe.firstMatch(token);
       if (glued != null) token = glued.group(1)!;
     }

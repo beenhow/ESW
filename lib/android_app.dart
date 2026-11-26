@@ -4144,19 +4144,22 @@ class _AnalysisPageState extends State<_AnalysisPage> {
           }
         }
         if (cat == null) {
-          for (final key in keys) {
-            if (widget.vocab.isStandard(key)) {
-              cat = '课标词';
-              break;
-            } else if (widget.vocab.isExtend(key)) {
-              cat = '拓展词';
-              break;
-            } else if (widget.vocab.isChaoGang(key)) {
-              cat = '超标词';
-              break;
-            } else if (widget.vocab.isExtra(key)) {
-              cat = '专有词';
-              break;
+          if (!apostropheBaseInStandard(original, widget.vocab.isStandard(original)) &&
+              isProperNounHit(widget.vocab.extraLowerSet, original)) {
+            // 首字母大写 / 全大写写法优先命中专有词；小写写法留给用户确认
+            cat = '专有词';
+          } else {
+            for (final key in keys) {
+              if (widget.vocab.isStandard(key)) {
+                cat = '课标词';
+                break;
+              } else if (widget.vocab.isExtend(key)) {
+                cat = '拓展词';
+                break;
+              } else if (widget.vocab.isChaoGang(key)) {
+                cat = '超标词';
+                break;
+              }
             }
           }
         }
@@ -7562,6 +7565,8 @@ Map<String, dynamic> _analyzeTextWorker(Map<String, dynamic> args) {
   final extend = (args['extend'] as List).cast<String>().toSet();
   final chaogang = (args['chaogang'] as List).cast<String>().toSet();
   final extra = (args['extra'] as List).cast<String>().toSet();
+  // 专有词大小写不敏感：存 Messy / MESSY 视为同一条
+  final extraLower = properNounKeySet(extra);
   final classMem = Map<String, String>.from(args['classMem'] as Map);
 
   final freqMap = <String, int>{};
@@ -7590,14 +7595,17 @@ Map<String, dynamic> _analyzeTextWorker(Map<String, dynamic> args) {
           }
         }
         if (cat == null) {
-          if (isWordSetHit(standard, original)) {
+          final standardHit = isWordSetHit(standard, original);
+          if (!apostropheBaseInStandard(original, standardHit) &&
+              isProperNounHit(extraLower, original)) {
+            // 首字母大写 / 全大写写法优先命中专有词；小写写法留给用户确认
+            cat = '专有词';
+          } else if (standardHit) {
             cat = '课标词';
           } else if (matchWordEntryKey(extend, original) != null) {
             cat = '拓展词';
           } else if (matchWordEntryKey(chaogang, original) != null) {
             cat = '超标词';
-          } else if (matchWordEntryKey(extra, original) != null) {
-            cat = '专有词';
           }
         }
         return <String, dynamic>{

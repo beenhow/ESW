@@ -2931,7 +2931,13 @@ class _MainWindowState extends State<MainWindow>
     //    一律归「未筛选」（无论语料是否出现过），语料出现过的这类词同时出现在
     //    真题词列与未筛选列，由用户在未筛选列手动归类。
     String filter;
-    if (_manualChaoGangWords.any((e) => e.toLowerCase() == word)) {
+    if (apostropheBaseInStandard(raw, isStandard)) {
+      // 缩略/所有格按基形判定：基形在课标就归课标词（I've / He's）
+      filter = '课标词';
+    } else if (isProperNounHit(properNounKeySet(_manualExtraWords), raw)) {
+      // 首字母大写 / 全大写写法优先命中专有词；小写写法留给用户确认
+      filter = '专有词';
+    } else if (_manualChaoGangWords.any((e) => e.toLowerCase() == word)) {
       filter = '超标词';
     } else if (isExtend) {
       filter = '拓展词';
@@ -2945,8 +2951,6 @@ class _MainWindowState extends State<MainWindow>
       _saveConfig();
       _wordSyncService.markChanged(word);
       filter = '拓展词';
-    } else if (_manualExtraWords.any((e) => e.toLowerCase() == word)) {
-      filter = '专有词';
     } else {
       // 四个词库均未收录：一律未筛选（语料出现过的词另由真题词叠加列展示）
       filter = '未筛选';
@@ -3173,7 +3177,7 @@ class _MainWindowState extends State<MainWindow>
     // 手动词表与课标词库同口径：精确匹配优先，大写写法可回退到同名小写词条。
     final extendKeySet = _extendWords.toSet();
     final chaoGangKeySet = _manualChaoGangWords.toSet();
-    final extraKeySet = _manualExtraWords.toSet();
+    final extraKeySet = properNounKeySet(_manualExtraWords);
     final words = <_ImportedWord>[];
     for (final entry in freqMap.entries) {
       final w = entry.key; // 小写
@@ -3192,15 +3196,19 @@ class _MainWindowState extends State<MainWindow>
       }
       // 真题词＝在真题语料中出现过（叠加口径，可与课标/拓展/超标/专有重合）
       final inCorpus = corpusFreqMap.containsKey(w);
-      // 词库归属（互斥口径）：历史归类 > 超标 > 拓展 > 课标 > 专有；
-      // 四个词库都不收录时一律进未筛选（语料出现过的同时进真题词叠加列，
-      // 并在未筛选列等待用户手动归类）
+      final standardHit = isWordEntryHit(_standardWords, original);
+      // 词库归属（互斥口径）：历史归类 > 大写写法的专有词 > 超标 > 拓展 > 课标；
+      // 小写写法不自动归专有词，四库都不收录时进未筛选（语料出现过的同时进
+      // 真题词叠加列，并在未筛选列等待用户手动归类）
       final cat = resolveFilterCategory(
         inCorpus: inCorpus,
-        inStandard: isWordEntryHit(_standardWords, original),
+        inStandard: standardHit,
         inExtend: matchWordEntryKey(extendKeySet, original) != null,
         inChaoGang: matchWordEntryKey(chaoGangKeySet, original) != null,
-        inProper: matchWordEntryKey(extraKeySet, original) != null,
+        inProper: false,
+        preferProper: isProperNounHit(extraKeySet, original) &&
+            !apostropheBaseInStandard(original, standardHit),
+        apostropheBaseStandard: apostropheBaseInStandard(original, standardHit),
         remembered: remembered,
       );
       words.add(
@@ -6335,19 +6343,23 @@ try {
     // 精确匹配优先，大写写法可回退到同名小写词条。
     final extendKeys = _extendWords.toSet();
     final chaoGangKeys = _manualChaoGangWords.toSet();
-    final extraKeys = _manualExtraWords.toSet();
+    final extraKeys = properNounKeySet(_manualExtraWords);
     for (int i = 0; i < _savedImportedWords.length; i++) {
       final iw = _savedImportedWords[i];
       String? newCat;
-      if (matchWordEntryKey(extendKeys, iw.word) != null &&
+      if (apostropheBaseInStandard(
+              iw.word, isWordEntryHit(_standardWords, iw.word)) &&
+          iw.category != '课标词') {
+        newCat = '课标词';
+      } else if (isProperNounHit(extraKeys, iw.word) &&
+          iw.category != '专有词') {
+        newCat = '专有词';
+      } else if (matchWordEntryKey(extendKeys, iw.word) != null &&
           iw.category != '拓展词') {
         newCat = '拓展词';
       } else if (matchWordEntryKey(chaoGangKeys, iw.word) != null &&
           iw.category != '超标词') {
         newCat = '超标词';
-      } else if (matchWordEntryKey(extraKeys, iw.word) != null &&
-          iw.category != '专有词') {
-        newCat = '专有词';
       }
       if (newCat != null) {
         oldCounts[iw.category] = (oldCounts[iw.category] ?? 1) - 1;

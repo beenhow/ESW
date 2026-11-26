@@ -6,6 +6,7 @@ import 'package:xml/xml.dart';
 import 'package:esw/shared/doc_extractor.dart';
 import 'package:esw/shared/text_normalize.dart';
 import 'package:esw/shared/vocab_service.dart';
+import 'package:esw/word_filter_rules.dart';
 
 /// 分词/抽取质量守卫：粘连、缺字母、隐形字符、编码。
 void main() {
@@ -44,6 +45,9 @@ void main() {
       expect(extractWordTokens('itB ofB toC AsC'), <String>['it', 'of', 'to', 'As']);
       // 正常缩写不能被误切
       expect(extractWordTokens('PhD MBA GPA'), <String>['PhD', 'MBA', 'GPA']);
+      // 末尾 A-H 紧跟大写时属于缩写块（MoMA），不能当选项标号剥离
+      expect(extractWordTokens('MoMA'), <String>['MoMA']);
+      expect(extractWordTokens('MoMA itB ofB'), <String>['MoMA', 'it', 'of']);
     });
 
     test('撇号缩略形式整体成词（couldn\'t 不再被截成 couldn）', () {
@@ -128,6 +132,120 @@ void main() {
         expect(lower.contains(bad), isFalse, reason: '残留粘连: $bad');
       }
       expect(lower, containsAll(<String>['real', 'perfect', 'clear', 'possible']));
+    });
+
+    test('缩略形式整体检测，不产出 re / ve / ll 残片', () {
+      expect(
+        extractWordTokens("they're we've she'll I'd"),
+        <String>["they're", "we've", "she'll", "I'd"],
+      );
+      final tails = extractWordTokens("they're we're he'll")
+          .map((e) => e.toLowerCase())
+          .toSet();
+      for (final bad in ['re', 've', 'll']) {
+        expect(tails.contains(bad), isFalse, reason: '出现残片: $bad');
+      }
+    });
+
+    test('专有词只认大写写法：Messy / MESSY 命中，小写留给用户确认', () {
+      final keys = properNounKeySet(<String>['Messy', 'WTO', 'Xinjiang']);
+      expect(isProperNounHit(keys, 'Messy'), isTrue);
+      expect(isProperNounHit(keys, 'MESSY'), isTrue);
+      expect(isProperNounHit(keys, 'Wto'), isTrue);
+      expect(isProperNounHit(keys, 'XINJIANG'), isTrue);
+      expect(isProperNounHit(keys, "Messy's"), isTrue);
+      // 小写写法即使词条也收在专有词库，也不自动归为专有词
+      expect(isProperNounHit(keys, 'messy'), isFalse);
+      expect(isProperNounHit(keys, 'wto'), isFalse);
+      expect(isProperNounHit(keys, 'xinjiang'), isFalse);
+      // 查词页/重新归类用的成员判定仍大小写不敏感
+      expect(matchWordEntryKey(keys, 'messy'), isNotNull);
+    });
+
+    test('带撇号的缩略形式按基形判定，不被大写专有规则抢走', () {
+      final keys = properNounKeySet(<String>['I', 'He', 'Rowling']);
+      expect(isProperNounHit(keys, "I've"), isTrue);
+      expect(isProperNounHit(keys, "He's"), isTrue);
+      // 基形在课标 → 按课标词算
+      expect(apostropheBaseInStandard("I've", true), isTrue);
+      expect(apostropheBaseInStandard("He's", true), isTrue);
+      // 即使词条同时出现在拓展/超标表里，基形在课标仍归课标词
+      expect(
+        resolveFilterCategory(
+          inCorpus: false,
+          inStandard: true,
+          inExtend: true,
+          inChaoGang: true,
+          inProper: true,
+          preferProper: true,
+          apostropheBaseStandard: true,
+        ),
+        '课标词',
+      );
+      // 用户历史归类仍然优先
+      expect(
+        resolveFilterCategory(
+          inCorpus: false,
+          inStandard: true,
+          inExtend: false,
+          inChaoGang: false,
+          inProper: false,
+          apostropheBaseStandard: true,
+          remembered: '拓展词',
+        ),
+        '拓展词',
+      );
+      expect(
+        resolveFilterCategory(
+          inCorpus: false,
+          inStandard: true,
+          inExtend: false,
+          inChaoGang: false,
+          inProper: false,
+          preferProper: !apostropheBaseInStandard("I've", true),
+        ),
+        '课标词',
+      );
+      // 基形不在课标（人名所有格）→ 仍归专有词
+      expect(apostropheBaseInStandard("Rowling's", false), isFalse);
+      expect(
+        resolveFilterCategory(
+          inCorpus: false,
+          inStandard: false,
+          inExtend: false,
+          inChaoGang: false,
+          inProper: false,
+          preferProper: !apostropheBaseInStandard("Rowling's", false),
+        ),
+        '专有词',
+      );
+    });
+
+    test('大写写法命中专有词时优先于拓展词/超标词', () {
+      expect(
+        resolveFilterCategory(
+          inCorpus: false,
+          inStandard: false,
+          inExtend: true,
+          inChaoGang: true,
+          inProper: false,
+          preferProper: true,
+        ),
+        '专有词',
+      );
+      // 历史归类优先于自动判定（分类由用户决定）
+      expect(
+        resolveFilterCategory(
+          inCorpus: false,
+          inStandard: false,
+          inExtend: true,
+          inChaoGang: false,
+          inProper: false,
+          preferProper: true,
+          remembered: '拓展词',
+        ),
+        '拓展词',
+      );
     });
   });
 

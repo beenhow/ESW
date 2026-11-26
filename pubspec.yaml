@@ -75,7 +75,6 @@ flutter:
   # To add assets to your application, add an assets section, like this:
   assets:
     - assets/standard_words.json
-    - assets/preload_vocab.json
     - assets/ecdict.db
     - assets/esw_sync_config.json
     # Android 端 PDF 导出用中文字体（Noto Sans SC，SIL OFL；TTF 轮廓，pdf 包可解析）

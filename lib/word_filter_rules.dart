@@ -67,8 +67,9 @@ class WordFilterState {
 
 /// 判定单词的词库归属（互斥口径）。
 ///
-/// 优先级：历史归类（仅四个词库类别）> 超标词 > 拓展词 > 课标词 > 专有词 >
-/// 未筛选（四个词库都不收录，无论语料是否出现过）。
+/// 优先级：历史归类（仅四个词库类别）> 带撇号且基形在课标 > 大写写法的专有词 >
+/// 超标词 > 拓展词 > 课标词 > 专有词 > 未筛选（四个词库都不收录，无论语料是否
+/// 出现过）。
 ///
 /// [remembered] 只接受四个词库类别；历史遗留的「真题词 / 未筛选」被忽略，
 /// 由最新词库归属重新推导，避免旧口径残留。
@@ -78,6 +79,8 @@ String resolveFilterCategory({
   required bool inExtend,
   required bool inChaoGang,
   required bool inProper,
+  bool preferProper = false,
+  bool apostropheBaseStandard = false,
   String? remembered,
 }) {
   final mem = remembered;
@@ -87,6 +90,11 @@ String resolveFilterCategory({
       kExclusiveFilters.contains(mem)) {
     return mem;
   }
+  // 带撇号的缩略/所有格按基形判定：基形在课标就归课标词（I've / He's），
+  // 不被大写专有规则抢走；基形不在课标时才考虑专有词
+  if (apostropheBaseStandard) return kFilterStandard;
+  // 大写写法命中专有词时优先归专有词；小写写法不会走到这里（见 isProperNounHit）
+  if (preferProper) return kFilterProper;
   if (inChaoGang) return kFilterOverLimit;
   if (inExtend) return kFilterExtend;
   if (inStandard) return kFilterStandard;

@@ -117,9 +117,12 @@ class VocabService {
   bool isChaoGang(String word) =>
       matchWordEntryKey(chaoGangWordKeySet, word) != null;
 
-  /// 判断是否专有词（大小写敏感，小写词条可被大写写法命中）
+  /// 是否在专有词库中（大小写不敏感的词条成员判定，含小写写法）。
+  ///
+  /// 仅用于查词页展示与重新归类；文本自动归类请用 `isProperNounHit`，
+  /// 后者只认首字母大写 / 全大写写法。
   bool isExtra(String word) =>
-      matchWordEntryKey(extraWordKeySet, word) != null;
+      matchWordEntryKey(extraLowerSet, word) != null;
 
   /// 获取单词的分类记忆
   String? getClassification(String word) {
