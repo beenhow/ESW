@@ -4135,30 +4135,36 @@ class _AnalysisPageState extends State<_AnalysisPage> {
         // 词形保留完整（couldn't / China's），查表按「完整词形 → 基形」回退，
         // 否则所有格与缩略形式会整段丢失课标/拓展/超标/专有分类。
         final keys = wordLookupKeys(original);
+        final standardHit = widget.vocab.isStandard(original);
         String? cat;
-        for (final key in keys) {
-          final remembered = widget.vocab.classificationMemory[key];
-          if (remembered != null) {
-            cat = remembered;
-            break;
+        if (apostropheBaseInStandard(original, standardHit)) {
+          // 常见缩写/所有格按基形归课标：I'm / can't / you've 不被历史分类
+          // 或专有词误判
+          cat = '课标词';
+        } else {
+          for (final key in keys) {
+            final remembered = widget.vocab.classificationMemory[key];
+            if (remembered != null) {
+              cat = remembered;
+              break;
+            }
           }
-        }
-        if (cat == null) {
-          if (!apostropheBaseInStandard(original, widget.vocab.isStandard(original)) &&
-              isProperNounHit(widget.vocab.extraLowerSet, original)) {
-            // 首字母大写 / 全大写写法优先命中专有词；小写写法留给用户确认
-            cat = '专有词';
-          } else {
-            for (final key in keys) {
-              if (widget.vocab.isStandard(key)) {
-                cat = '课标词';
-                break;
-              } else if (widget.vocab.isExtend(key)) {
-                cat = '拓展词';
-                break;
-              } else if (widget.vocab.isChaoGang(key)) {
-                cat = '超标词';
-                break;
+          if (cat == null) {
+            if (isProperNounHit(widget.vocab.extraLowerSet, original)) {
+              // 首字母大写 / 全大写写法优先命中专有词；小写写法留给用户确认
+              cat = '专有词';
+            } else {
+              for (final key in keys) {
+                if (widget.vocab.isStandard(key)) {
+                  cat = '课标词';
+                  break;
+                } else if (widget.vocab.isExtend(key)) {
+                  cat = '拓展词';
+                  break;
+                } else if (widget.vocab.isChaoGang(key)) {
+                  cat = '超标词';
+                  break;
+                }
               }
             }
           }
@@ -7586,26 +7592,30 @@ Map<String, dynamic> _analyzeTextWorker(Map<String, dynamic> args) {
         final original = caseMap[lower] ?? lower;
         // 与 UI 侧一致：完整词形查不到时回退基形（China's → China）
         final keys = wordLookupKeys(original);
+        final standardHit = isWordSetHit(standard, original);
         String? cat;
-        for (final key in keys) {
-          final remembered = classMem[key];
-          if (remembered != null) {
-            cat = remembered;
-            break;
+        if (apostropheBaseInStandard(original, standardHit)) {
+          // 常见缩写按基形归课标：I'm / can't / you've
+          cat = '课标词';
+        } else {
+          for (final key in keys) {
+            final remembered = classMem[key];
+            if (remembered != null) {
+              cat = remembered;
+              break;
+            }
           }
-        }
-        if (cat == null) {
-          final standardHit = isWordSetHit(standard, original);
-          if (!apostropheBaseInStandard(original, standardHit) &&
-              isProperNounHit(extraLower, original)) {
-            // 首字母大写 / 全大写写法优先命中专有词；小写写法留给用户确认
-            cat = '专有词';
-          } else if (standardHit) {
-            cat = '课标词';
-          } else if (matchWordEntryKey(extend, original) != null) {
-            cat = '拓展词';
-          } else if (matchWordEntryKey(chaogang, original) != null) {
-            cat = '超标词';
+          if (cat == null) {
+            if (isProperNounHit(extraLower, original)) {
+              // 首字母大写 / 全大写写法优先命中专有词；小写写法留给用户确认
+              cat = '专有词';
+            } else if (standardHit) {
+              cat = '课标词';
+            } else if (matchWordEntryKey(extend, original) != null) {
+              cat = '拓展词';
+            } else if (matchWordEntryKey(chaogang, original) != null) {
+              cat = '超标词';
+            }
           }
         }
         return <String, dynamic>{

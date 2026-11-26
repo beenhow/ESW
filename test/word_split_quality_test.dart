@@ -169,6 +169,12 @@ void main() {
       // 基形在课标 → 按课标词算
       expect(apostropheBaseInStandard("I've", true), isTrue);
       expect(apostropheBaseInStandard("He's", true), isTrue);
+      // 弯撇号（Word/PDF 原文常见）同样按缩写处理
+      expect(apostropheBaseInStandard("I\u2019m", true), isTrue);
+      expect(apostropheBaseInStandard("can\u2019t", true), isTrue);
+      // 原形不在词表头（does / was）时回退到词表里的原形
+      expect(wordLookupKeys("doesn\u2019t"), containsAll(<String>['does', 'do']));
+      expect(wordLookupKeys("wasn't"), containsAll(<String>['was', 'be']));
       // 即使词条同时出现在拓展/超标表里，基形在课标仍归课标词
       expect(
         resolveFilterCategory(
@@ -182,7 +188,8 @@ void main() {
         ),
         '课标词',
       );
-      // 用户历史归类仍然优先
+      // 常见缩写的基形在课标时，历史里的误判（如 I'm 记为专有词 / ca 记为
+      // 专有词 / does 记为拓展词）不生效，一律按课标词算
       expect(
         resolveFilterCategory(
           inCorpus: false,
@@ -193,7 +200,19 @@ void main() {
           apostropheBaseStandard: true,
           remembered: '拓展词',
         ),
-        '拓展词',
+        '课标词',
+      );
+      expect(
+        resolveFilterCategory(
+          inCorpus: false,
+          inStandard: true,
+          inExtend: false,
+          inChaoGang: false,
+          inProper: false,
+          apostropheBaseStandard: true,
+          remembered: '专有词',
+        ),
+        '课标词',
       );
       expect(
         resolveFilterCategory(

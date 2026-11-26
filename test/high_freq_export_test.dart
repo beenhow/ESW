@@ -33,6 +33,48 @@ const calendarFlexSet = <String>{
 };
 
 void main() {
+  test('原词未出现时，拓展词频次仍计入课标原词', () async {
+    // 语料里只有变形/派生形式时，词条仍应是课标原词 develop，
+    // 频次为全部拓展词之和，而不是把某个变形词单独列一条。
+    final temp = Directory.systemTemp.createTempSync('esw_orphan_');
+    try {
+      File(p.join(temp.path, 'sample.txt'))
+          .writeAsStringSync('developing developed developments');
+      const stdRaw = '{"develop":{"extensions":'
+          '["developing","developed","developments"]}}';
+      final res = await HighFreqExporter.export(
+        corpusDir: temp.path,
+        standardWordsRaw: stdRaw,
+        dbPath: p.join(Directory.current.path, 'assets', 'ecdict.db'),
+        extendBaseMapRaw: jsonEncode(<String, String>{
+          'developing': 'develop',
+          'developed': 'develop',
+          'developments': 'develop',
+        }),
+        extendWordsRaw:
+            jsonEncode(<String>['developing', 'developed', 'developments']),
+      );
+      final xl = Excel.decodeBytes(res.xlsxBytes);
+      final rows = xl['高考高频词表']
+          .rows
+          .map((r) => r.map((c) => c?.value?.toString() ?? '').toList())
+          .toList();
+      final row = rows.firstWhere((r) => r[1] == 'develop',
+          orElse: () => <String>[]);
+      expect(row, isNotEmpty, reason: '词条应显示课标原词 develop');
+      expect(row[3], '3', reason: '频次应为三个拓展词之和');
+      expect(row[11], contains('developing(1)'));
+      expect(row[11], contains('developed(1)'));
+      expect(row[11], contains('developments(1)'));
+      // 变形形式不得再独立成条
+      for (final w in <String>['developing', 'developed', 'developments']) {
+        expect(rows.where((r) => r[1] == w), isEmpty, reason: '$w 不应独立成条');
+      }
+    } finally {
+      temp.deleteSync(recursive: true);
+    }
+  });
+
   test('export high freq xlsx smoke', () async {
     // 全部输入取自项目内置资产，不依赖本机外部真题目录 / 用户配置目录：
     //  - 语料：assets/gaokao/txt（内置 119 套真题）

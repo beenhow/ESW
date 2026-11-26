@@ -146,7 +146,11 @@ List<int> annotateDocxBytes({
   return bytes;
 }
 
-/// 遍历 document.xml 所有 `<w:t>`，把命中分类的单词拆分为独立 run 并追加标注属性。
+/// 遍历正文段落，先按渲染后的整段文本匹配词元，再按 run 着色。
+///
+/// Word 常把 `Mary’s` / `you’ve` 拆成多个 run，逐 run 匹配会把词头与缩写
+/// 尾巴割裂（只剩词头着色、’s 落空）。按整段匹配后，跨 run 的词元会在
+/// 各自 run 内分别着色，保证「一个词一起检测」。
 void _annotateDocument(
   XmlDocument document,
   Map<String, String> catByLower,
@@ -159,40 +163,60 @@ void _annotateDocument(
       ? typographyAnnotateStyles()
       : defaultAnnotateStyles(colorBold: colorBold);
   if (!annotateUnfiltered) styles.remove(ExportCategory.unfiltered);
-  // 收集需要替换的 w:r（引用原节点），统一从后往前替换，避免索引失效
+
   final replacements = <(XmlElement, String)>[];
-  for (final t in document.findAllElements('w:t')) {
-    final r = t.parentElement;
-    if (r == null || r.name.local != 'r') continue;
-    final text = t.innerText;
-    if (text.isEmpty) continue;
-    // 命中区间：[word, start, end, category]
-    final hits = <(String, int, int, String)>[];
-    for (final m in annotatedWordRegExp.allMatches(text)) {
+  for (final p in document.findAllElements('w:p')) {
+    final runs = _runsOfParagraph(p);
+    if (runs.isEmpty) continue;
+    final buf = StringBuffer();
+    final spans = <(XmlElement, int, int)>[];
+    for (final r in runs) {
+      final text = _runPlainText(r);
+      final start = buf.length;
+      buf.write(text);
+      spans.add((r, start, start + text.length));
+    }
+    final full = buf.toString();
+    if (full.isEmpty) continue;
+
+    final hits = <(int, int, String)>[];
+    for (final m in annotatedWordRegExp.allMatches(full)) {
       final cat = categoryOfWord(catByLower, m.group(0)!);
-      if (cat != null) hits.add((m.group(0)!, m.start, m.end, cat));
+      if (cat != null) hits.add((m.start, m.end, cat));
     }
     if (hits.isEmpty) continue;
-    // 原 run 的 rPr（若有），命中 run 在其基础上追加属性，未命中 run 原样继承
-    final rPr = r.getElement('w:rPr');
-    final rPrXml = rPr != null ? rPr.toXmlString() : '';
-    final runsXml = <String>[];
-    var lastEnd = 0;
-    for (final h in hits) {
-      if (h.$2 > lastEnd) {
-        runsXml.add(_runXml(text.substring(lastEnd, h.$2), rPrXml, null));
+
+    for (final span in spans) {
+      final (r, start, end) = span;
+      final segs = <(String, AnnotateStyle?)>[];
+      var cursor = start;
+      for (final h in hits) {
+        if (h.$2 <= start) continue;
+        if (h.$1 >= end) break;
+        final hs = h.$1 > start ? h.$1 : start;
+        final he = h.$2 < end ? h.$2 : end;
+        if (hs > cursor) segs.add((full.substring(cursor, hs), null));
+        segs.add((
+          full.substring(hs, he),
+          styles[h.$3] ?? const AnnotateStyle(color: '000000'),
+        ));
+        cursor = he;
       }
-      final style = styles[h.$4];
-      runsXml.add(
-        _runXml(h.$1, rPrXml, style ?? const AnnotateStyle(color: '000000')),
-      );
-      lastEnd = h.$3;
+      if (cursor == start) continue; // 本 run 无命中，保持原样
+      if (cursor < end) segs.add((full.substring(cursor, end), null));
+
+      final rPr = r.getElement('w:rPr');
+      final rPrXml = rPr != null ? rPr.toXmlString() : '';
+      final runsXml = <String>[];
+      for (final s in segs) {
+        if (s.$1.isEmpty) continue;
+        runsXml.add(_runXml(s.$1, rPrXml, s.$2));
+      }
+      if (runsXml.isEmpty) continue;
+      replacements.add((r, runsXml.join()));
     }
-    if (lastEnd < text.length) {
-      runsXml.add(_runXml(text.substring(lastEnd), rPrXml, null));
-    }
-    replacements.add((r, runsXml.join()));
   }
+  // 统一从后往前替换，避免索引失效
   for (final rep in replacements.reversed) {
     final parent = rep.$1.parentElement;
     if (parent == null) continue;
@@ -202,6 +226,43 @@ void _annotateDocument(
     final fragment = _parseFragment(rep.$2);
     parent.children.insertAll(idx, fragment);
   }
+}
+
+/// 段落内按文档顺序取 run，跳过内层段落（文本框），避免外层重复收集。
+List<XmlElement> _runsOfParagraph(XmlElement p) {
+  final out = <XmlElement>[];
+  void walk(XmlElement e) {
+    for (final c in e.children.whereType<XmlElement>()) {
+      if (c.name.local == 'p') continue;
+      if (c.name.local == 'r') {
+        out.add(c);
+        continue;
+      }
+      walk(c);
+    }
+  }
+
+  walk(p);
+  return out;
+}
+
+/// run 的渲染文本：制表符/换行按空格、不换行连字符按 `-`，与正文抽取口径一致。
+String _runPlainText(XmlElement run) {
+  final buf = StringBuffer();
+  for (final c in run.children.whereType<XmlElement>()) {
+    switch (c.name.local) {
+      case 't':
+        buf.write(c.innerText);
+      case 'tab':
+      case 'ptab':
+      case 'br':
+      case 'cr':
+        buf.write(' ');
+      case 'noBreakHyphen':
+        buf.write('-');
+    }
+  }
+  return buf.toString();
 }
 
 /// 生成单个 `<w:r>`：文本转义 + 继承原 rPr（可选追加标注属性）。

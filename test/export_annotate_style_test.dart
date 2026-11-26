@@ -263,6 +263,34 @@ void main() {
         reason: '拓展词仍应按规范色着色');
   });
 
+  test('跨 run 的所有格/缩写按整词标注（Mary + ’s、you + ’ + ve）', () {
+    // Word 常把同一单词拆到多个 run：逐 run 匹配会只给词头着色，尾巴落空。
+    const src = '<w:p>'
+        '<w:r><w:t xml:space="preserve">Borrowing </w:t></w:r>'
+        '<w:r><w:t xml:space="preserve">Mary</w:t></w:r>'
+        '<w:r><w:t xml:space="preserve">’s</w:t></w:r>'
+        '<w:r><w:t xml:space="preserve"> watch and </w:t></w:r>'
+        '<w:r><w:t xml:space="preserve">you</w:t></w:r>'
+        '<w:r><w:t xml:space="preserve">’</w:t></w:r>'
+        '<w:r><w:t xml:space="preserve">ve</w:t></w:r>'
+        '<w:r><w:t xml:space="preserve"> done.</w:t></w:r>'
+        '</w:p>';
+    final annotated = annotateDocxBytes(
+      srcBytes: buildDocx([src]),
+      catByLower: const {"mary's": '专有词', "you've": '拓展词'},
+      colorBold: false,
+      annotateUnfiltered: false,
+    );
+    final xml = readDocumentXml(annotated);
+    expect(xml.contains(docxRunXml('Mary', '800080')), isTrue,
+        reason: '人名所有格的词头应按专有词着色');
+    expect(xml.contains(docxRunXml('’s', '800080')), isTrue,
+        reason: '撇号尾巴应与词头同色，不能落空');
+    expect(xml.contains(docxRunXml('you', '006400')), isTrue);
+    expect(xml.contains(docxRunXml('’', '006400')), isTrue);
+    expect(xml.contains(docxRunXml('ve', '006400')), isTrue);
+  });
+
   test('PDF 路径：原文标注带极淡同色底纹 + 规范字色字重', () async {
     final font = loadExportFont();
 
@@ -422,6 +450,7 @@ void main() {
         '<w:r><w:rPr><w:rFonts w:ascii="Courier New"/><w:i/>'
         '<w:u w:val="single"/></w:rPr>'
         '<w:t xml:space="preserve">ExtendWord</w:t></w:r>'
+        '<w:r><w:t xml:space="preserve"> </w:t></w:r>'
         '<w:r><w:rPr><w:rFonts w:ascii="Courier New"/>'
         '<w:u w:val="single"/></w:rPr>'
         '<w:t xml:space="preserve">ProperWord</w:t></w:r>'

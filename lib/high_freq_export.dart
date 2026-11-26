@@ -989,7 +989,8 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
 
   // 5) 词族归并：
   //    - 课标词出现 → 以其自身为词条（freq 含全部归并拓展词）
-  //    - 课标词未出现、仅拓展词出现 → 拓展词单独计入（词条=频次最高的拓展词，标注课标原词）
+  //    - 课标词未出现、仅拓展词出现 → 仍以课标原词为词条，频次为全部
+  //      拓展词之和（派生/变形形式一并计入该词的统计）
   //    - 非课标体系词（超标词）与专有词一律排除
   final familyFreq = <String, int>{}; // 展示词 -> 总频
   final baseFreqRaw = <String, int>{}; // 课标原词本身的原始频次
@@ -1072,7 +1073,7 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
       ],
     ));
   }
-  // 原词未出现、仅拓展词出现 → 拓展词单独计入
+  // 原词未出现、仅拓展词出现 → 仍以课标原词为词条，频次为全部拓展词之和
   final orphanGroups = <String, List<String>>{};
   for (final e in extGroup.entries) {
     final base = e.key;
@@ -1081,43 +1082,37 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
     for (final m in e.value) {
       sum += extFreq[m] ?? 0;
     }
-    // 词条展示：频次最高的拓展词
     e.value.sort((a, b) => (extFreq[b] ?? 0).compareTo(extFreq[a] ?? 0));
-    final rep = e.value.first;
-    final memberList = e.value..sort();
-    orphanGroups[rep] = memberList;
-    familyFreq[rep] = sum;
+    orphanGroups[base] = e.value;
+    familyFreq[base] = sum;
   }
   for (final e in orphanGroups.entries) {
-    final rep = e.key;
-    final base = extBaseMap[rep]!;
+    final base = e.key;
     final members = e.value;
-    final dict = _lookupCached(db, rep);
-    final allWords = <String>[rep, ...members.where((m) => m != rep)];
-    final otherWords = allWords.where((m) => m != rep).toList();
-    final examples = _pickExamples(rep, sentences, sentTokens, sentIndex, freq,
+    final dict = _lookupCached(db, base);
+    final examples = _pickExamples(base, sentences, sentTokens, sentIndex, freq,
         stdSet, sentYears, _multiSense(dict) ? 4 : 2,
-        altWords: otherWords);
-    final usedYears = {for (final e in examples) e.year};
+        altWords: members);
+    final usedYears = {for (final ex in examples) ex.year};
     finalEntries.add(_WordEntry(
-      word: lowerToOrig[rep] ?? rep,
-      baseStd: lowerToOrig[base] ?? base,
-      freq: familyFreq[rep]!,
-      isStd: stdSet.contains(rep),
-      category: stdCategory[rep] ?? '',
+      word: lowerToOrig[base] ?? base,
+      // 词条本身就是课标原词，无需再标「对应课标原词」
+      baseStd: null,
+      freq: familyFreq[base]!,
+      isStd: true,
+      category: stdCategory[base] ?? '',
       dict: dict,
       examples: examples,
       members: [
-        for (final m in allWords)
-          if (m != rep)
-            (
-              word: lowerToOrig[m] ?? m,
-              dict: _lookupCached(db, m),
-              freq: extFreq[m] ?? familyFreq[m] ?? 0,
-              examples: _pickExamples(m, sentences, sentTokens, sentIndex,
-                  freq, stdSet, sentYears, 1,
-                  excludeYears: usedYears),
-            ),
+        for (final m in members)
+          (
+            word: lowerToOrig[m] ?? m,
+            dict: _lookupCached(db, m),
+            freq: extFreq[m] ?? 0,
+            examples: _pickExamples(m, sentences, sentTokens, sentIndex, freq,
+                stdSet, sentYears, 1,
+                excludeYears: usedYears),
+          ),
       ],
     ));
   }

@@ -331,6 +331,21 @@ const Map<String, String> _irregularBases = <String, String>{
   "shan't": 'shall',
 };
 
+/// 缩写基形不是词表头词时，回退到对应的原形（课标词库只收原形：do / be / have）。
+///
+/// 否则 doesn't → does、wasn't → was、didn't → did 在原形缺失时查不到课标，
+/// 常见缩写会被判成未筛选或沿用错误的历史分类。
+const Map<String, String> _contractionLemmas = <String, String>{
+  'does': 'do',
+  'did': 'do',
+  'done': 'do',
+  'was': 'be',
+  'were': 'be',
+  'had': 'have',
+  'goes': 'go',
+  'won': 'win',
+};
+
 /// 查词表用的候选键。
 ///
 /// 普通词首个元素是完整词形本身；带点缩写先尝试省略末尾点的形式
@@ -360,8 +375,10 @@ List<String> wordLookupKeys(String token) {
     // 单字母基形只保留 I / a（I've → I），其余过短基形丢弃
     final shortOk = base.length == 1 &&
         (base == 'I' || base == 'i' || base == 'a' || base == 'A');
-    if ((base.length < 2 && !shortOk) || keys.contains(base)) continue;
-    keys.add(base);
+    if (base.length < 2 && !shortOk) continue;
+    if (!keys.contains(base)) keys.add(base);
+    final lemma = _contractionLemmas[base.toLowerCase()];
+    if (lemma != null && !keys.contains(lemma)) keys.add(lemma);
   }
   return keys;
 }
@@ -401,8 +418,10 @@ List<String> wordLookupKeysExact(String token) {
     // 单字母基形只保留 I / a（I've → I、a.m 之外的 a），其余过短基形丢弃
     final shortOk = base.length == 1 &&
         (base == 'I' || base == 'i' || base == 'a' || base == 'A');
-    if ((base.length < 2 && !shortOk) || keys.contains(base)) continue;
-    keys.add(base);
+    if (base.length < 2 && !shortOk) continue;
+    if (!keys.contains(base)) keys.add(base);
+    final lemma = _contractionLemmas[base.toLowerCase()];
+    if (lemma != null && !keys.contains(lemma)) keys.add(lemma);
   }
   return keys;
 }
@@ -473,7 +492,7 @@ bool isProperNounHit(Set<String> lowerEntries, String token) {
 /// 这类词元不能因为含大写字母（句首 I / He）就被专有词抢走：基形命中课标
 /// 就按课标词算；只有基形不在课标里，才继续考虑专有词。
 bool apostropheBaseInStandard(String token, bool standardHit) =>
-    standardHit && token.contains("'");
+    standardHit && wordLookupKeyExact(token).contains("'");
 
 /// 连字符复合词按部分判定：整体未命中时拆开，所有组成部分都命中才算命中。
 List<String>? _compoundPartKeys(
