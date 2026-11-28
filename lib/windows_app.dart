@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart'
-    show rootBundle, Clipboard, ClipboardData;
+    show rootBundle, Clipboard, ClipboardData, FilteringTextInputFormatter;
 import 'dart:isolate';
 import 'package:file_picker/file_picker.dart';
 import 'package:file_selector/file_selector.dart' as fs;
@@ -39,14 +39,23 @@ import 'shared/inplace_docx_annotator.dart';
 import 'shared/export_word_style.dart';
 import 'word_filter_rules.dart';
 import 'shared/export_annotate_markup.dart';
+import 'shared/phrase_stats.dart';
 import 'shared/text_normalize.dart';
+import 'shared/word_family.dart';
 import 'shared/builtin_corpus.dart';
+import 'shared/builtin_textbook.dart';
 import 'shared/imported_corpus.dart';
 import 'windows/imported_word_row.dart';
 import 'windows/year_filter_bar.dart';
+import 'shared/vocab_report.dart';
+import 'windows/vocab_report_page.dart';
 
 typedef _GetDroppedFileC = Pointer<Utf8> Function();
 typedef _GetDroppedFileDart = Pointer<Utf8> Function();
+
+/// 左栏列表的一条展示项（真题年份/教材版本分组、文件/单元行、聚焦提示、内联原文）。
+/// [label] 为年份或单元标题；[index] 为教材单元下标。
+typedef _LeftItem = ({String kind, CorpusFile? file, String? label, int? index});
 final DynamicLibrary _exeLib = DynamicLibrary.process();
 final _GetDroppedFileDart _getDroppedFile = _exeLib
     .lookupFunction<_GetDroppedFileC, _GetDroppedFileDart>('get_dropped_file');
@@ -266,7 +275,12 @@ class _MainWindowState extends State<MainWindow>
   bool _builtinCollapsed = false; // 仅折叠内置分组（仍参与统计）
   bool _highFreqExporting = false;
   // 教材导入文件列表（txt/doc/docx，可勾选，参与语料统计）
+  // _textbookFiles 始终是「内置教材 + 用户导入」的合并视图；_userTextbookFiles
+  // 才写入用户配置，内置教材由内置链路释放、不进配置。
   List<CorpusFile> _textbookFiles = [];
+  List<CorpusFile> _builtinTextbookFiles = [];
+  List<CorpusFile> _userTextbookFiles = [];
+  Set<String> _builtinTextbookIds = {};
   // 第三关 ⑥：左栏每组的"高亮行"（选中态全栏唯一，初始为第 1 行）。
   // 仅用于视觉高亮，与 CorpusFile.isSelected（勾选参与统计的功能语义）解耦。
   String? _activeCorpusPath;
@@ -317,6 +331,8 @@ class _MainWindowState extends State<MainWindow>
   String _wordDef = '';
   String? _detectedCategory;
   String _detectedWord = '';
+  /// 查询词的原始大小写（March/march 等异义词需要按大小写分别统计与展示）。
+  String _detectedWordRaw = '';
   final List<String> _extendWords = []; // 用户添加的拓展词列表（保持添加顺序）
 
   /// 拓展词小写索引：查询/渲染高频路径（_onDetect、_buildWordDefBanner）避免
@@ -500,6 +516,17 @@ class _MainWindowState extends State<MainWindow>
   final ScrollController _textbookListScrollController = ScrollController();
   String? _textbookFocusPath; // 结果定位时只显示这本教材
 
+  // ======== 左栏分组展开状态 ========
+  /// 已展开的真题年份（键为 '2024' 这类年份串，或 '其他'）。默认全部收起，
+  /// 点击年份头展开卷别。
+  final Set<String> _corpusExpandedYears = <String>{};
+
+  /// 已展开的教材版本（键为教材文件路径）。默认收起，点击版本展开单元。
+  final Set<String> _textbookExpandedVersions = <String>{};
+
+  /// 教材单元被排除后的过滤文本缓存（原文过大时避免每次查询重复拼接）。
+  final Map<String, String> _filteredTextCache = {};
+
   /// 已筛选过的文件路径集合，打开这些文件时自动积累分类结果
   final Set<String> _processedFilePaths = {};
   List<_ImportedWord> _importedWords = [];
@@ -516,6 +543,14 @@ class _MainWindowState extends State<MainWindow>
     '专有词': 0,
     '未筛选': 0,
   };
+  // ======== 检测报告（基于当前导入分析结果；数据与明细表同源） ========
+  bool _showImportedReport = false;
+  bool _importedReportLoading = false;
+  VocabReportData? _importedReport;
+  /// 生成报告时的 _importedWords 引用：重新导入 / 返回检测后引用变化，
+  /// 旧报告自动失效，避免展示上一份文档的统计。
+  List<_ImportedWord>? _importedReportWordsRef;
+
   // ======== 从导入模式跳转到查词后的返回状态 ========
   bool _cameFromImportedMode = false;
   String _savedImportedText = '';
@@ -595,8 +630,42 @@ class _MainWindowState extends State<MainWindow>
     _fileTextCacheOrder.add(path);
   }
 
-  /// 读取任意文件纯文本并走缓存（docx/pdf/doc/txt 统一异步入口）
+  /// 读取任意文件纯文本并走缓存（docx/pdf/doc/txt 统一异步入口）。
+  /// 教材文件若存在被排除的单元，返回裁剪后的文本；其余文件原样返回。
   Future<String> _readFileTextCached(String filePath) async {
+    final raw = await _readRawFileText(filePath);
+    final cf = _textbookFileByPath(filePath);
+    if (cf == null || cf.excludedSections.isEmpty) return raw;
+    final sections = cf.sections;
+    if (sections == null || sections.isEmpty) return raw;
+    final key =
+        '$filePath|${(cf.excludedSections.toList()..sort()).join(',')}';
+    final cached = _filteredTextCache[key];
+    if (cached != null) return cached;
+    final sb = StringBuffer();
+    for (var i = 0; i < sections.length; i++) {
+      if (cf.excludedSections.contains(i)) continue;
+      final s = sections[i];
+      final start = s.start.clamp(0, raw.length);
+      final end = s.end.clamp(start, raw.length);
+      sb.write(raw.substring(start, end));
+    }
+    final filtered = sb.toString();
+    if (_filteredTextCache.length > 8) _filteredTextCache.clear();
+    _filteredTextCache[key] = filtered;
+    return filtered;
+  }
+
+  /// 教材列表里按路径查文件（单元过滤用；列表很小，线性扫描即可）。
+  CorpusFile? _textbookFileByPath(String path) {
+    for (final f in _textbookFiles) {
+      if (f.path == path) return f;
+    }
+    return null;
+  }
+
+  /// 读取文件原始纯文本（不含单元裁剪），走缓存。
+  Future<String> _readRawFileText(String filePath) async {
     // 缺失资源降级标记：本次读取是否因缺少 OCR 组件而读不出文字（供调用方提示）
     _lastPdfOcrUnavailable = false;
     final hit = _readCachedFileText(filePath);
@@ -620,6 +689,9 @@ class _MainWindowState extends State<MainWindow>
     // 三条入口（真题语料 / 导入文档 / 粘贴文本）统一规范化：
     // 制表符当分隔、软换行当断行、选项标记断行，避免 itB / toC 这类粘连 token
     content = normalizeText(content);
+    // 与高频导出共用同一套语料预处理（全角标点/弯引号归一，1:1 替换
+    // 不改变字符偏移，原文定位/高亮仍可用）。
+    content = normalizeCorpusText(content);
     _cacheFileText(filePath, content);
     return content;
   }
@@ -663,11 +735,15 @@ class _MainWindowState extends State<MainWindow>
     _initDragDrop();
     _searchFocus.addListener(_onSearchFocusChange);
     _initOcr();
-    _loadStandardWords();
+    final standardWordsFuture = _loadStandardWords();
     // 配置加载（异步）完成后只释放内置真题；不再自动载入上次导入的真题目录。
     // 历史路径仍保存在配置里，仅用于文件选择器的初始目录（initialDirectory）。
+    // 课标库与配置都就绪后，把内置专有词并入用户专有词库（去重后持久化）。
     unawaited(_loadConfig().then((_) async {
+      await standardWordsFuture;
+      _mergeBuiltinProperWords();
       await _initBuiltinCorpus();
+      await _initBuiltinTextbooks();
     }));
     if (Platform.environment['ESW_SHOT_CAPTURE'] == null && !EswPerf.enabled) {
       _maybePromptSync();
@@ -865,10 +941,11 @@ class _MainWindowState extends State<MainWindow>
           paths.add(tb);
         }
         if (paths.isNotEmpty) {
-          _textbookFiles = [
+          _userTextbookFiles = [
             for (final path in paths)
               CorpusFile(name: p.basename(path), path: path)..isSelected = true,
           ];
+          _rebuildTextbookList();
         }
       }
       setState(() => _searchController.text = q);
@@ -1730,6 +1807,12 @@ class _MainWindowState extends State<MainWindow>
   /// 课标词数据：{word: {category, pos, def}}，key 为原始大小写
   Map<String, Map<String, String>> _standardWords = {};
 
+  /// 内置专有词（standard_words.json 中 category=专有词 的词条）
+  final List<String> _builtinProperWords = [];
+
+  /// 英美拼写合并后的「变体 → 主条」映射（来自课标库 extensions）
+  Map<String, String> _spellingExtensionAliases = const {};
+
   /// 大小写不敏感索引：{lowercase → [原始大小写...]}
   final Map<String, List<String>> _standardWordsLower = {};
 
@@ -1788,9 +1871,10 @@ class _MainWindowState extends State<MainWindow>
         _lastTextbookImportPath = null;
       }
       _lastImportMode = json['lastImportMode'] as String?;
-      // 内置真题分组的显示偏好（隐藏 / 折叠）
-      _builtinHidden = json['builtinHidden'] as bool? ?? false;
-      _builtinCollapsed = json['builtinCollapsed'] as bool? ?? false;
+      // 内置真题改由左栏年份分组勾选控制，不再读取旧的「隐藏 / 折叠」偏好，
+      // 避免旧配置把内置真题隐藏后在新界面上看不到恢复入口。
+      _builtinHidden = false;
+      _builtinCollapsed = false;
       _lastExportPath = json['lastExportPath'] as String?;
       final wh = json['wordHistory'];
       if (wh is List) {
@@ -1880,7 +1964,8 @@ class _MainWindowState extends State<MainWindow>
           itp.map((e) => e.toString()),
         );
         if (validPaths.isNotEmpty) {
-          _textbookFiles = [
+          // 仅用户导入项进配置；内置教材由 _initBuiltinTextbooks 单独释放合并
+          _userTextbookFiles = [
             for (final path in validPaths)
               CorpusFile(
                 name: File(path).uri.pathSegments.last,
@@ -1888,9 +1973,10 @@ class _MainWindowState extends State<MainWindow>
               ),
           ];
           // 教材默认全部勾选，便于直接参与"同时检测真题和教材"
-          for (final f in _textbookFiles) {
+          for (final f in _userTextbookFiles) {
             f.isSelected = true;
           }
+          _rebuildTextbookList();
           // 同步恢复导入目录记忆，便于下次打开文件选择器定位
           _lastTextbookImportPath = File(validPaths.first).parent.path;
         }
@@ -2030,7 +2116,7 @@ class _MainWindowState extends State<MainWindow>
       put('wordHistory', _wordHistory);
       // 仅记录用户在本应用内主动导入的语料文件（内置 119 套由内置链路释放，不写这里）
       put('importedCorpusPaths', _userCorpusFiles.map((f) => f.path).toList());
-      put('importedTextbookPaths', _textbookFiles.map((f) => f.path).toList());
+      put('importedTextbookPaths', _userTextbookFiles.map((f) => f.path).toList());
       put('extendWords', _extendWords);
       put('extendBaseMap', _extendBaseMap);
       put('manualChaoGangWords', _manualChaoGangWords.toList());
@@ -2070,16 +2156,6 @@ class _MainWindowState extends State<MainWindow>
       _extendReverseIndex.clear();
       _standardWords = raw.map((k, v) {
         final m = v as Map<String, dynamic>;
-        // 什JSON extensions 反向索引
-        final exts = m['extensions'];
-        if (exts is List) {
-          for (final ext in exts) {
-            final extLower = ext.toString().toLowerCase();
-            if (extLower.isNotEmpty) {
-              _extendReverseIndex[extLower] = k.toLowerCase();
-            }
-          }
-        }
         return MapEntry(k, {
           'category': (m['category'] as String?) ?? '',
           'pos': (m['pos'] as String?) ?? '',
@@ -2093,8 +2169,39 @@ class _MainWindowState extends State<MainWindow>
         _standardWordsLower.putIfAbsent(lk, () => []);
         _standardWordsLower[lk]!.add(key);
       }
+      // 英美拼写：数据侧已合并为一条、变体挂 extensions，
+      // 这里还原「变体 → 主条」映射，保证页面词频与导出同口径。
+      final extByBase = <String, Iterable<String>>{};
+      for (final e in raw.entries) {
+        final m = e.value as Map<String, dynamic>;
+        if ((m['category'] as String?) == '专有词') continue;
+        final exts = m['extensions'];
+        if (exts is List && exts.isNotEmpty) {
+          extByBase[e.key] = exts.map((x) => x.toString());
+        }
+      }
+      // extensions → 主条反向索引（检测侧原样保留，供检测结果导出的
+      // 「课标原词」列与手动归类使用；词族归并的「形同义不同」排除只在
+      // _effectiveExtendBaseMap 里做，避免影响检测结果导出）。
+      extByBase.forEach((base, exts) {
+        final lb = base.toLowerCase();
+        for (final ext in exts) {
+          final le = ext.toLowerCase();
+          if (le.isNotEmpty && le != lb) _extendReverseIndex[le] = lb;
+        }
+      });
+      _spellingExtensionAliases =
+          buildExtensionSpellingAliases(extByBase);
       // Build performance indices
       _standardWordsLowerKeySet = _standardWordsLower.keys.toSet();
+      // 内置专有词单独登记（可查询，但不计入课标词导出统计）
+      _builtinProperWords
+        ..clear()
+        ..addAll(
+          _standardWords.entries
+              .where((e) => e.value['category'] == '专有词')
+              .map((e) => e.key),
+        );
       _wordsByFirstChar.clear();
       for (final key in _standardWords.keys) {
         if (key.isEmpty) continue;
@@ -2110,6 +2217,55 @@ class _MainWindowState extends State<MainWindow>
     } catch (_) {
       _standardWords = {};
     }
+  }
+
+  /// 把内置专有词并入用户专有词库（按小写去重），新增时持久化配置。
+  /// 课标库与用户库两处都有数据：查询/分类走课标库条目，
+  /// 专有词库列表与同步走 [_manualExtraWords]。
+  void _mergeBuiltinProperWords() {
+    if (_builtinProperWords.isEmpty) return;
+    final lower = _manualExtraWords.map((e) => e.toLowerCase()).toSet();
+    var added = 0;
+    for (final w in _builtinProperWords) {
+      if (lower.add(w.toLowerCase())) {
+        _manualExtraWords.add(w);
+        _classificationMemory[w.toLowerCase()] = '专有词';
+        added++;
+      }
+    }
+    if (added == 0) return;
+    if (mounted) setState(() {});
+    _saveConfig();
+  }
+
+  /// 词族使用的拓展映射：用户配置 + 课标库 extensions（与导出一致，
+  /// 不再按界面拓展词列表做白名单过滤），保证英美拼写合并后仍按单条统计。
+  Map<String, String> _effectiveExtendBaseMap() {
+    final base = buildExtendBaseMap(
+      raw: _extendBaseMap,
+      standardKeys: _standardWords.keys,
+    );
+    final allowed = <String>{
+      for (final k in _standardWords.keys) foldWordText(k).trim().toLowerCase(),
+    };
+    _extendReverseIndex.forEach((ext, root) {
+      // 形同义不同的独立词条（found/left/born/lay/lost/rose/thought/would/
+      // should/might）不并入词族，避免抬高主条频次。
+      if (allowed.contains(ext)) return;
+      base.putIfAbsent(ext, () => root);
+    });
+    return base;
+  }
+
+  /// 是否内置专有词：精确词条命中，或首字母大写写法命中同名专有词条。
+  /// 纯小写不命中大写词条（避免 may/march/china 等普通义被误判）。
+  bool _isBuiltinProperWord(String w) {
+    if (w.isEmpty || _builtinProperWords.isEmpty) return false;
+    if (_builtinProperWords.contains(w)) return true;
+    final first = w[0];
+    final isUpper = first.toUpperCase() == first && first.toLowerCase() != first;
+    return isUpper &&
+        _builtinProperWords.any((e) => e.toLowerCase() == w.toLowerCase());
   }
 
   @override
@@ -2141,87 +2297,29 @@ class _MainWindowState extends State<MainWindow>
     super.dispose();
   }
 
-  // 弹出导入方式菜单（居中于按钮正下方）
+  // 真题导入：精简为只导入单个文件（不再支持文件夹导入）。
   Future<void> _showImportMenu() async {
     if (_leftPanelIsTextbook) {
       setState(() => _leftPanelIsTextbook = false);
     }
-    final ctx = _importBtnKey.currentContext ?? _leftHeaderKey.currentContext;
-    final RenderBox box = ctx!.findRenderObject() as RenderBox;
-    final offset = box.localToGlobal(Offset.zero);
-    final centerX = offset.dx + box.size.width / 2;
-    final items = <PopupMenuEntry<String>>[
-      const PopupMenuItem(value: 'folder', child: Text('导入文件夹')),
-      const PopupMenuItem(value: 'files', child: Text('导入文件')),
-    ];
-    final mode = await showMenu<String>(
-      context: context,
-      position: RelativeRect.fromLTRB(
-        centerX - 50,
-        offset.dy + box.size.height,
-        centerX + 50,
-        0,
-      ),
-      items: items,
-    );
-    if (mode == 'folder') {
-      _importFolder();
-    } else if (mode == 'files') {
-      _importFiles();
-    }
-  }
-
-  Future<void> _importFolder() async {
-    final dir = await FilePicker.getDirectoryPath(
-      dialogTitle: '选择真题文件夹',
-      initialDirectory: _lastExamImportPath,
-    );
-    if (dir == null || dir.isEmpty) return;
-    final dirObj = Directory(dir);
-    if (!await dirObj.exists()) return;
-    _lastExamImportPath = dir;
-    _lastImportMode = 'folder';
-    _saveConfig();
-    final files = <CorpusFile>[];
-    for (final entity in dirObj.listSync(recursive: true)) {
-      if (entity is File) {
-        final ext = entity.path.toLowerCase();
-        if (ext.endsWith('.txt') ||
-            ext.endsWith('.doc') ||
-            ext.endsWith('.docx') ||
-            ext.endsWith('.pdf')) {
-          files.add(
-            CorpusFile(name: entity.uri.pathSegments.last, path: entity.path),
-          );
-        }
-      }
-    }
-    _applyCorpusFiles(files);
+    await _importFiles();
   }
 
   Future<void> _importFiles() async {
     final result = await FilePicker.pickFiles(
       dialogTitle: '选择真题文件',
-      allowMultiple: true,
+      allowMultiple: false,
       type: FileType.custom,
       allowedExtensions: ['txt', 'doc', 'docx', 'pdf'],
       initialDirectory: _lastExamImportPath,
     );
     if (result == null || result.files.isEmpty) return;
-    final files = <CorpusFile>[];
-    for (final f in result.files) {
-      if (f.path != null) {
-        files.add(CorpusFile(name: f.name, path: f.path!));
-      }
-    }
-    _applyCorpusFiles(files);
-    // 保存第一个文件的父目录作为导入路径
-    final firstPath = result.files.first.path;
-    if (firstPath != null) {
-      _lastExamImportPath = File(firstPath).parent.path;
-      _lastImportMode = 'files';
-      _saveConfig();
-    }
+    final f = result.files.first;
+    if (f.path == null) return;
+    _applyCorpusFiles([CorpusFile(name: f.name, path: f.path!)]);
+    _lastExamImportPath = File(f.path!).parent.path;
+    _lastImportMode = 'files';
+    _saveConfig();
   }
 
   // ==================== 教材导入（txt/doc/docx，可多选，可勾选） ====================
@@ -2305,6 +2403,11 @@ class _MainWindowState extends State<MainWindow>
   void _applyTextbookFiles(List<CorpusFile> files) {
     if (files.isEmpty) return;
     files.sort((a, b) => a.name.compareTo(b.name));
+    // 与内置教材同名的用户文件让位内置，避免同一本被计两次
+    final userFiles = files
+        .where((f) => !_builtinTextbookIds.contains(f.name))
+        .toList();
+    if (userFiles.isEmpty) return;
     // 退出单词查询模式：若输入框仍为上次查询词则一并清空
     final queryText = _searchController.text.trim();
     if (_detectedWord.isNotEmpty &&
@@ -2312,7 +2415,8 @@ class _MainWindowState extends State<MainWindow>
       _searchController.clear();
     }
     setState(() {
-      _textbookFiles = files;
+      _userTextbookFiles = userFiles;
+      _rebuildTextbookList();
       // 导入教材后左栏自动切到教材栏（单栏形态，真题列表整块不占位）
       _leftPanelIsTextbook = true;
       // 教材文件默认全部勾选，便于直接参与"同时检测真题和教材"
@@ -2321,6 +2425,7 @@ class _MainWindowState extends State<MainWindow>
       }
       // 导入教材后自动退出单词查询模式，切换/进入文档检测模式
       _detectedWord = '';
+      _detectedWordRaw = '';
       _activeFilter = '真题词';
       _detectedCategory = null;
       _wordPos = '';
@@ -2525,6 +2630,7 @@ class _MainWindowState extends State<MainWindow>
   void _resetWordQueryState() {
     setState(() {
       _detectedWord = '';
+      _detectedWordRaw = '';
       _activeFilter = '真题词';
       _detectedCategory = null;
       _wordPos = '';
@@ -2598,6 +2704,55 @@ class _MainWindowState extends State<MainWindow>
     _sortedYears = years.toList()..sort((a, b) => b.compareTo(a));
   }
 
+  /// 首启释放内置教材（8 套）到用户目录，作为「内置」分组并入教材列表。
+  /// 内置教材不进用户配置；用户导入列表仍由 importedTextbookPaths 单独维护。
+  Future<void> _initBuiltinTextbooks() async {
+    if (kEswStructureGuardTestMode) return;
+    try {
+      final index = await BuiltinTextbook.loadIndex();
+      if (index == null) return;
+      final paths = await BuiltinTextbook.ensureExtracted(
+        baseDir: p.join(_userDataDir, 'textbook'),
+        version: index.version,
+        books: index.books,
+      );
+      if (paths == null) return;
+      final files = <CorpusFile>[];
+      for (final book in index.books) {
+        final path = paths[book.id];
+        if (path == null) continue;
+        files.add(
+          CorpusFile(name: '${book.id}.txt', path: path, isBuiltin: true),
+        );
+      }
+      if (files.isEmpty) return;
+      _builtinTextbookIds = files.map((f) => f.name).toSet();
+      if (!mounted) {
+        _builtinTextbookFiles = files;
+        _rebuildTextbookList();
+        return;
+      }
+      setState(() {
+        _builtinTextbookFiles = files;
+        // 同名用户教材让位内置，避免同一本教材被计两次
+        _userTextbookFiles = _userTextbookFiles
+            .where((f) => !_builtinTextbookIds.contains(f.name))
+            .toList();
+        _rebuildTextbookList();
+      });
+    } catch (_) {}
+  }
+
+  /// 合并「内置教材 + 用户导入」为下游唯一的 _textbookFiles 视图。
+  /// 调用方需在 setState 内调用（构造期初始化除外）。
+  void _rebuildTextbookList() {
+    // 保持内置教材索引里的「八大版本」顺序，用户导入项按导入顺序排在后面。
+    _textbookFiles = <CorpusFile>[
+      ..._builtinTextbookFiles,
+      ..._userTextbookFiles,
+    ];
+  }
+
   void _applyCorpusFiles(List<CorpusFile> files) {
     if (files.isEmpty) return;
     files.sort((a, b) => a.name.compareTo(b.name));
@@ -2606,6 +2761,12 @@ class _MainWindowState extends State<MainWindow>
     final userFiles = _builtinHidden
         ? files
         : files.where((f) => !_builtinIds.contains(f.name)).toList();
+    // 单文件导入是增量行为：与已导入列表合并（按路径去重），不覆盖之前的导入。
+    final existingPaths = _userCorpusFiles.map((f) => f.path).toSet();
+    final mergedUser = <CorpusFile>[
+      ..._userCorpusFiles,
+      ...userFiles.where((f) => !existingPaths.contains(f.path)),
+    ]..sort((a, b) => a.name.compareTo(b.name));
     // 退出单词查询模式：若输入框仍为上次查询词则一并清空
     final queryText = _searchController.text.trim();
     if (_detectedWord.isNotEmpty &&
@@ -2613,12 +2774,13 @@ class _MainWindowState extends State<MainWindow>
       _searchController.clear();
     }
     setState(() {
-      _userCorpusFiles = userFiles;
+      _userCorpusFiles = mergedUser;
       // 导入真题后左栏切回真题栏
       _leftPanelIsTextbook = false;
       _rebuildCorpusList();
       // 导入真题后自动退出单词查询模式，切换/进入文档检测模式
       _detectedWord = '';
+      _detectedWordRaw = '';
       _activeFilter = '真题词';
       _detectedCategory = null;
       _wordPos = '';
@@ -2707,20 +2869,30 @@ class _MainWindowState extends State<MainWindow>
     /// [texts] 为可选增量同步源：仅当文件版本与 worker 不一致时才重发文本。
     /// worker 不可用（spawn 失败/超时/异常）时自动回退同步扫描，保证结果必出。
     Future<_ScanOut> scanOnWorker(
-      String keyword,
+      List<String> forms,
       List<_ScanTarget> targets,
       bool includeYears, {
       Map<String, ({String text, int version})>? texts,
+      String? phrase,
+      bool queryIsExactPhrase = false,
+      String? caseQuery,
+      Set<String> caseSensitiveKeys = const <String>{},
     }) async {
       _ScanOut fallbackSync() {
         final textsMap = <String, String>{};
-        final lowerMap = <String, String>{};
         texts?.forEach((path, tv) {
           textsMap[path] = tv.text;
-          lowerMap[path] = tv.text.toLowerCase();
         });
         return _scanCorpusWorker(
-            keyword, targets, includeYears, textsMap, lowerMap);
+          forms,
+          targets,
+          includeYears,
+          textsMap,
+          phrase: phrase,
+          queryIsExactPhrase: queryIsExactPhrase,
+          caseQuery: caseQuery,
+          caseSensitiveKeys: caseSensitiveKeys,
+        );
       }
 
       try {
@@ -2749,12 +2921,16 @@ class _MainWindowState extends State<MainWindow>
         _scanWorkerPort!.send({
           'type': 'scan',
           'reqId': reqId,
-          'keyword': keyword,
+          'forms': forms,
           'targets': [
             for (final t in targets)
               {'path': t.path, 'name': t.name},
           ],
           'includeYears': includeYears,
+          'phrase': phrase,
+          'queryIsExactPhrase': queryIsExactPhrase,
+          'caseQuery': caseQuery,
+          'caseSensitiveKeys': caseSensitiveKeys.toList(),
         });
         return await completer.future.timeout(
           const Duration(seconds: 20),
@@ -2781,12 +2957,25 @@ class _MainWindowState extends State<MainWindow>
       return;
     }
     final word = raw.toLowerCase();
+    // 短语与大小写口径（与导出共用 phrase_stats）：
+    //  - phraseTarget：查询是课标短语、或某短语首词时命中的短语；
+    //  - caseSensitiveKeys：March/march 等异义词，页面按原始大小写精确分计。
+    final phraseTable = buildStandardPhrases(_standardWords.keys);
+    final phraseTarget = phraseTargetFor(word, phraseTable);
+    final queryIsExactPhrase =
+        phraseTarget != null && foldToken(raw) == phraseTarget;
+    final caseSensitiveKeys = buildCaseVariantGroups(_standardWords.keys)
+        .keys
+        .toSet();
     // 立即反馈：同步清空上一单词的释义/结果区并标记"查询中…"，避免异步扫描期间
     // 旧结果残留，造成"点击没反应 / 显示的还是上一个单词释义"的错觉。
     // 扫描完成后的主 setState 会覆盖以下临时状态，不会与最终结果冲突。
     if (seq == _querySeq && mounted) {
       setState(() {
+        // 新查询：收起左栏残留的上一词原文页（Museum → positive 等）
+        if (!_inImportedMode) _collapseAllReaders();
         _detectedWord = word;
+        _detectedWordRaw = raw.trim();
         _activeFilter = '查询中…';
         _detectedCategory = null;
         _wordPos = '';
@@ -2809,10 +2998,12 @@ class _MainWindowState extends State<MainWindow>
     final standardKey = findWordEntryKey(_standardWords, raw);
     if (standardKey != null) {
       final swEntry = _standardWords[standardKey]!;
-      isStandard = true;
       cat = swEntry['category']!;
       pos = swEntry['pos']!;
       def = swEntry['def']!;
+      // 专有词仍从课标库取释义，但不计入课标词（查询页显示专有词、
+      // 不参与高频导出的课标词统计）
+      isStandard = cat != '专有词';
     } else if (isWordEntryHit(_standardWords, raw)) {
       // 连字符复合词：各部分均为课标词，整体按课标词处理（无单条级别/释义）
       isStandard = true;
@@ -2854,8 +3045,23 @@ class _MainWindowState extends State<MainWindow>
         textsToSync[e.$1.path] =
             (text: e.$2, version: cached?.modified ?? 0);
       }
-      final scanOut = await scanOnWorker(word, scanTargets, true,
-          texts: textsToSync);
+      // 词族：被查词 + 英美对应拼写 + 归属同一课标原词的拓展变形。
+      // 与高频导出共用 word_family，保证页面词频与导出表一致。
+      final familyBaseForQuery = _effectiveExtendBaseMap();
+      final familyForms = wordFamily(
+        word,
+        standardKeys: _standardWords.keys,
+        extendWords: <String>{..._extendWords, ...familyBaseForQuery.keys},
+        // 与导出共用同一张规范化映射（大小写重复键以小写键为准）
+        extBaseMap: familyBaseForQuery,
+        extensionAliases: _spellingExtensionAliases,
+      ).forms;
+      final scanOut = await scanOnWorker(familyForms, scanTargets, true,
+          texts: textsToSync,
+          phrase: phraseTarget,
+          queryIsExactPhrase: queryIsExactPhrase,
+          caseQuery: raw,
+          caseSensitiveKeys: caseSensitiveKeys);
       // 后台扫描期间用户可能已发起新查询，本次结果作废
       if (seq != _querySeq || !mounted) {
         _debugLog('[Detect] stale-return-after-scan seq=$seq cur=$_querySeq '
@@ -2906,8 +3112,20 @@ class _MainWindowState extends State<MainWindow>
           tbTextsToSync[e.$1.path] =
               (text: e.$2, version: cached?.modified ?? 0);
         }
-        final tbOut = await scanOnWorker(word, tbTargets, false,
-            texts: tbTextsToSync);
+        final tbBaseMap = _effectiveExtendBaseMap();
+        final familyForms = wordFamily(
+          word,
+          standardKeys: _standardWords.keys,
+          extendWords: <String>{..._extendWords, ...tbBaseMap.keys},
+          extBaseMap: tbBaseMap,
+          extensionAliases: _spellingExtensionAliases,
+        ).forms;
+        final tbOut = await scanOnWorker(familyForms, tbTargets, false,
+            texts: tbTextsToSync,
+            phrase: phraseTarget,
+            queryIsExactPhrase: queryIsExactPhrase,
+            caseQuery: raw,
+            caseSensitiveKeys: caseSensitiveKeys);
         // 后台扫描期间新查询已发起，本次结果作废
         if (seq != _querySeq || !mounted) return;
         for (final r in tbOut.rows) {
@@ -2934,8 +3152,10 @@ class _MainWindowState extends State<MainWindow>
     if (apostropheBaseInStandard(raw, isStandard)) {
       // 缩略/所有格按基形判定：基形在课标就归课标词（I've / He's）
       filter = '课标词';
-    } else if (isProperNounHit(properNounKeySet(_manualExtraWords), raw)) {
+    } else if (isProperNounHit(properNounKeySet(_manualExtraWords), raw) ||
+        _isBuiltinProperWord(raw)) {
       // 首字母大写 / 全大写写法优先命中专有词；小写写法留给用户确认
+      // （内置专有词中含小写文化专名如 hot pot，按精确词条命中）
       filter = '专有词';
     } else if (_manualChaoGangWords.any((e) => e.toLowerCase() == word)) {
       filter = '超标词';
@@ -2966,6 +3186,7 @@ class _MainWindowState extends State<MainWindow>
     setState(() {
       // 展示完整词元（haven't 不再回写成基形 have）
       _detectedWord = word;
+      _detectedWordRaw = raw.trim();
       _activeFilter = filter;
       _detectedCategory = isStandard && cat.isNotEmpty ? cat : null;
       _wordPos = pos;
@@ -3112,6 +3333,14 @@ class _MainWindowState extends State<MainWindow>
         ),
       );
 
+  /// 大小写异义词行的并列成员提示（只展示出现过的词库大写写法）。
+  String? _caseMemberNote(Iterable<String> members, Set<String>? observed) {
+    if (observed == null) return null;
+    final hit = members.where(observed.contains).toList();
+    if (hit.isEmpty) return null;
+    return '含 ${hit.join(' / ')}';
+  }
+
   Future<void> _analyzeImportedText() async {
     // 粘贴/输入文本同样走统一规范化（幂等，文件入口已规范化过）
     final text = normalizeText(_searchController.text.trim());
@@ -3129,17 +3358,17 @@ class _MainWindowState extends State<MainWindow>
       });
       return;
     }
-    // 提取单词（仅英文单词，至少 2 字符且非纯数字）并保留原始大小写。
-    // 统一走 shared/text_normalize 的 extractWordTokens：连字/变音/全角折叠 +
-    // 选项字母粘连剥离，与 Android 端和语料统计口径一致。
+    // 提取单词（与高频导出同一分词口径）：extractAnalysisTokens 负责连字/变音/
+    // 全角折叠、选项字母粘连剥离（itB → it）与单字母 a / I 的保留。
+    // 词条本身按词形分行（不复用高频导出的词族归并/排名口径）。
     final freqMap = <String, int>{};
-    final wordCaseMap = <String, String>{}; // 小写→原始大小写
-    for (final original in extractWordTokens(text)) {
-      final w = original.toLowerCase();
+    final wordCaseMap = <String, String>{}; // 统计键 → 首次出现的原始写法
+    final observedForms = <String, Set<String>>{}; // 统计键 → 出现过的全部写法
+    for (final original in extractAnalysisTokens(text)) {
+      final w = foldToken(original);
       freqMap[w] = (freqMap[w] ?? 0) + 1;
-      if (!wordCaseMap.containsKey(w)) {
-        wordCaseMap[w] = original;
-      }
+      wordCaseMap.putIfAbsent(w, () => original);
+      (observedForms[w] ??= <String>{}).add(original);
     }
     // 收集真题 + 教材语料中的所有单词；其中真题语料另统计真题词频（totalFreq）
     // 注意：真题词判定只看「真题语料」（_corpusFiles），教材语料不参与真题词判定，
@@ -3166,26 +3395,81 @@ class _MainWindowState extends State<MainWindow>
       final corpusText = fileTexts[i];
       if (corpusText == null) continue;
       final isCorpusText = corpusFilePaths.contains(selectedFiles[i].path);
-      for (final cw in extractWordTokens(corpusText)) {
-        final lw = cw.toLowerCase();
+      for (final cw in extractAnalysisTokens(corpusText)) {
+        final lw = foldToken(cw);
         if (isCorpusText) {
           corpusFreqMap[lw] = (corpusFreqMap[lw] ?? 0) + 1;
         }
       }
+    }
+    // 非句首大写专有词（Londoners 这类）：与高频导出共用同一判据
+    // （ProperNounStats）。课标库内的词条不受该判据影响（分类按词条判定）。
+    final properStats = ProperNounStats(standardWords: <String>{
+      for (final e in _standardWords.entries)
+        if (e.value['category'] != '专有词')
+          foldWordText(e.key).trim().toLowerCase(),
+    });
+    final sentenceRe = RegExp(r'[^.!?。！？]+[.!?。！？]');
+    for (final m in sentenceRe.allMatches(text)) {
+      var first = true;
+      for (final raw in extractAnalysisTokens(m.group(0)!)) {
+        properStats.addToken(raw, analysisWordKey(raw),
+            isFirstInSentence: first);
+        first = false;
+      }
+    }
+    final autoProper = properStats.excluded;
+    // 词族合并数（与导出同口径）：课标库 extensions + 用户拓展映射 + 英美拼写，
+    // 检测页同时展示「本词词频」与「词族合并数」两列。
+    final familyAliases = buildSpellingAliases(
+      _standardWords.keys,
+      extraVariants: _spellingExtensionAliases,
+    );
+    final familyBaseMap = _effectiveExtendBaseMap();
+    final familyRootOf = <String, String>{
+      for (final w in freqMap.keys)
+        w: familyRoot(w, familyAliases, familyBaseMap),
+    };
+    final familyFreqMap = <String, int>{};
+    for (final e in freqMap.entries) {
+      final root = familyRootOf[e.key]!;
+      familyFreqMap[root] = (familyFreqMap[root] ?? 0) + e.value;
     }
     // 词库索引：未筛选判定需要「四个词库全不收录」。
     // 手动词表与课标词库同口径：精确匹配优先，大写写法可回退到同名小写词条。
     final extendKeySet = _extendWords.toSet();
     final chaoGangKeySet = _manualChaoGangWords.toSet();
     final extraKeySet = properNounKeySet(_manualExtraWords);
+    final caseGroups = buildCaseVariantGroups(_standardWords.keys);
     final words = <_ImportedWord>[];
     for (final entry in freqMap.entries) {
-      final w = entry.key; // 小写
-      final original = wordCaseMap[w] ?? w; // 原始大小写
+      final w = entry.key; // 本词词形键（折叠小写，不并入同义词）
+      final original = wordCaseMap[w] ?? w; // 首次出现的原始写法
       final freq = entry.value;
+      // 展示层同义词别名：TV / TVs 显示为 television，但本词词频仍是自身次数
+      // （不并入 television 行，避免影响检测结果导出）。
+      final aliasTarget = builtinWordAliases[w];
+      final caseMembers = caseGroups[w];
+      // 行名固定用词库词条写法：大小写异义词取词库小写词条，
+      // 同义词别名取目标词条，其余取词库原写法；
+      // 未收录词才回退到文本里首次出现的写法。
+      final entryKey = findWordEntryKey(_standardWords, original);
+      final String display;
+      if (caseMembers != null) {
+        display = w;
+      } else if (aliasTarget != null) {
+        display = findWordEntryKey(_standardWords, aliasTarget) ?? aliasTarget;
+      } else {
+        display = entryKey ?? original;
+      }
+      // 分类按词条判定：大小写写法不再参与（March 不会再把 march 判成专有词）。
+      final classifyToken = caseMembers != null ? w : original;
+      final variantNote = caseMembers != null
+          ? _caseMemberNote(caseMembers, observedForms[w])
+          : (aliasTarget != null ? original : null);
       // 词形保留完整（couldn't / China's），查表按「完整词形 → 基形」回退，
       // 否则所有格与缩略形式会整段丢失词库分类。
-      final keys = wordLookupKeys(original);
+      final keys = wordLookupKeys(classifyToken);
       String? remembered;
       for (final key in keys) {
         final mem = _classificationMemory[key];
@@ -3196,28 +3480,32 @@ class _MainWindowState extends State<MainWindow>
       }
       // 真题词＝在真题语料中出现过（叠加口径，可与课标/拓展/超标/专有重合）
       final inCorpus = corpusFreqMap.containsKey(w);
-      final standardHit = isWordEntryHit(_standardWords, original);
+      final standardHit = isWordEntryHit(_standardWords, classifyToken);
       // 词库归属（互斥口径）：历史归类 > 大写写法的专有词 > 超标 > 拓展 > 课标；
       // 小写写法不自动归专有词，四库都不收录时进未筛选（语料出现过的同时进
       // 真题词叠加列，并在未筛选列等待用户手动归类）
       final cat = resolveFilterCategory(
         inCorpus: inCorpus,
         inStandard: standardHit,
-        inExtend: matchWordEntryKey(extendKeySet, original) != null,
-        inChaoGang: matchWordEntryKey(chaoGangKeySet, original) != null,
+        inExtend: matchWordEntryKey(extendKeySet, classifyToken) != null,
+        inChaoGang: matchWordEntryKey(chaoGangKeySet, classifyToken) != null,
         inProper: false,
-        preferProper: isProperNounHit(extraKeySet, original) &&
-            !apostropheBaseInStandard(original, standardHit),
-        apostropheBaseStandard: apostropheBaseInStandard(original, standardHit),
+        preferProper: (isProperNounHit(extraKeySet, classifyToken) &&
+                !apostropheBaseInStandard(classifyToken, standardHit)) ||
+            (!standardHit && autoProper.contains(w)),
+        apostropheBaseStandard:
+            apostropheBaseInStandard(classifyToken, standardHit),
         remembered: remembered,
       );
       words.add(
         _ImportedWord(
-          word: original,
+          word: display,
           category: cat,
           frequency: freq,
           isInCorpus: inCorpus,
           totalFreq: corpusFreqMap[w] ?? 0,
+          variantNote: variantNote,
+          familyFreq: familyFreqMap[familyRootOf[w]] ?? freq,
         ),
       );
     }
@@ -3302,7 +3590,7 @@ class _MainWindowState extends State<MainWindow>
                               ),
                             ),
                             const SizedBox(width: kGap8),
-                            GlassVersionBadge(version: 'v1.6.3'),
+                            GlassVersionBadge(version: 'v1.6.7'),
                           ],
                         ),
                       ),
@@ -3579,13 +3867,23 @@ class _MainWindowState extends State<MainWindow>
                 switch (item.kind) {
                   case 'focusHint':
                     return _buildTextbookFocusHint();
+                  case 'versionHeader':
+                    return _buildTextbookVersionHeader(item.file!);
+                  case 'unit':
+                    return _buildTextbookUnitRow(
+                      item.file!,
+                      item.index!,
+                      item.label ?? '',
+                    );
+                  case 'unitHint':
+                    return _buildTextbookUnitHint(item.label ?? '');
                   case 'reader':
                     return _buildCorpusReader(
                       item.file!,
                       itemHeight: focusReaderH,
                     );
                   default:
-                    return _buildTextbookFileRow(item.file!);
+                    return const SizedBox.shrink();
                 }
               },
             ),
@@ -3595,30 +3893,311 @@ class _MainWindowState extends State<MainWindow>
     );
   }
 
-  List<({String kind, CorpusFile? file})> _textbookDisplayItems() {
+  /// 教材按版本分组：8 个内置版本（+ 用户导入）各为一级，点击展开单元。
+  List<_LeftItem> _textbookDisplayItems() {
     final focus = _textbookFocusPath;
     final files = focus == null
         ? _textbookFiles
         : _textbookFiles.where((f) => f.path == focus).toList();
-    if (files.isEmpty) return const <({String kind, CorpusFile? file})>[];
-    return <({String kind, CorpusFile? file})>[
-      if (focus != null) (kind: 'focusHint', file: null),
-      for (final f in files) ...[
-        (kind: 'file', file: f),
-        if (_textbookReaderOpen.contains(f.path)) (kind: 'reader', file: f),
-      ],
+    if (files.isEmpty) return const <_LeftItem>[];
+    final items = <_LeftItem>[
+      if (focus != null) (kind: 'focusHint', file: null, label: null, index: null),
     ];
+    for (final f in files) {
+      items.add((
+        kind: 'versionHeader',
+        file: f,
+        label: f.name.replaceAll(RegExp(r'\.[^.]+$'), ''),
+        index: null,
+      ));
+      final expanded = _textbookExpandedVersions.contains(f.path);
+      if (expanded) {
+        final sections = f.sections;
+        if (sections == null || sections.isEmpty) {
+          items.add((
+            kind: 'unitHint',
+            file: f,
+            label: '未识别到单元（整本参与统计）',
+            index: null,
+          ));
+        } else {
+          for (var i = 0; i < sections.length; i++) {
+            items.add((
+              kind: 'unit',
+              file: f,
+              label: sections[i].title,
+              index: i,
+            ));
+          }
+        }
+      }
+      if (_textbookReaderOpen.contains(f.path)) {
+        items.add((kind: 'reader', file: f, label: null, index: null));
+      }
+    }
+    return items;
   }
 
-  double _textbookItemHeight(({String kind, CorpusFile? file}) item) {
+  double _textbookItemHeight(_LeftItem item) {
     switch (item.kind) {
       case 'focusHint':
         return GlassTheme.dp(24);
+      case 'versionHeader':
+        return GlassTheme.dp(_kCorpusGroupH);
+      case 'unit':
+        return GlassTheme.dp(_kCorpusUnitH);
+      case 'unitHint':
+        return GlassTheme.dp(_kCorpusHintH);
       case 'reader':
         return GlassTheme.dp(_kCorpusReaderH) + kGap6;
       default:
         return GlassTheme.dp(32);
     }
+  }
+
+  static final RegExp _unitHeadingRegex = RegExp(
+    r'^[ \t]*((?:选择性)?必修[一二三四五六七八九十0-9]+第[一二三四五六七八九十0-9]+单元)[ \t]*$',
+    multiLine: true,
+  );
+
+  /// 解析教材单元区间（含前置说明并入首单元），未识别到标题时返回空列表。
+  List<TextbookSection> _parseTextbookSections(String raw) {
+    final matches = _unitHeadingRegex.allMatches(raw).toList();
+    if (matches.isEmpty) return const <TextbookSection>[];
+    final result = <TextbookSection>[];
+    for (var i = 0; i < matches.length; i++) {
+      final start = i == 0 ? 0 : matches[i].start;
+      final end = i + 1 < matches.length ? matches[i + 1].start : raw.length;
+      result.add(TextbookSection(
+        title: matches[i].group(1)!,
+        start: start,
+        end: end,
+      ));
+    }
+    return result;
+  }
+
+  Future<void> _ensureTextbookSections(CorpusFile file) async {
+    if (file.sections != null) return;
+    String raw = '';
+    try {
+      raw = await _readRawFileText(file.path);
+    } catch (_) {}
+    file.sections = _parseTextbookSections(raw);
+  }
+
+  Future<void> _toggleTextbookVersion(CorpusFile file) async {
+    setState(() => _activeTextbookPath = file.path);
+    if (_textbookExpandedVersions.contains(file.path)) {
+      setState(() => _textbookExpandedVersions.remove(file.path));
+      return;
+    }
+    await _ensureTextbookSections(file);
+    if (!mounted) return;
+    setState(() => _textbookExpandedVersions.add(file.path));
+  }
+
+  /// 单元勾选变化后让过滤文本缓存 / worker 文本版本失效。
+  void _invalidateSectionFilter(CorpusFile file) {
+    _filteredTextCache.clear();
+    _workerTextVersions.remove(file.path);
+    // 原文面板内的文本是按旧选择裁剪过的，收起后下次展开重新读取
+    if (_textbookReaderOpen.contains(file.path)) {
+      _textbookReaderOpen.remove(file.path);
+      _corpusReaderControllers.remove(file.path)?.dispose();
+      _corpusReaderScrolls.remove(file.path)?.dispose();
+      _corpusReaderKeys.remove(file.path);
+      _corpusReaderAnchors.remove(file.path);
+      _corpusReaderTexts.remove(file.path);
+    }
+  }
+
+  /// 教材版本分组头：勾选整本 + 点击展开单元。
+  Widget _buildTextbookVersionHeader(CorpusFile file) {
+    final expanded = _textbookExpandedVersions.contains(file.path);
+    final total = file.sections?.length ?? 0;
+    final selected = file.selectedSectionCount;
+    final allSelected = file.allSectionsSelected;
+    final partial =
+        file.isSelected && total > 0 && file.excludedSections.isNotEmpty;
+    final label = file.name.replaceAll(RegExp(r'\.[^.]+$'), '');
+    final isActive = file.path == _activeTextbookPath;
+    final row = SizedBox(
+      height: GlassTheme.dp(_kCorpusGroupH),
+      child: Row(
+        children: [
+          _selectionBox(
+            checked: allSelected && (total == 0 || selected > 0),
+            partial: partial,
+            tooltip: allSelected ? '取消选择该教材' : '选择该教材全部单元',
+            onTap: () {
+              setState(() {
+                if (allSelected) {
+                  file.isSelected = false;
+                } else {
+                  file.isSelected = true;
+                  file.excludedSections.clear();
+                }
+                _invalidateSectionFilter(file);
+              });
+            },
+          ),
+          Expanded(
+            child: MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () => _toggleTextbookVersion(file),
+                child: Row(
+                  children: [
+                    Icon(
+                      expanded
+                          ? Icons.keyboard_arrow_down_rounded
+                          : Icons.keyboard_arrow_right_rounded,
+                      size: 16,
+                      color: GlassTheme.ink3,
+                    ),
+                    const SizedBox(width: kGap4),
+                    Expanded(
+                      child: Text(
+                        label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: GlassTheme.fMicro,
+                          fontWeight: FontWeight.w600,
+                          color: isActive
+                              ? GlassTheme.accentInk
+                              : (file.isSelected
+                                  ? GlassTheme.ink
+                                  : GlassTheme.ink3),
+                          height: 1,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: kGap6),
+                    Text(
+                      total > 0 ? '$selected/$total 单元' : (file.isSelected ? '已选' : '未选'),
+                      style: const TextStyle(
+                        fontSize: GlassTheme.fMicro,
+                        color: GlassTheme.ink3,
+                        height: 1,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          // 查看 / 收起本册教材原文（保留原有能力）
+          Tooltip(
+            message: _textbookReaderOpen.contains(file.path) ? '收起教材原文' : '查看教材原文',
+            child: MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: GlassPressable(
+                radius: 6,
+                hoverColor: GlassTheme.accentSoft,
+                pressColor: const Color(0x294462F2),
+                enabled: true,
+                child: InkWell(
+                  onTap: () => _toggleTextbookReader(file),
+                  borderRadius: BorderRadius.circular(6),
+                  child: SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: Icon(
+                      _textbookReaderOpen.contains(file.path)
+                          ? Icons.keyboard_arrow_up_rounded
+                          : Icons.keyboard_arrow_down_rounded,
+                      size: 15,
+                      color: GlassTheme.ink3,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (file.isBuiltin) return row;
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onSecondaryTapDown: (details) =>
+          _showTextbookFileContextMenu(details.globalPosition, file),
+      child: row,
+    );
+  }
+
+  Widget _buildTextbookUnitHint(String label) {
+    return SizedBox(
+      height: GlassTheme.dp(_kCorpusHintH),
+      child: Padding(
+        padding: const EdgeInsets.only(left: kGap20, right: kGap8),
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              fontSize: GlassTheme.fMicro,
+              color: GlassTheme.ink3,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 教材单元行：勾选决定该单元是否参与统计。
+  Widget _buildTextbookUnitRow(CorpusFile file, int index, String label) {
+    final checked = file.isSelected && !file.excludedSections.contains(index);
+    return SizedBox(
+      height: GlassTheme.dp(_kCorpusUnitH),
+      child: Row(
+        children: [
+          const SizedBox(width: kGap16),
+          _selectionBox(
+            checked: checked,
+            tooltip: checked ? '该单元不参与统计' : '该单元参与统计',
+            onTap: () {
+              setState(() {
+                final total = file.sections?.length ?? 0;
+                if (!file.isSelected) {
+                  // 整本未选时点某个单元：只选该单元
+                  file.excludedSections.clear();
+                  for (var j = 0; j < total; j++) {
+                    if (j != index) file.excludedSections.add(j);
+                  }
+                  file.isSelected = true;
+                } else if (file.excludedSections.contains(index)) {
+                  file.excludedSections.remove(index);
+                } else {
+                  file.excludedSections.add(index);
+                  if (total > 0 && file.excludedSections.length >= total) {
+                    file.isSelected = false;
+                  }
+                }
+                _invalidateSectionFilter(file);
+              });
+            },
+          ),
+          Expanded(
+            child: Text(
+              label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: GlassTheme.fSmall,
+                color: checked ? GlassTheme.ink2 : GlassTheme.ink3,
+                height: 1,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   /// 教材聚焦态提示条：只显示当前教材，可一键恢复完整列表。
@@ -3670,133 +4249,6 @@ class _MainWindowState extends State<MainWindow>
     );
   }
 
-  Widget _buildTextbookFileRow(CorpusFile file) {
-    // 第三关 ⑥：高亮行全栏唯一——教材导入组默认无高亮（透明底、hover 变灰），
-    // 点击后才产生高亮；勾选语义 isSelected 保持原功能
-    final selected =
-        file.path == _activePathOf(_textbookFiles, _activeTextbookPath);
-    final expanded = _textbookReaderOpen.contains(file.path);
-    final ext = _fileTypeLabel(file.name);
-    return GlassPressable(
-      radius: GlassTheme.rMd,
-      hoverColor: const Color(0x0A18181B),
-      pressColor: const Color(0x294462F2),
-      enabled: true,
-      child: InkWell(
-        onTap: () {
-          setState(() {
-            file.isSelected = !file.isSelected;
-            // 原功能：多选参与统计（只改视觉，不动交互）
-            _activeTextbookPath = file.path; // 第三关 ⑥：高亮行唯一
-          });
-        },
-        borderRadius: BorderRadius.circular(GlassTheme.rMd),
-        child: Container(
-          height: 32,
-          padding: const EdgeInsets.only(right: kGap8),
-          // 第三轮清单第 2 项：选中态 = 淡蓝底 rgba(68,98,242,.12) + 左侧 2.5px 蓝竖条
-          //（竖条上下各内缩 6，圆角 2）+ 深蓝字，行高仍 32、不整行填主色
-          decoration: BoxDecoration(
-            color: selected ? const Color(0x1F4462F2) : null,
-            borderRadius: BorderRadius.circular(GlassTheme.rMd),
-          ),
-          child: Row(
-            children: [
-              // 左侧 2.5px 蓝色竖条（骨架 FileItem: Positioned(left:0, top:6, bottom:6, width:2.5)）
-              SizedBox(
-                width: kGap8,
-                child: selected
-                    ? Align(
-                        alignment: Alignment.centerLeft,
-                        child: Container(
-                          width: 2.5,
-                          height: 20,
-                          decoration: BoxDecoration(
-                            color: GlassTheme.accent,
-                            borderRadius: BorderRadius.circular(2),
-                          ),
-                        ),
-                      )
-                    : null,
-              ),
-              GlassFileTypeTag(label: ext, selected: selected),
-              const SizedBox(width: kGap8),
-              Expanded(
-                child: Text(
-                  file.name,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    fontSize: GlassTheme.fBody,
-                    color: selected
-                        ? GlassTheme.accentInk
-                        : const Color(0xFF52525B),
-                    fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
-                    height: 1,
-                  ),
-                ),
-              ),
-              const SizedBox(width: kGap4),
-              // 行尾展开按钮：行下内联展示教材原文
-              Tooltip(
-                message: expanded ? '收起教材原文' : '查看教材原文',
-                child: MouseRegion(
-                  cursor: SystemMouseCursors.click,
-                  child: GlassPressable(
-                    radius: 6,
-                    hoverColor: GlassTheme.accentSoft,
-                    pressColor: const Color(0x294462F2),
-                    enabled: true,
-                    child: InkWell(
-                      onTap: () => _toggleTextbookReader(file),
-                      borderRadius: BorderRadius.circular(6),
-                      child: SizedBox(
-                        width: 20,
-                        height: 20,
-                        child: Icon(
-                          expanded
-                              ? Icons.keyboard_arrow_up_rounded
-                              : Icons.keyboard_arrow_down_rounded,
-                          size: 16,
-                          color:
-                              selected ? GlassTheme.accentInk : GlassTheme.ink3,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 2),
-              GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: _showTextbookImportMenu,
-                child: GlassPressable(
-                  radius: 6,
-                  hoverColor: GlassTheme.accentSoft,
-                  pressColor: const Color(0x294462F2),
-                  enabled: true,
-                  child: Container(
-                    width: 20,
-                    height: 20,
-                    decoration: BoxDecoration(
-                      color: const Color(0x1218181B),
-                      borderRadius: BorderRadius.circular(6),
-                    ),
-                    child: const Icon(
-                      Icons.add_rounded,
-                      size: 14,
-                      color: GlassTheme.ink2,
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
   Future<void> _toggleTextbookReader(CorpusFile file) async {
     if (_textbookFocusPath != null) {
       setState(() => _textbookFocusPath = null);
@@ -3815,6 +4267,28 @@ class _MainWindowState extends State<MainWindow>
     _corpusReaderKeys.remove(path);
     _corpusReaderAnchors.remove(path);
     _corpusReaderTexts.remove(path);
+  }
+
+  /// 收起左栏所有已展开的真题/教材原文（不触发 setState，供查询开始时在
+  /// setState 内调用）。
+  ///
+  /// 新查询必须清掉上一次查询展开的原文页，否则左栏会停留在上一个被查词
+  /// （如 Museum）打开的真题页面，看起来像"搜索没生效"。
+  void _collapseAllReaders() {
+    final paths = <String>{..._corpusReaderOpen, ..._textbookReaderOpen};
+    _corpusReaderOpen.clear();
+    _textbookReaderOpen.clear();
+    for (final p in paths) {
+      _corpusReaderControllers.remove(p)?.dispose();
+      _corpusReaderScrolls.remove(p)?.dispose();
+      _corpusReaderKeys.remove(p);
+      _corpusReaderAnchors.remove(p);
+      _corpusReaderTexts.remove(p);
+    }
+    _activeCorpusPath = null;
+    _corpusFocusPath = null;
+    _textbookFocusPath = null;
+    _leftPanelIsTextbook = false;
   }
 
   /// 展开教材并（可选）定位到关键词；[focusOnly] 时教材栏只显示这一本。
@@ -3839,6 +4313,8 @@ class _MainWindowState extends State<MainWindow>
       _leftPanelIsTextbook = true;
       _activeTextbookPath = path;
       _textbookFocusPath = focusOnly ? path : null;
+      // 定位某本教材时确保其版本分组已展开
+      _textbookExpandedVersions.add(path);
       if (collapseOthers) {
         _textbookReaderOpen
           ..clear()
@@ -3881,9 +4357,9 @@ class _MainWindowState extends State<MainWindow>
       if (!mounted || !_textbookListScrollController.hasClients) return;
       final items = _textbookDisplayItems();
       double off = kGap8;
-      double targetH = GlassTheme.dp(32);
+      double targetH = GlassTheme.dp(_kCorpusGroupH);
       for (final it in items) {
-        if (it.kind == 'file' && it.file?.path == path) {
+        if (it.kind == 'versionHeader' && it.file?.path == path) {
           targetH = _textbookItemHeight(it);
           break;
         }
@@ -4043,7 +4519,7 @@ class _MainWindowState extends State<MainWindow>
                     ),
                   ),
                 ),
-                  // 第三轮清单第 5 项：左侧 16px 放大镜（距左 12）→ 占位文字左对齐（图标后 8px）
+                  // 左侧放大镜（距左 12），占位提示整体居中显示
                   Positioned(
                     left: 12,
                     top: 0,
@@ -4058,9 +4534,10 @@ class _MainWindowState extends State<MainWindow>
                       ),
                     ),
                   ),
+                  // 占位提示：整条居中显示（用户要求），提示按 Enter 开始检测
                   Positioned(
-                    left: 36,
-                    right: 78,
+                    left: 0,
+                    right: 0,
                     top: 0,
                     bottom: 0,
                     child: IgnorePointer(
@@ -4071,9 +4548,9 @@ class _MainWindowState extends State<MainWindow>
                             : 0.0,
                         duration: const Duration(milliseconds: 150),
                         child: const Align(
-                          alignment: Alignment.centerLeft,
+                          alignment: Alignment.center,
                           child: Text(
-                            '输入单词或粘贴文本进行检测',
+                            '输入单词或文本按Enter键开始检测!',
                             style: TextStyle(
                               fontSize: 14,
                               color: GlassTheme.ink3,
@@ -4193,7 +4670,7 @@ class _MainWindowState extends State<MainWindow>
             _buildSearchRow(historyMaxHeight: historyMaxHeight),
             Expanded(
               child: _inImportedMode
-                  ? _buildImportedTextPanel()
+                  ? (_reportVisible ? _buildVocabReportView() : _buildImportedTextPanel())
                   : LayoutBuilder(
                       builder: (context, constraints) {
                         // 自适应分配：年份面板常态保持设计高度，窗口变矮时按可用
@@ -4593,144 +5070,198 @@ class _MainWindowState extends State<MainWindow>
     );
   }
 
-  /// 工具栏右侧按钮：始终显示"导出结果"
-  Widget _buildToolbarRightButton() {
-    return GlassGradientButton(
-      label: '导出结果',
-      icon: Icons.arrow_downward,
-      onPressed: _exportResultToWord,
-      height: GlassTheme.hSearchBtn,
-    );
-  }
-
-  /// 导出检测结果前的「单词标注方案」选择弹窗（返回 null 表示用户取消）。
+  /// 工具栏右侧按钮：检测结果模式下「查看报告」+「导出结果」，否则仅「导出结果」。
   ///
-  /// 沿用「选择导出格式」同一套玻璃弹窗骨架与紧凑选项块，不新增并行入口：
-  /// - 方案一：按单词类型标不同颜色（既有导出）；
-  /// - 方案二：按单词类型用字体与格式区分（Times New Roman / 下划线 /
-  ///   波浪下划线 / 加粗），一眼可分辨类型。
-  Future<ExportAnnotateScheme?> _promptAnnotateScheme() {
-    return showDialog<ExportAnnotateScheme>(
-      context: context,
-      builder: (dctx) {
-        var picked = ExportAnnotateScheme.color;
-        return _glassDialog(
-          StatefulBuilder(
-            builder: (ctx, setDialogState) => EswDialogShell(
-              title: '选择单词标注方案',
-              subtitle: '导出时按所选方案标注原文中的单词：',
-              icon: Icons.text_fields,
-              minContent: 340,
-              body: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  EswOptionRow(
-                    children: [
-                      EswOptionTile(
-                        label: '方案一',
-                        desc: '不同颜色',
-                        selected: picked == ExportAnnotateScheme.color,
-                        onTap: () => setDialogState(
-                          () => picked = ExportAnnotateScheme.color,
-                        ),
-                      ),
-                      EswOptionTile(
-                        label: '方案二',
-                        desc: '字体与格式',
-                        selected: picked == ExportAnnotateScheme.typography,
-                        onTap: () => setDialogState(
-                          () => picked = ExportAnnotateScheme.typography,
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: kGap8),
-                  EswDialogHint(
-                    picked == ExportAnnotateScheme.color
-                        ? '方案一：按类型着色——初中课标词黑色、必修课标词深蓝、'
-                            '选修课标词浅蓝、拓展词深绿、超标词红色、专有词紫色，'
-                            '不加粗。'
-                        : '方案二（黑白打印）：课标词默认不标注；拓展词 加粗；'
-                            '超标词 单线下划线；专有词 30% 灰底纹；'
-                            '全文西文统一 Times New Roman。',
-                    icon: Icons.info_outline,
-                  ),
-                ],
-              ),
-              actions: EswDialogActions(
-                children: [
-                  EswDialogTextAction(
-                    label: '取消',
-                    onPressed: () => Navigator.pop(dctx),
-                  ),
-                  EswDialogPrimaryAction(
-                    label: '下一步',
-                    onPressed: () => Navigator.pop(dctx, picked),
-                  ),
-                ],
-              ),
+  /// 「查看报告」原为结果面板顶部一行说明 + 文字按钮，与搜索框、导出按钮挤在
+  /// 同一窄条里显得杂乱；现收进工具栏，与导出按钮并列，面板直接进入筛选与列表。
+  Widget _buildToolbarRightButton() {
+    final showReportEntry =
+        _inImportedMode && _importedWords.isNotEmpty && !_reportVisible;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (showReportEntry) ...[
+          OutlinedButton.icon(
+            onPressed: _importedReportLoading ? null : _openImportedReport,
+            icon: _importedReportLoading
+                ? const SizedBox(
+                    width: 13,
+                    height: 13,
+                    child: CircularProgressIndicator(strokeWidth: 1.6),
+                  )
+                : const Icon(Icons.description_outlined, size: 15),
+            label: Text(
+              _importedReportLoading ? '生成中…' : '查看报告',
+              style: const TextStyle(fontSize: 11),
+            ),
+            style: OutlinedButton.styleFrom(
+              minimumSize: Size(0, GlassTheme.hSearchBtn),
+              padding: const EdgeInsets.symmetric(horizontal: kGap12),
             ),
           ),
-        );
-      },
+          const SizedBox(width: kGap8),
+        ],
+        GlassGradientButton(
+          label: '导出结果',
+          icon: Icons.arrow_downward,
+          onPressed: _exportResultToWord,
+          height: GlassTheme.hSearchBtn,
+        ),
+      ],
     );
   }
 
-  /// 导出格式选择（docx / pdf）。返回 null 表示用户取消。
+  /// 导出检测结果：单弹窗合并「打印方案」与「导出报告」两个入口。
   ///
-  /// 先定格式再打保存对话框：保存框里只保留所选类型，建议文件名后缀与格式
-  /// 始终一致，避免原生对话框切换类型时文件名后缀不跟随的问题。
-  Future<String?> _promptExportFormat() {
-    return showDialog<String>(
+  /// 用户选择「打印方案」时在同一弹窗内勾选方案一/方案二 + 打印格式，
+  /// 确定即导出标注原文；选择「导出报告」时选 HTML 或 Word，确定即导出报告。
+  /// 返回 null 表示取消；kind == 'print' 时 scheme 与 format(docx/pdf) 有效，
+  /// kind == 'report' 时 format 为 html/docx。
+  Future<({String kind, ExportAnnotateScheme? scheme, String format})?>
+      _promptExportOptions() {
+    return showDialog<({String kind, ExportAnnotateScheme? scheme, String format})>(
       context: context,
       builder: (dctx) {
-        var picked = 'docx';
+        var kind = 'print';
+        var scheme = ExportAnnotateScheme.color;
+        var printFormat = 'docx';
+        var reportFormat = 'html';
         return _glassDialog(
           StatefulBuilder(
-            builder: (ctx, setDialogState) => EswDialogShell(
-              title: '选择导出格式',
-              subtitle: 'Word 可保留原文档排版；PDF 适合直接打印或分享。',
-              icon: Icons.save_alt_rounded,
-              minContent: 340,
-              body: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  EswOptionRow(
-                    children: [
-                      EswOptionTile(
-                        label: 'Word 文档',
-                        desc: '*.docx',
-                        selected: picked == 'docx',
-                        onTap: () => setDialogState(() => picked = 'docx'),
+            builder: (ctx, setDialogState) {
+              final isPrint = kind == 'print';
+              return EswDialogShell(
+                title: '导出检测结果',
+                subtitle: '选择要导出的内容：标注原文（打印方案）或词汇检测报告。',
+                icon: Icons.ios_share_rounded,
+                minContent: 420,
+                body: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    EswOptionRow(
+                      children: [
+                        EswOptionTile(
+                          label: '打印方案',
+                          desc: '标注原文 · Word/PDF',
+                          selected: isPrint,
+                          onTap: () =>
+                              setDialogState(() => kind = 'print'),
+                        ),
+                        EswOptionTile(
+                          label: '导出报告',
+                          desc: '词汇检测报告 · HTML/Word',
+                          selected: !isPrint,
+                          onTap: () =>
+                              setDialogState(() => kind = 'report'),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: kGap8),
+                    if (isPrint) ...[
+                      EswOptionRow(
+                        children: [
+                          EswOptionTile(
+                            label: '方案一',
+                            desc: '不同颜色',
+                            selected: scheme == ExportAnnotateScheme.color,
+                            onTap: () => setDialogState(
+                              () => scheme = ExportAnnotateScheme.color,
+                            ),
+                          ),
+                          EswOptionTile(
+                            label: '方案二',
+                            desc: '字体与格式',
+                            selected: scheme == ExportAnnotateScheme.typography,
+                            onTap: () => setDialogState(
+                              () => scheme = ExportAnnotateScheme.typography,
+                            ),
+                          ),
+                        ],
                       ),
-                      EswOptionTile(
-                        label: 'PDF 文档',
-                        desc: '*.pdf',
-                        selected: picked == 'pdf',
-                        onTap: () => setDialogState(() => picked = 'pdf'),
+                      const SizedBox(height: kGap6),
+                      EswDialogHint(
+                        scheme == ExportAnnotateScheme.color
+                            ? '方案一：按类型着色——初中课标词黑色、必修课标词深蓝、'
+                                '选修课标词浅蓝、拓展词深绿、超标词红色、专有词紫色，'
+                                '不加粗。'
+                            : '方案二（黑白打印）：课标词默认不标注；拓展词 加粗；'
+                                '超标词 单线下划线；专有词 30% 灰底纹；'
+                                '全文西文统一 Times New Roman。',
+                        icon: Icons.info_outline,
+                      ),
+                      const SizedBox(height: kGap8),
+                      EswOptionRow(
+                        children: [
+                          EswOptionTile(
+                            label: 'Word 文档',
+                            desc: '*.docx',
+                            selected: printFormat == 'docx',
+                            onTap: () =>
+                                setDialogState(() => printFormat = 'docx'),
+                          ),
+                          EswOptionTile(
+                            label: 'PDF 文档',
+                            desc: '*.pdf',
+                            selected: printFormat == 'pdf',
+                            onTap: () =>
+                                setDialogState(() => printFormat = 'pdf'),
+                          ),
+                        ],
+                      ),
+                    ] else ...[
+                      EswOptionRow(
+                        children: [
+                          EswOptionTile(
+                            label: 'HTML 网页',
+                            desc: '*.html',
+                            selected: reportFormat == 'html',
+                            onTap: () =>
+                                setDialogState(() => reportFormat = 'html'),
+                          ),
+                          EswOptionTile(
+                            label: 'Word 文档',
+                            desc: '*.docx',
+                            selected: reportFormat == 'docx',
+                            onTap: () =>
+                                setDialogState(() => reportFormat = 'docx'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: kGap6),
+                      const EswDialogHint(
+                        'HTML 可直接在浏览器打开或打印；Word 便于继续编辑与二次排版。',
+                        icon: Icons.info_outline,
                       ),
                     ],
-                  ),
-                  const SizedBox(height: kGap8),
-                  const EswDialogHint(
-                    '选择后进入保存对话框，文件名后缀会与所选格式保持一致。',
-                    icon: Icons.info_outline,
-                  ),
-                ],
-              ),
-              actions: EswDialogActions(
-                children: [
-                  EswDialogTextAction(
-                    label: '取消',
-                    onPressed: () => Navigator.pop(dctx),
-                  ),
-                  EswDialogPrimaryAction(
-                    label: '下一步',
-                    onPressed: () => Navigator.pop(dctx, picked),
-                  ),
-                ],
-              ),
-            ),
+                  ],
+                ),
+                actions: EswDialogActions(
+                  children: [
+                    EswDialogTextAction(
+                      label: '取消',
+                      onPressed: () => Navigator.pop(dctx),
+                    ),
+                    EswDialogPrimaryAction(
+                      label: '确定',
+                      onPressed: () => Navigator.pop(
+                        dctx,
+                        isPrint
+                            ? (
+                                kind: 'print',
+                                scheme: scheme,
+                                format: printFormat,
+                              )
+                            : (
+                                kind: 'report',
+                                scheme: null,
+                                format: reportFormat,
+                              ),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            },
           ),
         );
       },
@@ -4803,50 +5334,56 @@ class _MainWindowState extends State<MainWindow>
       final proceed = await _promptUnfilteredBeforeExport(unfilteredCount);
       if (!proceed || !mounted) return;
     }
-    // 单词标注方案：导出前弹窗让用户二选一（方案一配色 / 方案二字体格式）。
-    // 复用「选择导出格式」同一套弹窗骨架与选项块（EswDialogShell + EswOptionRow），
-    // 不另设并行入口；用户取消则不导出。
+    // 导出选项：单弹窗选择「打印方案」（方案一/二 + 打印格式）或「导出报告」
+    // （HTML / Word），确定后直接进入对应导出，不再分两步弹窗。
     final autoScheme = Platform.environment['ESW_AUTO_ANNOTATE'];
-    final autoOut = Platform.environment['ESW_AUTO_OUT'];
-    ExportAnnotateScheme? scheme;
-    if (autoScheme == 'color') {
-      scheme = ExportAnnotateScheme.color;
-    } else if (autoScheme == 'typography') {
-      scheme = ExportAnnotateScheme.typography;
-    } else if (autoOut != null && autoOut.isNotEmpty) {
-      // 自动化取证（ESW_AUTO_OUT 已指定输出路径）沿用既有方案一，不弹窗阻塞。
-      scheme = ExportAnnotateScheme.color;
-    } else {
-      scheme = await _promptAnnotateScheme();
-    }
-    if (scheme == null || !mounted) return;
-    // 先选格式再保存：保存对话框只列所选类型，建议文件名后缀与格式一致，
-    // 从根上避免「选了 PDF 但文件名仍是 .docx」的问题。
-    // 自动化取证钩子：ESW_AUTO_OUT 指定输出路径时跳过两个选择弹窗。
     final autoOutPath = Platform.environment['ESW_AUTO_OUT'];
+    final autoOutSet = autoOutPath != null && autoOutPath.isNotEmpty;
+    ExportAnnotateScheme scheme;
     String chosenExt;
-    if (autoOutPath != null && autoOutPath.isNotEmpty) {
+    if (autoOutSet) {
+      // 自动化取证钩子：ESW_AUTO_OUT 指定输出路径时跳过选择弹窗。
+      scheme = autoScheme == 'typography'
+          ? ExportAnnotateScheme.typography
+          : ExportAnnotateScheme.color;
       chosenExt =
           p.extension(autoOutPath).toLowerCase() == '.pdf' ? 'pdf' : 'docx';
+    } else if (autoScheme == 'color' || autoScheme == 'typography') {
+      scheme = autoScheme == 'color'
+          ? ExportAnnotateScheme.color
+          : ExportAnnotateScheme.typography;
+      chosenExt = 'docx';
     } else {
-      final picked = await _promptExportFormat();
-      if (picked == null || !mounted) return;
-      chosenExt = picked;
+      final choice = await _promptExportOptions();
+      if (choice == null || !mounted) return;
+      if (choice.kind == 'report') {
+        await _exportImportedReport(format: choice.format);
+        return;
+      }
+      scheme = choice.scheme ?? ExportAnnotateScheme.color;
+      chosenExt = choice.format;
     }
+    // 先选格式再保存：保存对话框只列所选类型，建议文件名后缀与格式一致，
+    // 从根上避免「选了 PDF 但文件名仍是 .docx」的问题。
     String? outPath;
-    if (autoOutPath != null && autoOutPath.isNotEmpty) {
+    if (autoOutSet) {
       outPath = autoOutPath;
     } else {
       try {
-        String baseName = 'ESW_分析结果';
+        // 文件名：ESW + 原文件名 + 标注方案（彩色打印 / 格式打印），便于区分两种标注
+        String baseName = '文本检测';
         if (_importedFileName != null && _importedFileName!.isNotEmpty) {
           final dotIdx = _importedFileName!.lastIndexOf('.');
           baseName = dotIdx > 0
               ? _importedFileName!.substring(0, dotIdx)
               : _importedFileName!;
         }
+        baseName = baseName.replaceAll(RegExp(r'[\\/:*?"<>|]'), '').trim();
+        if (baseName.isEmpty) baseName = '文本检测';
+        final schemeLabel =
+            scheme == ExportAnnotateScheme.color ? '彩色打印' : '格式打印';
         final fs.FileSaveLocation? result = await fs.getSaveLocation(
-          suggestedName: '$baseName课标词检测.$chosenExt',
+          suggestedName: 'ESW$baseName$schemeLabel.$chosenExt',
           acceptedTypeGroups: [
             if (chosenExt == 'pdf')
               const fs.XTypeGroup(
@@ -4910,6 +5447,9 @@ class _MainWindowState extends State<MainWindow>
       final wordCatMap = <String, String>{};
       for (final iw in _importedWords) {
         final lower = iw.word.toLowerCase();
+        // 单字母（a / I）不参与标注高亮：词频统计照旧，只在标注层跳过，
+        // 避免整篇文档满屏单字标记。
+        if (lower.length == 1) continue;
         var level = '';
         if (iw.category == '课标词') {
           final key = findWordEntryKey(_standardWords, iw.word);
@@ -6369,6 +6909,8 @@ try {
           frequency: iw.frequency,
           isInCorpus: iw.isInCorpus,
           totalFreq: iw.totalFreq,
+          variantNote: iw.variantNote,
+          familyFreq: iw.familyFreq,
         );
         oldCounts[newCat] = (oldCounts[newCat] ?? 0) + 1;
       }
@@ -6390,6 +6932,7 @@ try {
         ..addAll(oldCounts);
       // 清除单次查词结果
       _detectedWord = '';
+      _detectedWordRaw = '';
       _results.clear();
       _yearFrequency.clear();
       _selectedYear = null;
@@ -6417,6 +6960,8 @@ try {
           frequency: old.frequency,
           isInCorpus: old.isInCorpus,
           totalFreq: old.totalFreq,
+          variantNote: old.variantNote,
+          familyFreq: old.familyFreq,
         );
         changed = true;
       }
@@ -6443,11 +6988,245 @@ try {
   Widget _buildImportedTextPanel() {
     return Column(
       children: [
+        // 报告入口已收进工具栏，面板不再占用一行说明
         _buildImportedFilterChips(),
         Container(height: 1, color: GlassTheme.line),
         Expanded(child: RepaintBoundary(child: _buildImportedWordList())),
       ],
     );
+  }
+
+  // ---------- 检测报告：生成 / 展示 / 导出 ----------
+
+  /// 报告可见性：必须属于当前这份导入分析结果（重新导入后旧报告自动失效）。
+  bool get _reportVisible =>
+      _showImportedReport &&
+      _importedWords.isNotEmpty &&
+      identical(_importedReportWordsRef, _importedWords);
+
+  Widget _buildVocabReportView() {
+    final data = _importedReport;
+    if (data == null) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(
+              width: 22,
+              height: 22,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+            const SizedBox(height: kGap12),
+            Text(
+              _importedReportLoading ? '正在生成检测报告…' : '报告数据不可用',
+              style: const TextStyle(fontSize: 12, color: GlassTheme.ink2),
+            ),
+          ],
+        ),
+      );
+    }
+    return VocabReportPage(
+      data: data,
+      onBack: () => setState(() => _showImportedReport = false),
+      onExport: _exportImportedReport,
+      onOpenWord: (word) {
+        for (final iw in _importedWords) {
+          if (iw.word == word) {
+            _openImportedWord(iw);
+            return;
+          }
+        }
+      },
+    );
+  }
+
+  static String _two(int v) => v < 10 ? '0$v' : '$v';
+
+  /// 生成报告：词汇分类/频次来自本次导入分析，年份分布、教材覆盖与例句
+  /// 由 shared/vocab_report.dart 在后台 isolate 用与导出一致的口径计算。
+  Future<void> _openImportedReport() async {
+    await _generateImportedReport(showReport: true);
+  }
+
+  /// 生成报告数据（[showReport] 决定是否切到报告页），返回是否成功。
+  /// 导出报告时可只取数据不切页，避免「导出报告」顺带改变当前视图。
+  Future<bool> _generateImportedReport({required bool showReport}) async {
+    if (_importedWords.isEmpty) return false;
+    final liveWords = _importedWords;
+    setState(() {
+      _showImportedReport = showReport;
+      _importedReport = null;
+      _importedReportLoading = true;
+      _importedReportWordsRef = liveWords;
+    });
+    try {
+      final corpusDocs = <Map<String, dynamic>>[];
+      final years = <int>{};
+      final corpusFiles = _corpusFiles.where((f) => f.isSelected).toList();
+      for (final cf in corpusFiles) {
+        String text;
+        try {
+          text = await _readFileTextCached(cf.path);
+        } catch (_) {
+          continue;
+        }
+        final ym = _yearPrefixRegex.firstMatch(cf.name);
+        final year = ym == null ? 0 : int.tryParse(ym.group(1)!) ?? 0;
+        if (year > 0) years.add(year);
+        var name = p.basenameWithoutExtension(cf.name);
+        name = name.replaceFirst(RegExp(r'^\d{4}\s*[-_· ]*'), '').trim();
+        final source = year <= 0
+            ? (name.isEmpty ? cf.name : name)
+            : (name.isEmpty ? '$year' : '$year · $name');
+        corpusDocs.add({'text': text, 'year': year, 'source': source});
+      }
+      // 教材按版本名聚合（同名版本只出一个方点，文本合并计数）。
+      final tbIndex = <String, int>{};
+      final textbookDocs = <Map<String, dynamic>>[];
+      for (final tf in _textbookFiles.where((f) => f.isSelected)) {
+        String text;
+        try {
+          text = await _readFileTextCached(tf.path);
+        } catch (_) {
+          continue;
+        }
+        var name = p.basenameWithoutExtension(tf.name);
+        name = name.replaceAll('（内置）', '').trim();
+        if (name.isEmpty) name = tf.name;
+        final i = tbIndex[name];
+        if (i == null) {
+          tbIndex[name] = textbookDocs.length;
+          textbookDocs.add({'text': text, 'source': name});
+        } else {
+          textbookDocs[i]['text'] = '${textbookDocs[i]['text']}\n$text';
+        }
+      }
+      final textbookNames = textbookDocs
+          .map((e) => '${e['source']}')
+          .toList(growable: false);
+      final words = <Map<String, dynamic>>[];
+      for (final iw in liveWords) {
+        var level = '';
+        var base = '';
+        if (iw.category == '课标词') {
+          final key = findWordEntryKey(_standardWords, iw.word);
+          level = key == null ? '' : (_standardWords[key]?['category'] ?? '');
+        } else if (iw.category == '拓展词') {
+          base = _baseWordOf(iw.word);
+        }
+        words.add({
+          'word': iw.word,
+          'category': iw.category,
+          'textFreq': iw.frequency,
+          'corpusFreq': iw.totalFreq,
+          'familyFreq': iw.familyFreq ?? iw.frequency,
+          'level': level,
+          'base': base,
+        });
+      }
+      final stdFolded = [
+        for (final k in _standardWords.keys)
+          foldWordText(k).trim().toLowerCase()
+      ];
+      final now = DateTime.now();
+      var fileName = '粘贴文本';
+      if (_importedFileName != null && _importedFileName!.isNotEmpty) {
+        fileName = p.basenameWithoutExtension(_importedFileName!);
+      }
+      final data = await buildVocabReport({
+        'fileName': fileName,
+        'text': _searchController.text,
+        'generatedAt': '${now.year}-${_two(now.month)}-${_two(now.day)} '
+            '${_two(now.hour)}:${_two(now.minute)}',
+        'corpusFileCount': corpusFiles.length,
+        'textbookNames': textbookNames,
+        'standardFolded': stdFolded,
+        'words': words,
+        'corpus': corpusDocs,
+        'textbooks': textbookDocs,
+        'years': (years.toList()..sort()),
+      });
+      if (!mounted) return false;
+      setState(() {
+        _importedReport = data;
+        _importedReportLoading = false;
+      });
+      return true;
+    } catch (e, st) {
+      debugPrint('[VocabReport] error: $e\n$st');
+      if (!mounted) return false;
+      setState(() {
+        _showImportedReport = false;
+        _importedReportLoading = false;
+        _importedReport = null;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('生成检测报告失败：$e')),
+      );
+      return false;
+    }
+  }
+
+  /// 导出报告：支持 HTML（自包含网页）与 Word(docx)。
+  ///
+  /// 报告页与「导出检测结果 → 导出报告」共用本方法；数据缺失时先按同一
+  /// 口径生成，保证导出内容与页面一致（不产生第二套数字）。
+  Future<void> _exportImportedReport({String format = 'html'}) async {
+    if (_importedReport == null) {
+      final ok = await _generateImportedReport(showReport: _showImportedReport);
+      if (!ok) return;
+    }
+    final data = _importedReport;
+    if (data == null) return;
+    final wantDocx = format == 'docx';
+    try {
+      var baseName = data.fileName.replaceAll(RegExp(r'[\\/:*?"<>|]'), '').trim();
+      if (baseName.isEmpty) baseName = '文本';
+      final result = await fs.getSaveLocation(
+        suggestedName:
+            'ESW$baseName词汇检测报告${wantDocx ? '.docx' : '.html'}',
+        acceptedTypeGroups: wantDocx
+            ? const [
+                fs.XTypeGroup(
+                  label: 'Word 报告 (*.docx)',
+                  extensions: ['docx'],
+                ),
+              ]
+            : const [
+                fs.XTypeGroup(label: 'HTML 报告 (*.html)', extensions: ['html']),
+              ],
+        initialDirectory: _lastExportPath,
+      );
+      WinWindowRepaint.burst();
+      if (result == null) return;
+      var outPath = result.path;
+      if (wantDocx) {
+        if (!outPath.toLowerCase().endsWith('.docx')) outPath = '$outPath.docx';
+        await File(outPath)
+            .writeAsBytes(buildVocabReportDocx(data), flush: true);
+      } else {
+        if (!outPath.toLowerCase().endsWith('.html')) outPath = '$outPath.html';
+        await File(outPath)
+            .writeAsString(buildVocabReportHtml(data), encoding: utf8);
+      }
+      _lastExportPath = Directory(outPath).parent.path;
+      _saveConfig();
+      WinWindowRepaint.burst();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('检测报告已导出：$outPath'),
+          duration: const Duration(seconds: 8),
+        ),
+      );
+    } catch (e, st) {
+      debugPrint('[VocabReport] export error: $e\n$st');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('导出检测报告失败：$e')),
+        );
+      }
+    }
   }
 
   // ---------- 导入文本筛选标签 ----------
@@ -6646,6 +7425,8 @@ try {
           activeFilter: _importedActiveFilter,
           color: _filterColors[iw.category]!,
           isEven: index.isEven,
+          variantNote: iw.variantNote,
+          familyFreq: iw.familyFreq,
           showRemoveExtra: _manualExtraWords.contains(iw.word),
           onOpen: () => _openImportedWord(iw),
           onClassify: () => _startClassifyBatch(iw),
@@ -6997,13 +7778,15 @@ try {
   /// 左栏真题行高 / 分组头高度（与 [_buildCorpusSize] 的整行吸附保持一致）
   static const double _kCorpusRowH = 36.0;
   static const double _kCorpusGroupH = 26.0;
+  static const double _kCorpusUnitH = 28.0;
   static const double _kCorpusHintH = 30.0;
   /// 内联真题原文高度（展开后固定高度、内部自行滚动）
   static const double _kCorpusReaderH = 200.0;
 
-  /// 左栏真题列表的展示序列：内置分组头 / 隐藏提示 / 用户分组头 / 文件行 / 内联原文。
+  /// 真题按文件名年份分组：年份倒序（最近年份在前），组内为「卷别」文件行。
+  /// 无法识别年份的文件归入末尾「其他」组。
   /// 从结果行定位时进入聚焦态：只展示该套真题 + 其原文，其它年份不占位。
-  List<({String kind, CorpusFile? file})> _corpusDisplayItems() {
+  List<_LeftItem> _corpusDisplayItems() {
     final focus = _corpusFocusPath;
     if (focus != null) {
       CorpusFile? target;
@@ -7014,51 +7797,57 @@ try {
         }
       }
       if (target != null) {
-        return <({String kind, CorpusFile? file})>[
-          (kind: 'focusHint', file: null),
-          (kind: 'file', file: target),
+        return <_LeftItem>[
+          (kind: 'focusHint', file: null, label: null, index: null),
+          (kind: 'file', file: target, label: null, index: null),
           if (_corpusReaderOpen.contains(target.path))
-            (kind: 'reader', file: target),
+            (kind: 'reader', file: target, label: null, index: null),
         ];
       }
     }
-    final items = <({String kind, CorpusFile? file})>[];
-    if (_builtinFiles.isNotEmpty) {
-      if (_builtinHidden) {
-        items.add((kind: 'hidden', file: null));
+    final groups = <String, List<CorpusFile>>{};
+    final other = <CorpusFile>[];
+    for (final f in _corpusFiles) {
+      final m = _yearPrefixRegex.firstMatch(f.name);
+      if (m != null) {
+        groups.putIfAbsent(m.group(1)!, () => <CorpusFile>[]).add(f);
       } else {
-        items.add((kind: 'builtinHeader', file: null));
-        if (!_builtinCollapsed) {
-          for (final f in _builtinFiles) {
-            items.add((kind: 'file', file: f));
-            if (_corpusReaderOpen.contains(f.path)) {
-              items.add((kind: 'reader', file: f));
-            }
-          }
-        }
+        other.add(f);
       }
     }
-    if (_userCorpusFiles.isNotEmpty) {
-      items.add((kind: 'userHeader', file: null));
-      for (final f in _userCorpusFiles) {
-        items.add((kind: 'file', file: f));
+    final years = groups.keys.toList()
+      ..sort((a, b) => b.compareTo(a));
+    final items = <_LeftItem>[];
+    void addGroup(String label, List<CorpusFile> files) {
+      files.sort((a, b) => a.name.compareTo(b.name));
+      items.add((kind: 'yearHeader', file: null, label: label, index: null));
+      if (!_corpusExpandedYears.contains(label)) return;
+      for (final f in files) {
+        items.add((kind: 'file', file: f, label: null, index: null));
         if (_corpusReaderOpen.contains(f.path)) {
-          items.add((kind: 'reader', file: f));
+          items.add((kind: 'reader', file: f, label: null, index: null));
         }
       }
     }
+
+    for (final y in years) {
+      addGroup(y, groups[y]!);
+    }
+    if (other.isNotEmpty) addGroup('其他', other);
     return items;
   }
 
-  double _corpusItemHeight(({String kind, CorpusFile? file}) item) {
+  double _corpusItemHeight(_LeftItem item) {
     switch (item.kind) {
-      case 'hidden':
-        return GlassTheme.dp(_kCorpusHintH);
       case 'focusHint':
         return GlassTheme.dp(24);
-      case 'builtinHeader':
-      case 'userHeader':
+      case 'yearHeader':
+      case 'versionHeader':
         return GlassTheme.dp(_kCorpusGroupH);
+      case 'unit':
+        return GlassTheme.dp(_kCorpusUnitH);
+      case 'unitHint':
+        return GlassTheme.dp(_kCorpusHintH);
       case 'reader':
         return GlassTheme.dp(_kCorpusReaderH) + kGap6;
       default:
@@ -7066,7 +7855,7 @@ try {
     }
   }
 
-  String? _firstCorpusDisplayPath(List<({String kind, CorpusFile? file})> items) {
+  String? _firstCorpusDisplayPath(List<_LeftItem> items) {
     for (final it in items) {
       if (it.kind != 'file') continue;
       final f = it.file;
@@ -7089,7 +7878,7 @@ try {
             ),
             const SizedBox(height: kGap8),
             Text(
-              '点击「真题导入」选择文件夹',
+              '点击 ＋ 导入真题文件',
               style: TextStyle(fontSize: GlassTheme.fSmall, color: GlassTheme.ink3),
             ),
           ],
@@ -7141,7 +7930,7 @@ try {
   /// 真题文件列表（滚动区）：视口高度由 [_buildCorpusList] 按整行吸附后传入。
   /// [focusReaderH] 仅在聚焦单套真题时传入，用于让原文撑满左栏剩余高度。
   Widget _buildCorpusScrollingList(
-    List<({String kind, CorpusFile? file})> items, {
+    List<_LeftItem> items, {
     double? focusReaderH,
   }) {
     final firstPath = _firstCorpusDisplayPath(items);
@@ -7152,20 +7941,14 @@ try {
       itemBuilder: (context, index) {
         final item = items[index];
         switch (item.kind) {
-          case 'builtinHeader':
-            return _buildCorpusGroupHeader(
-              label: '内置真题',
-              count: _builtinFiles.length,
-              builtin: true,
-            );
-          case 'userHeader':
-            return _buildCorpusGroupHeader(
-              label: '我的导入',
-              count: _userCorpusFiles.length,
-              builtin: false,
-            );
-          case 'hidden':
-            return _buildBuiltinHiddenHint();
+          case 'yearHeader':
+            final label = item.label ?? '';
+            final files = _corpusFiles
+                .where((f) =>
+                    (_yearPrefixRegex.firstMatch(f.name)?.group(1) ?? '其他') ==
+                    label)
+                .toList();
+            return _buildYearHeader(label, files);
           case 'focusHint':
             return _buildCorpusFocusHint();
           case 'reader':
@@ -7232,154 +8015,129 @@ try {
     );
   }
 
-  /// 分组头：内置组可折叠 + 可隐藏；用户组只显示数量。
-  Widget _buildCorpusGroupHeader({
-    required String label,
-    required int count,
-    required bool builtin,
+  /// 勾选框：全选 / 部分选中 / 未选三态，点击切换整组或单项。
+  Widget _selectionBox({
+    required bool checked,
+    bool partial = false,
+    required VoidCallback onTap,
+    String? tooltip,
   }) {
+    final box = MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: onTap,
+        child: SizedBox(
+          width: 22,
+          height: 22,
+          child: Center(
+            child: Container(
+              width: 14,
+              height: 14,
+              decoration: BoxDecoration(
+                color: checked || partial
+                    ? GlassTheme.accent
+                    : Colors.transparent,
+                borderRadius: BorderRadius.circular(3),
+                border: Border.all(
+                  color: checked || partial
+                      ? GlassTheme.accent
+                      : const Color(0x5918181B),
+                  width: 1.2,
+                ),
+              ),
+              child: checked
+                  ? const Icon(Icons.check_rounded,
+                      size: 11, color: Colors.white)
+                  : partial
+                      ? Center(
+                          child: Container(
+                            width: 7,
+                            height: 1.6,
+                            color: Colors.white,
+                          ),
+                        )
+                      : null,
+            ),
+          ),
+        ),
+      ),
+    );
+    if (tooltip == null) return box;
+    return Tooltip(message: tooltip, child: box);
+  }
+
+  /// 真题年份分组头：勾选整年 + 点击展开/收起卷别。
+  Widget _buildYearHeader(String label, List<CorpusFile> files) {
+    final expanded = _corpusExpandedYears.contains(label);
+    final selectedCount = files.where((f) => f.isSelected).length;
+    final allSelected = files.isNotEmpty && selectedCount == files.length;
+    final partial = selectedCount > 0 && !allSelected;
     return SizedBox(
       height: GlassTheme.dp(_kCorpusGroupH),
       child: Row(
         children: [
-          if (builtin)
-            Icon(
-              _builtinCollapsed
-                  ? Icons.keyboard_arrow_right_rounded
-                  : Icons.keyboard_arrow_down_rounded,
-              size: 16,
-              color: GlassTheme.ink3,
-            )
-          else
-            const SizedBox(width: 16),
-          const SizedBox(width: kGap4),
-          Text(
-            label,
-            style: const TextStyle(
-              fontSize: GlassTheme.fMicro,
-              fontWeight: FontWeight.w600,
-              color: GlassTheme.ink3,
-              height: 1,
-            ),
-          ),
-          const SizedBox(width: kGap6),
-          Text(
-            '$count',
-            style: const TextStyle(
-              fontSize: GlassTheme.fMicro,
-              color: GlassTheme.ink3,
-              height: 1,
-            ),
-          ),
-          const Spacer(),
-          // 折叠箭头（整组统一交互，避免 98 行逐个点）
-          if (builtin)
-            _corpusHeaderIcon(
-              icon: _builtinCollapsed
-                  ? Icons.unfold_more_rounded
-                  : Icons.unfold_less_rounded,
-              tooltip: _builtinCollapsed ? '展开内置真题' : '折叠内置真题',
-              onTap: () {
-                setState(() {
-                  _builtinCollapsed = !_builtinCollapsed;
-                });
-                _saveConfig();
-              },
-            ),
-          if (builtin) const SizedBox(width: kGap4),
-          if (builtin)
-            _corpusHeaderIcon(
-              icon: Icons.visibility_off_outlined,
-              tooltip: '隐藏内置真题',
-              onTap: () {
-                setState(() {
-                  _builtinHidden = true;
-                  _rebuildCorpusList();
-                });
-                _resetWordQueryState();
-                _saveConfig();
-              },
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget _corpusHeaderIcon({
-    required IconData icon,
-    required String tooltip,
-    required VoidCallback onTap,
-  }) {
-    return Tooltip(
-      message: tooltip,
-      child: MouseRegion(
-        cursor: SystemMouseCursors.click,
-        child: GlassPressable(
-          radius: 6,
-          hoverColor: GlassTheme.accentSoft,
-          pressColor: const Color(0x294462F2),
-          enabled: true,
-          child: InkWell(
-            onTap: onTap,
-            borderRadius: BorderRadius.circular(6),
-            child: SizedBox(
-              width: 20,
-              height: 20,
-              child: Icon(icon, size: 14, color: GlassTheme.ink3),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// 内置真题被隐藏后的恢复入口（不删除任何文件，仅退出统计）。
-  Widget _buildBuiltinHiddenHint() {
-    return SizedBox(
-      height: GlassTheme.dp(_kCorpusHintH),
-      child: MouseRegion(
-        cursor: SystemMouseCursors.click,
-        child: GlassPressable(
-          radius: GlassTheme.rSm,
-          hoverColor: GlassTheme.accentSoft,
-          pressColor: const Color(0x294462F2),
-          enabled: true,
-          child: InkWell(
+          _selectionBox(
+            checked: allSelected,
+            partial: partial,
+            tooltip: allSelected ? '取消选择 $label 全部卷别' : '选择 $label 全部卷别',
             onTap: () {
               setState(() {
-                _builtinHidden = false;
-                _rebuildCorpusList();
+                final target = !allSelected;
+                for (final f in files) {
+                  f.isSelected = target;
+                }
               });
-              _saveConfig();
             },
-            borderRadius: BorderRadius.circular(GlassTheme.rSm),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: kGap8),
-              child: Row(
-                children: [
-                  const Icon(
-                    Icons.visibility_outlined,
-                    size: 14,
-                    color: GlassTheme.accentInk,
-                  ),
-                  const SizedBox(width: kGap6),
-                  Expanded(
-                    child: Text(
-                      '内置真题已隐藏（${_builtinFiles.length} 套）· 点击恢复',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
+          ),
+          Expanded(
+            child: MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () {
+                  setState(() {
+                    if (expanded) {
+                      _corpusExpandedYears.remove(label);
+                    } else {
+                      _corpusExpandedYears.add(label);
+                    }
+                  });
+                },
+                child: Row(
+                  children: [
+                    Icon(
+                      expanded
+                          ? Icons.keyboard_arrow_down_rounded
+                          : Icons.keyboard_arrow_right_rounded,
+                      size: 16,
+                      color: GlassTheme.ink3,
+                    ),
+                    const SizedBox(width: kGap4),
+                    Text(
+                      label.isEmpty ? '其他' : label,
                       style: const TextStyle(
                         fontSize: GlassTheme.fMicro,
-                        color: GlassTheme.accentInk,
+                        fontWeight: FontWeight.w600,
+                        color: GlassTheme.ink3,
                         height: 1,
                       ),
                     ),
-                  ),
-                ],
+                    const SizedBox(width: kGap6),
+                    Text(
+                      '$selectedCount/${files.length}',
+                      style: const TextStyle(
+                        fontSize: GlassTheme.fMicro,
+                        color: GlassTheme.ink3,
+                        height: 1,
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
-        ),
+        ],
       ),
     );
   }
@@ -7407,7 +8165,6 @@ try {
         child: InkWell(
           onTap: () {
             setState(() {
-              file.isSelected = !file.isSelected;
               _activeCorpusPath = file.path;
             });
           },
@@ -7438,29 +8195,17 @@ try {
                         )
                       : null,
                 ),
-                if (yearLabel.isNotEmpty)
-                  Container(
-                    width: 30,
-                    height: 16,
-                    alignment: Alignment.center,
-                    decoration: BoxDecoration(
-                      color: selected
-                          ? const Color(0x294462F2)
-                          : const Color(0x0D18181B),
-                      borderRadius: BorderRadius.circular(6),
-                    ),
-                    child: Text(
-                      yearLabel,
-                      style: TextStyle(
-                        fontSize: 9.5,
-                        fontWeight: FontWeight.w600,
-                        color: selected ? GlassTheme.accentInk : GlassTheme.ink3,
-                        height: 1,
-                      ),
-                    ),
-                  )
-                else
-                  GlassFileTypeTag(label: _fileTypeLabel(file.name), selected: selected),
+                // 勾选参与统计（与高亮行解耦）
+                _selectionBox(
+                  checked: file.isSelected,
+                  tooltip: file.isSelected ? '取消选择该卷' : '选择该卷',
+                  onTap: () => setState(() {
+                    file.isSelected = !file.isSelected;
+                  }),
+                ),
+                if (yearLabel.isEmpty)
+                  GlassFileTypeTag(
+                      label: _fileTypeLabel(file.name), selected: selected),
                 const SizedBox(width: kGap6),
                 Expanded(
                   child: Text(
@@ -7641,11 +8386,9 @@ try {
       _leftPanelIsTextbook = false;
       _activeCorpusPath = path;
       _corpusFocusPath = focusOnly ? path : null;
-      // 内置真题被折叠 / 隐藏时先恢复，否则展开项不可见
-      if (file.isBuiltin) {
-        _builtinHidden = false;
-        _builtinCollapsed = false;
-      }
+      // 确保该套真题所在年份已展开，否则展开项不可见
+      final year = _yearPrefixRegex.firstMatch(file.name)?.group(1) ?? '其他';
+      _corpusExpandedYears.add(year);
       if (collapseOthers) {
         _corpusReaderOpen
           ..clear()
@@ -7836,6 +8579,46 @@ try {
         }
         break;
     }
+  }
+
+  /// 教材版本行右键菜单：用户导入的教材可从列表移除（不删磁盘文件）；
+  /// 内置教材随包发布，不提供删除（与真题列表口径一致）。
+  Future<void> _showTextbookFileContextMenu(
+    Offset position,
+    CorpusFile file,
+  ) async {
+    final result = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx,
+        position.dy,
+        position.dx,
+        position.dy,
+      ),
+      items: [
+        const PopupMenuItem(value: 'open', child: Text('打开')),
+        const PopupMenuItem(
+          value: 'remove',
+          child: Text('从列表移除', style: TextStyle(color: Colors.red)),
+        ),
+      ],
+    );
+    if (result == null) return;
+    if (result == 'open') {
+      await Process.run('cmd', ['/c', 'start', '', file.path]);
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _userTextbookFiles.removeWhere((f) => f.path == file.path);
+      _textbookExpandedVersions.remove(file.path);
+      _textbookReaderOpen.remove(file.path);
+      if (_activeTextbookPath == file.path) _activeTextbookPath = null;
+      if (_textbookFocusPath == file.path) _textbookFocusPath = null;
+      _rebuildTextbookList();
+    });
+    // 移除后立即持久化，重启不再恢复该项
+    _saveConfig();
   }
 
   // ---------- 筛选标签 ----------
@@ -8183,17 +8966,35 @@ try {
     _saveConfig();
   }
 
-  // ---------- 词频年份 + 教材分布 ----------
+  /// 命中行关键字是否就是被查词本身（用于「本词」计数）。
+  /// 大写查询（March）按原写法精确比对；小写查询按折叠后词形比对。
+  bool _isOwnFormMatch(String keyword, String raw) {
+    final k = keyword.trim();
+    final r = raw.trim();
+    if (k.isEmpty || r.isEmpty) return false;
+    if (r != r.toLowerCase()) return k == r;
+    return foldToken(k) == foldToken(r);
+  }
+
   // ---------- 词频年份 + 教材分布 ----------
   Widget _buildYearDistribution() {
     final textbookCounts = <String, int>{};
     for (final r in _textbookResults) {
       textbookCounts[r.filePath] = (textbookCounts[r.filePath] ?? 0) + 1;
     }
-    var yearTotal = 0;
-    for (final v in _yearFrequency.values) {
-      yearTotal += v;
-    }
+    // 「共」口径：该词在真题语料里的**词族**命中总次数（本词 + 变体/拓展，
+    // 如 women 含 woman/women's 等），不是整批语料的词次合计；
+    // 直接取命中行数，个别文件名无年份前缀时也不会漏计。
+    final yearTotal = _results.length;
+    // 本词词频：只统计与查询词形完全一致的命中（women 不含 woman/women's），
+    // 与左侧「词族合计」区分开；大小写敏感查询（March）按原写法精确比对。
+    final ownRaw = _detectedWordRaw.isEmpty ? _detectedWord : _detectedWordRaw;
+    final ownWordFreq =
+        _results.where((r) => _isOwnFormMatch(r.keyword, ownRaw)).length;
+    // 教材侧本词同口径
+    final ownTextbookWordFreq = _textbookResults
+        .where((r) => _isOwnFormMatch(r.keyword, ownRaw))
+        .length;
     return YearFilterBar(
       textbookItems: [
         for (final f in _textbookFiles.where((f) => f.isSelected))
@@ -8203,7 +9004,12 @@ try {
       years: _sortedYears,
       yearCounts: _yearFrequency,
       yearTotal: yearTotal,
+      // 与左侧同口径：该词族在所选教材中的命中总次数
       textbookTotal: _textbookResults.length,
+      // 展示用户输入的原始大小写（March 与 march 分开）
+      word: _detectedWordRaw.isEmpty ? _detectedWord : _detectedWordRaw,
+      wordFreq: ownWordFreq,
+      textbookWordFreq: ownTextbookWordFreq,
       selectedYear: _selectedYear,
       selectedTextbook: _selectedTextbook,
       selectedTextbookName: _selectedTextbookName(),
@@ -9843,21 +10649,25 @@ try {
   /// 导出时必须剔除。因此仅保留「键 ∈ 界面 extendWords 集合」的映射，
   /// 确保导出词表的每个拓展词都真实存在于界面词库中。
   String _collectExtendBaseMapRaw() {
+    // 保留键的原始大小写：extendBaseMap 存在仅大小写不同的重复映射
+    // （members→member 与 Members→membership），若在此小写化会相互覆盖，
+    // 与检测页取到的映射不一致。统一交给 word_family.buildExtendBaseMap
+    // 规范化（小写键优先），两侧得到同一张表。
     final merged = <String, String>{};
     for (final e in _extendBaseMap.entries) {
-      final k = e.key.toLowerCase().trim();
-      final v = e.value.toLowerCase().trim();
+      final k = e.key.trim();
+      final v = e.value.trim();
       if (k.isEmpty || v.isEmpty) continue;
       // 键必须在界面"拓展词汇"列表集合内（_extendWordsLower 由 esw_config.json
       // extendWords 构建），不在集合内的映射一律剔除（如 ind）。
-      if (!_extendWordsLower.contains(k)) continue;
+      if (!_extendWordsLower.contains(k.toLowerCase())) continue;
       merged[k] = v;
     }
     return jsonEncode(merged);
   }
 
-  /// 导出高频词表：统计真题语料词频，取前 3000 导出。先让用户选择
-  /// Word(docx) 或 Excel(xlsx) 格式，再执行导出（排除星期/月份/序数词）。
+  /// 导出高频词表：单页勾选语料来源（真题 / 教材）、词数（全部导出 /
+  /// 自定义）与格式，确定即导出（排除星期/月份/序数词）。
   ///
   /// 本按钮与版式保持原样；三类词库的导出入口在各词库列表弹窗顶部
   /// （「导出Word版」/「导出Excel版」，见 [_exportWordBank]）。
@@ -9865,79 +10675,468 @@ try {
     if (_highFreqExporting) return;
     _highFreqExporting = true;
     _ExportProgress? progress;
+    Directory? tempCorpus;
     try {
-      // 格式选择：Word(docx) / Excel(xlsx)，取消则不导出
-      final format = await showDialog<String>(
+      // 1) 语料来源 + 范围：真题（全部年份 / 近三年 / 近五年 / 近十年）
+      //    或教材（选版本，可选到具体册次）。
+      // 先解析教材版本与册次（解析结果缓存在 CorpusFile.sections）。
+      final tbModuleRanges = <String, Map<String, List<int>>>{};
+      for (final f in _textbookFiles) {
+        await _ensureTextbookSections(f);
+        final secs = f.sections ?? const <TextbookSection>[];
+        final ranges = <String, List<int>>{};
+        for (var i = 0; i < secs.length; i++) {
+          final title = secs[i].title;
+          final cut = title.indexOf('第');
+          final name = (cut > 0 ? title.substring(0, cut) : title).trim();
+          ranges.putIfAbsent(name, () => <int>[]).add(i);
+        }
+        tbModuleRanges[f.path] = ranges;
+      }
+      // 真题最新年份（用于近 N 年窗口）
+      final detectedYears = <int>[];
+      for (final f in _corpusFiles.where((f) => f.isSelected)) {
+        final m = _yearPrefixRegex.firstMatch(f.name);
+        final y = int.tryParse(m?.group(1) ?? '');
+        if (y != null && y >= 2000 && y <= 2099) detectedYears.add(y);
+      }
+      detectedYears.sort((a, b) => b.compareTo(a));
+      final latestYear = detectedYears.isEmpty ? null : detectedYears.first;
+      if (!mounted) return;
+
+      final yearsCtrl = TextEditingController(text: '5');
+      final limitCtrl = TextEditingController(text: '3000');
+      final opt = await showDialog<
+          ({
+            String source,
+            int yearWindow,
+            Set<String> tbPaths,
+            String? tbModule,
+            bool allStd,
+            int limit,
+            String format,
+          })>(
         context: context,
         builder: (dctx) {
+          var picked = 'exam';
+          var yearWindow = 0; // 0=全部年份，>0=近几年
+          final tbPaths = <String>{};
+          String? tbModule;
+          // 词数只保留「全部导出 / 自定义词数」两档，默认全部导出。
+          var pickAllStd = true;
           var pickedFormat = 'docx';
+          var limitError = '';
+          final versions = _textbookFiles;
+          void ensureDefaultTb() {
+            if (tbPaths.isNotEmpty || versions.isEmpty) return;
+            tbPaths.add(versions.first.path);
+          }
+
           return _glassDialog(
             StatefulBuilder(
-              builder: (ctx, setDialogState) => EswDialogShell(
-                title: '选择导出格式',
-                subtitle: '请选择高频词表的导出格式：',
-                icon: Icons.file_download_outlined,
-                minContent: 300,
-                body: EswOptionRow(
-                  children: [
-                    EswOptionTile(
-                      label: 'Word',
-                      desc: '.docx',
-                      selected: pickedFormat == 'docx',
-                      onTap: () =>
-                          setDialogState(() => pickedFormat = 'docx'),
+              builder: (ctx, setDialogState) {
+                // 所选版本的册次并集（同名册次跨版本共用）
+                final modules = <String>{};
+                for (final path in tbPaths) {
+                  modules.addAll(tbModuleRanges[path]?.keys ?? const <String>[]);
+                }
+                if (tbModule != null && !modules.contains(tbModule)) {
+                  tbModule = null;
+                }
+                return EswDialogShell(
+                  title: '导出高频',
+                  subtitle: '勾选语料范围、词数与格式，确定即导出',
+                  icon: Icons.library_books_outlined,
+                  minContent: 480,
+                  body: ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 430),
+                    child: SingleChildScrollView(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                      EswOptionRow(
+                        children: [
+                          EswOptionTile(
+                            label: '真题',
+                            desc: '高考真题语料',
+                            selected: picked == 'exam',
+                            onTap: () =>
+                                setDialogState(() => picked = 'exam'),
+                          ),
+                          EswOptionTile(
+                            label: '教材',
+                            desc: '可多选版本',
+                            selected: picked == 'textbook',
+                            onTap: () => setDialogState(() {
+                              picked = 'textbook';
+                              ensureDefaultTb();
+                            }),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: kGap8),
+                      if (picked == 'exam') ...[
+                        Row(
+                          children: [
+                            Expanded(
+                              child: EswOptionTile(
+                                label: '全部年份',
+                                desc: '不限年份',
+                                selected: yearWindow == 0,
+                                onTap: () =>
+                                    setDialogState(() => yearWindow = 0),
+                              ),
+                            ),
+                            const SizedBox(width: kGap8),
+                            Expanded(
+                              child: EswOptionTile(
+                                label: '近几年',
+                                desc: '自定义年数',
+                                selected: yearWindow > 0,
+                                onTap: () => setDialogState(() {
+                                  final n =
+                                      int.tryParse(yearsCtrl.text.trim()) ?? 5;
+                                  yearWindow = n.clamp(1, 30);
+                                  yearsCtrl.text = '$yearWindow';
+                                }),
+                              ),
+                            ),
+                            const SizedBox(width: kGap8),
+                            SizedBox(
+                              width: 76,
+                              child: TextField(
+                                controller: yearsCtrl,
+                                textAlign: TextAlign.center,
+                                style: const TextStyle(
+                                    fontSize: GlassTheme.fBody),
+                                decoration: const InputDecoration(
+                                  isDense: true,
+                                  hintText: '年数',
+                                  suffixText: '年',
+                                ),
+                                onChanged: (v) {
+                                  final n = int.tryParse(v.trim());
+                                  if (n == null) return;
+                                  setDialogState(
+                                      () => yearWindow = n.clamp(1, 30));
+                                },
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: kGap6),
+                        EswDialogHint(
+                          latestYear == null
+                              ? '未识别到真题年份，将使用全部年份'
+                              : '最新年份 $latestYear 年',
+                        ),
+                      ] else ...[
+                        if (versions.isEmpty)
+                          const EswDialogHint('没有可用教材')
+                        else
+                          ConstrainedBox(
+                            constraints: const BoxConstraints(maxHeight: 156),
+                            child: SingleChildScrollView(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  for (final f in versions)
+                                    CheckboxListTile(
+                                      dense: true,
+                                      visualDensity:
+                                          const VisualDensity(vertical: -3),
+                                      contentPadding: EdgeInsets.zero,
+                                      controlAffinity:
+                                          ListTileControlAffinity.leading,
+                                      value: tbPaths.contains(f.path),
+                                      title: Text(
+                                        p.basenameWithoutExtension(f.name),
+                                        style: const TextStyle(
+                                            fontSize: GlassTheme.fBody),
+                                      ),
+                                      subtitle: Text(
+                                        (tbModuleRanges[f.path]?.isEmpty ??
+                                                true)
+                                            ? '册次未识别，按整本统计'
+                                            : '共 ${tbModuleRanges[f.path]!.length} 册',
+                                        style: const TextStyle(
+                                            fontSize: GlassTheme.fMicro),
+                                      ),
+                                      onChanged: (v) => setDialogState(() {
+                                        if (v == true) {
+                                          tbPaths.add(f.path);
+                                        } else {
+                                          tbPaths.remove(f.path);
+                                        }
+                                        tbModule = null;
+                                      }),
+                                    ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        if (modules.isNotEmpty) ...[
+                          const SizedBox(height: kGap6),
+                          const EswDialogHint('册次（默认全部）'),
+                          Wrap(
+                            spacing: kGap6,
+                            runSpacing: kGap4,
+                            children: [
+                              ChoiceChip(
+                                label: const Text('全部册次'),
+                                selected: tbModule == null,
+                                onSelected: (_) => setDialogState(
+                                    () => tbModule = null),
+                              ),
+                              for (final m in modules)
+                                ChoiceChip(
+                                  label: Text(m),
+                                  selected: tbModule == m,
+                                  onSelected: (_) => setDialogState(
+                                      () => tbModule = m),
+                                ),
+                            ],
+                          ),
+                        ],
+                      ],
+                      const SizedBox(height: kGap10),
+                      const EswDialogHint('导出词数'),
+                      EswOptionRow(
+                        children: [
+                          EswOptionTile(
+                            label: '全部导出',
+                            desc: '含频次 0 的词条，不截断',
+                            selected: pickAllStd,
+                            onTap: () => setDialogState(() {
+                              pickAllStd = true;
+                              limitError = '';
+                            }),
+                          ),
+                          EswOptionTile(
+                            label: '自定义词数',
+                            desc: 'Top N（1–50000）',
+                            selected: !pickAllStd,
+                            onTap: () => setDialogState(() {
+                              pickAllStd = false;
+                              limitError = '';
+                            }),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: kGap6),
+                      TextField(
+                        controller: limitCtrl,
+                        enabled: !pickAllStd,
+                        keyboardType: TextInputType.number,
+                        inputFormatters: [
+                          FilteringTextInputFormatter.digitsOnly,
+                        ],
+                        decoration: InputDecoration(
+                          labelText: '自定义词数（1–50000）',
+                          hintText: '例如 1500',
+                          isDense: true,
+                          errorText: limitError.isEmpty ? null : limitError,
+                          border: const OutlineInputBorder(
+                            borderRadius: BorderRadius.all(Radius.circular(8)),
+                          ),
+                        ),
+                        onChanged: (v) => setDialogState(() {
+                          pickAllStd = false;
+                          limitError = '';
+                        }),
+                      ),
+                      const SizedBox(height: kGap10),
+                      const EswDialogHint('导出格式'),
+                      EswOptionRow(
+                        children: [
+                          EswOptionTile(
+                            label: 'Word',
+                            desc: '.docx',
+                            selected: pickedFormat == 'docx',
+                            onTap: () =>
+                                setDialogState(() => pickedFormat = 'docx'),
+                          ),
+                          EswOptionTile(
+                            label: 'Excel',
+                            desc: '.xlsx',
+                            selected: pickedFormat == 'xlsx',
+                            onTap: () =>
+                                setDialogState(() => pickedFormat = 'xlsx'),
+                          ),
+                        ],
+                      ),
+                    ],
+                      ),
                     ),
-                    EswOptionTile(
-                      label: 'Excel',
-                      desc: '.xlsx',
-                      selected: pickedFormat == 'xlsx',
-                      onTap: () =>
-                          setDialogState(() => pickedFormat = 'xlsx'),
-                    ),
-                  ],
-                ),
-                actions: EswDialogActions(
-                  children: [
-                    EswDialogTextAction(
-                      label: '取消',
-                      onPressed: () => Navigator.pop(dctx),
-                    ),
-                    EswDialogPrimaryAction(
-                      label: '导出',
-                      onPressed: () => Navigator.pop(dctx, pickedFormat),
-                    ),
-                  ],
-                ),
-              ),
+                  ),
+                  actions: EswDialogActions(
+                    children: [
+                      EswDialogTextAction(
+                        label: '取消',
+                        onPressed: () => Navigator.pop(dctx),
+                      ),
+                      EswDialogPrimaryAction(
+                        label: '导出',
+                        onPressed: () {
+                          if (picked == 'textbook' && tbPaths.isEmpty) {
+                            setDialogState(
+                                () => limitError = '请至少选择一个教材版本');
+                            return;
+                          }
+                          final n = int.tryParse(limitCtrl.text.trim()) ?? 0;
+                          if (!pickAllStd && (n < 1 || n > 50000)) {
+                            setDialogState(
+                                () => limitError = '请输入 1–50000 之间的整数');
+                            return;
+                          }
+                          Navigator.pop(dctx, (
+                            source: picked,
+                            yearWindow: yearWindow,
+                            tbPaths: tbPaths,
+                            tbModule: tbModule,
+                            allStd: pickAllStd,
+                            limit: pickAllStd ? 0 : n,
+                            format: pickedFormat,
+                          ));
+                        },
+                      ),
+                    ],
+                  ),
+                );
+              },
             ),
           );
         },
       );
-      if (format == null) return;
+      yearsCtrl.dispose();
+      limitCtrl.dispose();
+      if (opt == null || !mounted) return;
+      final isTextbook = opt.source == 'textbook';
+      // 年数只认对话框内的显式选择 / 输入：0 = 全部年份。
+      // 不能用输入框默认值兜底，否则「全部年份」会被默认的 5 年覆盖。
+      final yearWindow = exportYearWindowFromSelection(
+        allYears: opt.yearWindow <= 0,
+        recentYears: opt.yearWindow,
+      );
+      final rangeLabel = isTextbook
+          ? '${opt.tbPaths.length}版本${opt.tbModule == null ? '' : '·${opt.tbModule}'}'
+          : (yearWindow == 0 ? '全部年份' : '近$yearWindow年');
+      final sourceLabel = isTextbook ? '教材' : '真题';
+      final allStdWords = opt.allStd;
+      final wordLimit = opt.limit;
+      final format = opt.format;
 
       // 确保词典数据库已部署到本地
       await DictionaryService.lookup('the');
 
-      // 语料目录：不再内置 corpus，也不硬编码本机路径。
-      // 仅使用用户主动导入的真题/教材语料：
-      // 1) 已导入真题且全部来自同一目录 → 直接使用该目录；
-      // 2) 否则弹窗引导导入真题或教材；导入后仍无法确定目录时让用户选择真题文件夹；
-      // 3) 用户拒绝导入 → 提示"无法完成真题单词检测"并中止。
-      String? corpusDir = _deriveCorpusDir();
-      if (corpusDir == null) {
-        final imported = await _promptCorpusImport();
-        if (!imported) return;
+      // 语料目录：
+      // - 教材：按所选版本/册次抽取为临时 txt 目录；
+      // - 真题：全部年份沿用导入目录；近 N 年按文件名年份前缀筛选后复制到临时目录。
+      String? corpusDir;
+      if (isTextbook) {
+        final paths = opt.tbPaths;
+        if (paths.isEmpty) return;
+        tempCorpus = await Directory.systemTemp.createTemp('esw_tb_export_');
+        var written = 0;
+        for (final path in paths) {
+          final matches = _textbookFiles.where((f) => f.path == path);
+          if (matches.isEmpty) continue;
+          final file = matches.first;
+          String text;
+          if (opt.tbModule == null) {
+            text = await _readFileTextCached(file.path);
+          } else {
+            await _ensureTextbookSections(file);
+            final raw = await _readRawFileText(file.path);
+            final secs = file.sections ?? const <TextbookSection>[];
+            final ranges = tbModuleRanges[path]?[opt.tbModule];
+            final buf = StringBuffer();
+            for (final i in (ranges ?? const <int>[])) {
+              if (i < 0 || i >= secs.length) continue;
+              buf.write(raw.substring(secs[i].start, secs[i].end));
+              buf.write('\n');
+            }
+            text = buf.toString();
+          }
+          if (text.trim().isEmpty) continue;
+          final base = p.basenameWithoutExtension(file.name);
+          final suffix = opt.tbModule == null ? '' : '_${opt.tbModule}';
+          await File(p.join(tempCorpus.path, '$base$suffix.txt'))
+              .writeAsString(text, flush: true);
+          written++;
+        }
+        if (written == 0) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('所选教材没有可用文本内容')),
+            );
+          }
+          return;
+        }
+        corpusDir = tempCorpus.path;
+      } else if (yearWindow > 0) {
+        final dir = _deriveCorpusDir();
+        if (dir == null) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('无法完成真题单词检测：未提供真题语料目录')),
+            );
+          }
+          return;
+        }
+        final years = <int>[];
+        try {
+          for (final f in Directory(dir).listSync().whereType<File>()) {
+            if (!f.path.toLowerCase().endsWith('.txt')) continue;
+            final m = _yearPrefixRegex.firstMatch(p.basename(f.path));
+            final y = int.tryParse(m?.group(1) ?? '');
+            if (y != null && y >= 2000 && y <= 2099) years.add(y);
+          }
+        } catch (_) {}
+        years.sort((a, b) => b.compareTo(a));
+        final latest = years.isEmpty ? null : years.first;
+        final minYear = latest == null ? null : latest - yearWindow + 1;
+        tempCorpus = await Directory.systemTemp.createTemp('esw_exam_export_');
+        var copied = 0;
+        if (minYear != null) {
+          try {
+            for (final f in Directory(dir).listSync().whereType<File>()) {
+              if (!f.path.toLowerCase().endsWith('.txt')) continue;
+              final m = _yearPrefixRegex.firstMatch(p.basename(f.path));
+              final y = int.tryParse(m?.group(1) ?? '');
+              if (y == null || y < minYear) continue;
+              await f.copy(p.join(tempCorpus.path, p.basename(f.path)));
+              copied++;
+            }
+          } catch (_) {}
+        }
+        if (copied == 0) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('没有符合「近$yearWindow年」的真题文件')),
+            );
+          }
+          return;
+        }
+        corpusDir = tempCorpus.path;
+      } else {
         corpusDir = _deriveCorpusDir();
         if (corpusDir == null) {
-          corpusDir = await FilePicker.getDirectoryPath(
-              dialogTitle: '选择真题语料目录（含真题 txt 的文件夹）');
-          if (corpusDir == null || corpusDir.isEmpty) {
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('无法完成真题单词检测：未提供真题语料目录')),
-              );
+          final imported = await _promptCorpusImport();
+          if (!imported) return;
+          corpusDir = _deriveCorpusDir();
+          if (corpusDir == null) {
+            corpusDir = await FilePicker.getDirectoryPath(
+                dialogTitle: '选择真题语料目录（含真题 txt 的文件夹）');
+            if (corpusDir == null || corpusDir.isEmpty) {
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('无法完成真题单词检测：未提供真题语料目录')),
+                );
+              }
+              return;
             }
-            return;
           }
         }
       }
@@ -9947,7 +11146,10 @@ try {
       final desktopDir = await systemDesktopPath();
       final ext = format == 'docx' ? 'docx' : 'xlsx';
       final savePath = p.join(
-          desktopDir, 'ESW-高考高频词表.$ext');
+          desktopDir,
+          allStdWords
+              ? 'ESW-${isTextbook ? '教材' : '高考'}高频课标词表-$rangeLabel.$ext'
+              : 'ESW-${isTextbook ? '教材' : '高考'}高频$wordLimit词表-$rangeLabel.$ext');
 
       // 预计用时：按语料规模动态估算（实测约 3 秒/MB，留足余量按 ~7 秒/MB 估算）
       var corpusBytes = 0;
@@ -9966,7 +11168,7 @@ try {
       // 等待提示：语料越多耗时越长，附带按语料规模估算的预计用时；
       // 延迟 0.5s 未完成才弹窗，小语料快速导出不闪屏。
       progress = await _beginExportProgress(
-        '正在统计真题词频并生成词表…',
+        '正在统计$sourceLabel（$rangeLabel）词频并生成词表…',
         hint: '预计总用时约$estMinutes分钟，请耐心等待',
       );
 
@@ -9981,9 +11183,8 @@ try {
       // 来自 esw_config.json 加载与词库同步）+ 共享/同步词库文件中的
       // extendBaseMap（shared_vocab.json / word_sync_state.json），传入
       // 导出器作为唯一拓展词归并依据（不再从 ecdict exchange 全量引入）。
-      // extendWordsRaw 为界面"拓展词汇"列表的完整词集合（与列表页同一
-      // 数据源 esw_config.json extendWords），导出器据此对课标词库
-      // extensions 做同样的白名单过滤。
+      // extendWordsRaw 为界面"拓展词汇"列表的完整词集合。导出器已不再用它
+      // 过滤课标词库 extensions（库内词形一律计入对应课标词），参数保留兼容。
       final extendBaseMapRaw = _collectExtendBaseMapRaw();
       final extendWordsRaw =
           jsonEncode(_extendWords.map((w) => w.toLowerCase()).toList());
@@ -9995,6 +11196,9 @@ try {
         extendBaseMapRaw: extendBaseMapRaw,
         extendWordsRaw: extendWordsRaw,
         format: format,
+        wordLimit: wordLimit,
+        allStdWords: allStdWords,
+        textbookCorpus: isTextbook,
       );
       final outBytes =
           result.format == 'docx' ? result.docxBytes! : result.xlsxBytes;
@@ -10006,7 +11210,7 @@ try {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              '导出高频完成（$fmtName）：${result.exportedWords} 词（${result.corpusFileCount} 篇真题语料，已排除星期/月份/序数词 ${result.calendarOrdinalExcluded.length} 个），已保存至 $savePath',
+              '导出高频完成（$fmtName）：${result.exportedWords} 词（${result.corpusFileCount} 篇$sourceLabel·$rangeLabel语料），已保存至 $savePath',
             ),
             duration: const Duration(seconds: 8),
           ),
@@ -10020,6 +11224,10 @@ try {
         );
       }
     } finally {
+      // 教材导出用的临时 txt 语料目录：导出结束（含失败）一律清理
+      try {
+        tempCorpus?.deleteSync(recursive: true);
+      } catch (_) {}
       // 失败分支此前未关闭进度窗，会残留遮挡界面，这里统一收尾
       progress?.close();
       _highFreqExporting = false;
@@ -11163,7 +12371,7 @@ try {
   }
 
   void _checkUpdate() async {
-    const currentVersion = '1.6.3';
+    const currentVersion = '1.6.7';
     try {
       final response = await http
           .get(
@@ -11301,6 +12509,18 @@ try {
 }
 
 // ==================== 数据模型 ====================
+/// 教材文件内的一个单元区间：[start]/[end] 为原文偏移（含单元标题行）。
+class TextbookSection {
+  final String title;
+  final int start;
+  final int end;
+  const TextbookSection({
+    required this.title,
+    required this.start,
+    required this.end,
+  });
+}
+
 class CorpusFile {
   final String name;
   final String path;
@@ -11309,12 +12529,34 @@ class CorpusFile {
   /// 是否来自内置真题包（随安装包发布、首启释放到用户目录）。
   /// 内置文件与用户自行导入的文件互不覆盖，左栏分区展示。
   final bool isBuiltin;
+
+  /// 教材单元分区（首次展开该教材时解析并缓存）；真题恒为 null。
+  List<TextbookSection>? sections;
+
+  /// 被排除（不参与统计）的教材单元下标；为空表示整本参与。
+  final Set<int> excludedSections = <int>{};
+
   CorpusFile({
     required this.name,
     required this.path,
     this.isSelected = true,
     this.isBuiltin = false,
   });
+
+  /// 正在参与统计的单元数（未解析出分区时按整本计 1）。
+  int get selectedSectionCount {
+    final total = sections?.length ?? 0;
+    if (total == 0) return isSelected ? 1 : 0;
+    if (!isSelected || excludedSections.length >= total) return 0;
+    return total - excludedSections.length;
+  }
+
+  /// 单元是否全部参与统计。
+  bool get allSectionsSelected =>
+      isSelected &&
+      (sections == null ||
+          sections!.isEmpty ||
+          excludedSections.isEmpty);
 }
 
 class ResultRow {
@@ -11745,12 +12987,22 @@ class _ImportedWord {
   final int frequency;
   final bool isInCorpus; // 是否出现在真题语料中（真题词列的判定依据）
   final int totalFreq; // 真题词频：该词在选中真题语料中的出现次数
+
+  /// 并列成员提示（「含 March」「含 TV」）：大小写异义词与同义词归并行的
+  /// 展示层补充，频次已合并计入 [frequency]，不重复计数。
+  final String? variantNote;
+
+  /// 词族合并数（与导出同口径）：本词及其全部拓展形/变体在文中的合计次数。
+  /// 与 [frequency]（本词词频）并列展示；未计算时为 null。
+  final int? familyFreq;
   const _ImportedWord({
     required this.word,
     required this.category,
     required this.frequency,
     required this.isInCorpus,
     this.totalFreq = 0,
+    this.variantNote,
+    this.familyFreq,
   });
 }
 
@@ -11966,7 +13218,6 @@ typedef _ScanOut = ({
 /// 重复查询零拷贝零重转，彻底消除每次 spawn isolate 的开销。
 void _scanWorkerMain(SendPort sp) {
   final texts = <String, String>{};
-  final textsLower = <String, String>{};
   final versions = <String, int>{};
   final port = ReceivePort();
   sp.send(port.sendPort);
@@ -11980,13 +13231,12 @@ void _scanWorkerMain(SendPort sp) {
           final path = em['path'] as String;
           final text = em['text'] as String;
           texts[path] = text;
-          textsLower[path] = text.toLowerCase();
           versions[path] = em['version'] as int;
         }
         break;
       case 'scan':
         final reqId = m['reqId'] as int;
-        final keyword = m['keyword'] as String;
+        final forms = (m['forms'] as List).map((e) => e as String).toList();
         final targets = <_ScanTarget>[];
         for (final t in m['targets'] as List) {
           final tm = t as Map;
@@ -11994,9 +13244,24 @@ void _scanWorkerMain(SendPort sp) {
               (path: tm['path'] as String, name: tm['name'] as String));
         }
         final includeYears = m['includeYears'] as bool;
+        final phrase = m['phrase'] as String?;
+        final queryIsExactPhrase = m['queryIsExactPhrase'] as bool? ?? false;
+        final caseQuery = m['caseQuery'] as String?;
+        final caseKeys =
+            ((m['caseSensitiveKeys'] as List?) ?? const [])
+                .map((e) => '$e')
+                .toSet();
         try {
           final out = _scanCorpusWorker(
-              keyword, targets, includeYears, texts, textsLower);
+            forms,
+            targets,
+            includeYears,
+            texts,
+            phrase: phrase,
+            queryIsExactPhrase: queryIsExactPhrase,
+            caseQuery: caseQuery,
+            caseSensitiveKeys: caseKeys,
+          );
           sp.send({
             'type': 'scanResult',
             'reqId': reqId,
@@ -12030,29 +13295,85 @@ void _scanWorkerMain(SendPort sp) {
 /// 在 worker 内执行全文扫描：正则匹配 + 上下文提取 + 句子提取。
 /// 文本与小写缓存来自 worker 常驻内存，不重复拷贝、不重复转换。
 _ScanOut _scanCorpusWorker(
-    String keyword,
-    List<_ScanTarget> targets,
-    bool includeYears,
-    Map<String, String> texts,
-    Map<String, String> textsLower) {
+  List<String> forms,
+  List<_ScanTarget> targets,
+  bool includeYears,
+  Map<String, String> texts, {
+  String? phrase,
+  bool queryIsExactPhrase = false,
+  String? caseQuery,
+  Set<String> caseSensitiveKeys = const <String>{},
+}) {
+  // 与高频导出共用 word_family / phrase_stats 口径：
+  //  - token 先 foldToken 再比对（café→cafe）；
+  //  - 大小写异义词按原始大小写精确匹配（March 与 march 分计）；
+  //  - 短语查询先按覆盖关系判定是否与首词合并，只输出一套结果。
+  final formsSet = {for (final f in forms) foldToken(f)};
+  final formRank = <String, int>{
+    for (var i = 0; i < forms.length; i++) foldToken(forms[i]): i,
+  };
   final rows = <_ScanRow>[];
-  final yearFreq = <int, int>{};
-  var totalFreq = 0;
-  final pattern = RegExp('\\b${RegExp.escape(keyword)}\\b');
+  final phraseRows = <_ScanRow>[];
+  final caseSensitive =
+      caseQuery != null && caseSensitiveKeys.contains(foldToken(caseQuery));
+  final caseToken = caseQuery?.trim() ?? '';
+  final head = phrase == null ? null : phraseHead(phrase);
+  final tracker =
+      phrase == null ? null : PhraseCoverageTracker({phrase: phrase});
+
+  ({_ScanRow row, int year}) buildRow(
+      String text, int start, int end, _ScanTarget t) {
+    // 上下文：在关键词两侧各取约等量字符，并修正到词边界
+    int beforeStart =
+        (start - _MainWindowState._maxContextHalf).clamp(0, text.length);
+    int afterEnd =
+        (end + _MainWindowState._maxContextHalf).clamp(0, text.length);
+    while (beforeStart > 0 &&
+        !_MainWindowState._whitespaceRegex.hasMatch(text[beforeStart - 1])) {
+      beforeStart--;
+    }
+    while (afterEnd < text.length &&
+        !_MainWindowState._whitespaceRegex.hasMatch(text[afterEnd])) {
+      afterEnd++;
+    }
+    var before = text.substring(beforeStart, start);
+    var after = text.substring(end, afterEnd);
+    // 平衡两侧长度使关键词居中：从较长侧远端截断
+    final diff = (before.length - after.length).abs();
+    if (diff > 5) {
+      if (before.length > after.length) {
+        before = '\'${before.substring(diff)}\'';
+      } else {
+        after = '\'${after.substring(0, after.length - diff)}\'';
+      }
+    }
+    final yearMatch = _MainWindowState._yearPrefixRegex.firstMatch(t.name);
+    final year = yearMatch == null ? -1 : int.parse(yearMatch.group(1)!);
+    return (
+      row: (
+        before: before,
+        keyword: text.substring(start, end),
+        after: after,
+        source: t.name,
+        filePath: t.path,
+        matchOffset: start,
+        sentence: _extractSentenceIsolate(text, start, end),
+      ),
+      year: year,
+    );
+  }
   for (final t in targets) {
     final text = texts[t.path];
     if (text == null || text.isEmpty) continue;
-    final lowerText = textsLower[t.path] ?? text.toLowerCase();
-    final matches = pattern.allMatches(lowerText);
-    for (final m in matches) {
-      if (includeYears) {
-        totalFreq++;
-        final yearMatch = _MainWindowState._yearPrefixRegex.firstMatch(t.name);
-        if (yearMatch != null) {
-          final y = int.parse(yearMatch.group(1)!);
-          yearFreq[y] = (yearFreq[y] ?? 0) + 1;
-        }
+    final headSpans = <String, List<(int, int)>>{};
+    for (final m in wordTokenRegExp.allMatches(text)) {
+      final tok = m.group(0)!;
+      final lw = foldToken(tok);
+      if (head != null && lw == head) {
+        (headSpans[lw] ??= <(int, int)>[]).add((m.start, m.end));
       }
+      final hit = caseSensitive ? tok == caseToken : formsSet.contains(lw);
+      if (!hit) continue;
       // 上下文：在关键词两侧各取约等量字符，并修正到词边界
       int beforeStart =
           (m.start - _MainWindowState._maxContextHalf).clamp(0, text.length);
@@ -12088,8 +13409,72 @@ _ScanOut _scanCorpusWorker(
         sentence: _extractSentenceIsolate(text, m.start, m.end),
       ));
     }
+    if (phrase != null) {
+      final spans = <(int, int)>[];
+      for (final pm in phraseRegExp(phrase).allMatches(text)) {
+        spans.add((pm.start, pm.end));
+        // 短语整条结果的上下文/例句与 token 行同口径
+        int beforeStart =
+            (pm.start - _MainWindowState._maxContextHalf).clamp(0, text.length);
+        int afterEnd =
+            (pm.end + _MainWindowState._maxContextHalf).clamp(0, text.length);
+        while (beforeStart > 0 &&
+            !_MainWindowState._whitespaceRegex
+                .hasMatch(text[beforeStart - 1])) {
+          beforeStart--;
+        }
+        while (afterEnd < text.length &&
+            !_MainWindowState._whitespaceRegex.hasMatch(text[afterEnd])) {
+          afterEnd++;
+        }
+        var before = text.substring(beforeStart, pm.start);
+        var after = text.substring(pm.end, afterEnd);
+        final diff = (before.length - after.length).abs();
+        if (diff > 5) {
+          if (before.length > after.length) {
+            before = "'${before.substring(diff)}'";
+          } else {
+            after = "'${after.substring(0, after.length - diff)}'";
+          }
+        }
+        phraseRows.add(buildRow(text, pm.start, pm.end, t).row);
+      }
+      tracker!.addPositions(
+        headTokenSpans: headSpans,
+        phraseSpans: spans.isEmpty
+            ? const <String, List<(int, int)>>{}
+            : <String, List<(int, int)>>{phrase: spans},
+      );
+    }
   }
-  return (rows: rows, yearFreq: yearFreq, totalFreq: totalFreq);
+  // 覆盖关系成立（或用户直接搜整条短语）→ 只输出短语整条结果；
+  // 否则维持首词自身 token 结果。两种结果不叠加。
+  final usePhrase = phrase != null &&
+      (queryIsExactPhrase || (tracker!.result()[phrase]?.merged ?? false));
+  final chosen = usePhrase ? phraseRows : rows;
+  chosen.sort((a, b) {
+    if (!usePhrase) {
+      final ra = formRank[foldToken(a.keyword)] ?? 999;
+      final rb = formRank[foldToken(b.keyword)] ?? 999;
+      if (ra != rb) return ra.compareTo(rb);
+    }
+    final c = a.filePath.compareTo(b.filePath);
+    if (c != 0) return c;
+    return a.matchOffset.compareTo(b.matchOffset);
+  });
+  final yearFreqOut = <int, int>{};
+  var totalFreqOut = 0;
+  if (includeYears) {
+    for (final r in chosen) {
+      totalFreqOut++;
+      final ym = _MainWindowState._yearPrefixRegex.firstMatch(r.source);
+      if (ym != null) {
+        final y = int.parse(ym.group(1)!);
+        yearFreqOut[y] = (yearFreqOut[y] ?? 0) + 1;
+      }
+    }
+  }
+  return (rows: chosen, yearFreq: yearFreqOut, totalFreq: totalFreqOut);
 }
 
 /// 提取匹配位置所在的完整句子（isolate 版，逻辑与 _extractSentence 一致）

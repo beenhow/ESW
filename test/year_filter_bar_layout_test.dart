@@ -30,6 +30,9 @@ Widget _host({
             yearCounts: {for (final y in years) y: 3},
             yearTotal: years.length * 3,
             textbookTotal: textbooks.length * 2,
+            word: 'taken',
+            wordFreq: 7,
+            textbookWordFreq: 3,
             selectedYear: null,
             selectedTextbook: null,
             selectedTextbookName: '',
@@ -59,6 +62,10 @@ void main() {
       textbooks: textbooks,
     ));
     expect(tester.takeException(), isNull);
+    expect(find.text('年份词频（共 36 次，taken 本词 7 次）'), findsOneWidget,
+        reason: '左侧标题应显示年份词频合计与被查词自身次数');
+    expect(find.text('教材分布（共 12 次，taken 本词 3 次）'), findsOneWidget,
+        reason: '右侧标题应显示教材分布合计与教材侧被查词自身次数');
 
     final panel = tester.getRect(find.byKey(const ValueKey('region-freq')));
     for (final y in years) {
@@ -95,6 +102,10 @@ void main() {
       textbooks: textbooks,
     ));
     expect(tester.takeException(), isNull);
+    expect(find.text('年份词频（共 36 次，taken 本词 7 次）'), findsOneWidget,
+        reason: '左侧标题应显示年份词频合计与被查词自身次数');
+    expect(find.text('教材分布（共 2 次，taken 本词 3 次）'), findsOneWidget,
+        reason: '右侧标题应显示教材分布合计与教材侧被查词自身次数');
 
     final panel = tester.getRect(find.byKey(const ValueKey('region-freq')));
     for (final y in years) {

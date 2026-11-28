@@ -3,7 +3,9 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'doc_extractor.dart';
+import 'phrase_stats.dart';
 import 'text_normalize.dart';
+import 'word_family.dart';
 
 /// 单词分类常量
 const wordCategories = ['真题词', '课标词', '拓展词', '超标词', '专有词'];
@@ -20,6 +22,13 @@ class VocabService {
   Map<String, List<String>> standardWordsLower = {};
   /// 小写 key 集合（快速查找）
   Set<String> standardWordsLowerKeySet = {};
+  /// 内置专有词（standard_words.json 中 category=专有词 的词条）
+  final List<String> builtinProperWords = [];
+  /// 内置专有词小写索引
+  final Set<String> builtinProperLowerSet = {};
+
+  /// 英美拼写合并后的「变体 → 主条」映射（来自课标库 extensions）
+  Map<String, String> spellingExtensionAliases = const {};
   /// 拓展词反向索引：{extension_word → base_word}
   Map<String, String> extendReverseIndex = {};
   /// 首字母索引
@@ -60,17 +69,19 @@ class VocabService {
       final jsonStr = await rootBundle.loadString('assets/standard_words.json');
       final raw = json.decode(jsonStr) as Map<String, dynamic>;
       extendReverseIndex.clear();
+      // 英美拼写变体（变体已挂主条 extensions）：还原为「变体 → 主条」
+      final extByBase = <String, Iterable<String>>{};
+      for (final e in raw.entries) {
+        final m = e.value as Map<String, dynamic>;
+        if ((m['category'] as String?) == '专有词') continue;
+        final exts = m['extensions'];
+        if (exts is List && exts.isNotEmpty) {
+          extByBase[e.key] = exts.map((x) => x.toString());
+        }
+      }
+      spellingExtensionAliases = buildExtensionSpellingAliases(extByBase);
       standardWords = raw.map((k, v) {
         final m = v as Map<String, dynamic>;
-        final exts = m['extensions'];
-        if (exts is List) {
-          for (final ext in exts) {
-            final extLower = ext.toString().toLowerCase();
-            if (extLower.isNotEmpty) {
-              extendReverseIndex[extLower] = k.toLowerCase();
-            }
-          }
-        }
         return MapEntry(k, {
           'category': (m['category'] as String?) ?? '',
           'pos': (m['pos'] as String?) ?? '',
@@ -84,6 +95,24 @@ class VocabService {
         standardWordsLower[lk]!.add(key);
       }
       standardWordsLowerKeySet = standardWordsLower.keys.toSet();
+      // 课标库 extensions → 主条反向索引（检测侧原样保留）；
+      // 词族归并的「形同义不同」排除只在 _familyBaseMap 里做。
+      extByBase.forEach((base, exts) {
+        final lb = base.toLowerCase();
+        for (final ext in exts) {
+          final le = ext.toLowerCase();
+          if (le.isNotEmpty && le != lb) extendReverseIndex[le] = lb;
+        }
+      });
+      // 内置专有词单独登记：可在查询页查询，但不按课标词参与导出统计
+      builtinProperWords
+        ..clear()
+        ..addAll(standardWords.entries
+            .where((e) => e.value['category'] == '专有词')
+            .map((e) => e.key));
+      builtinProperLowerSet
+        ..clear()
+        ..addAll(builtinProperWords.map((e) => e.toLowerCase()));
       wordsByFirstChar.clear();
       for (final key in standardWords.keys) {
         if (key.isEmpty) continue;
@@ -94,6 +123,9 @@ class VocabService {
       _loaded = true;
     } catch (_) {
       standardWords = {};
+      builtinProperWords.clear();
+      builtinProperLowerSet.clear();
+      spellingExtensionAliases = const {};
       _loaded = true;
     }
   }
@@ -108,7 +140,39 @@ class VocabService {
   }
 
   /// 判断是否课标词（大小写敏感；连字符复合词按部分判定）
-  bool isStandard(String word) => isWordEntryHit(standardWords, word);
+  bool isStandard(String word) {
+    final key = findWordEntryKey(standardWords, word);
+    if (key == null) return false;
+    // 专有词虽在课标库中（便于查询与释义），但不属于课标词统计口径
+    return standardWords[key]?['category'] != '专有词';
+  }
+
+  /// 是否内置专有词：精确大小写命中，或首字母大写的写法命中同名大写词条。
+  /// 纯小写写法不命中，避免 may/march 等大小写同形词被误判为专有词。
+  bool isBuiltinProper(String word) {
+    if (word.isEmpty) return false;
+    if (builtinProperWords.contains(word)) return true;
+    final first = word[0];
+    final isUpper = first.toUpperCase() == first && first.toLowerCase() != first;
+    return isUpper && builtinProperLowerSet.contains(word.toLowerCase());
+  }
+
+  /// 把内置专有词并入用户专有词库（[manualExtraWords]），按小写去重。
+  /// 返回新增条数。
+  int mergeBuiltinProperIntoManual() {
+    if (builtinProperWords.isEmpty) return 0;
+    var added = 0;
+    final lower = manualExtraWords.map((e) => e.toLowerCase()).toSet();
+    for (final w in builtinProperWords) {
+      if (lower.add(w.toLowerCase())) {
+        manualExtraWords.add(w);
+        classificationMemory.putIfAbsent(w.toLowerCase(), () => '专有词');
+        added++;
+      }
+    }
+    if (added > 0) _rebuildLowerSets();
+    return added;
+  }
 
   /// 判断是否拓展词（大小写敏感，小写词条可被大写写法命中）
   bool isExtend(String word) => matchWordEntryKey(extendWordKeySet, word) != null;
@@ -414,6 +478,8 @@ class VocabService {
   String? _classify(String word) {
     final man = _classifyManually(word);
     if (man != null) return man;
+    if (isBuiltinProper(word)) return '专有词';
+    if (spellingExtensionAliases.containsKey(word.toLowerCase())) return '拓展词';
     if (isStandard(word)) return '课标词';
     return null;
   }
@@ -421,7 +487,8 @@ class VocabService {
   /// 搜索建议（课标词 + 拓展词）
   List<String> searchSuggestions(String query, {int limit = 10}) {
     if (query.isEmpty) return [];
-    final lower = query.toLowerCase();
+    // 折叠后再匹配：弯撇号 o’ / 直撇号 o' 都能补全到 o'clock
+    final lower = wordLookupKey(query);
     final results = <String>[];
 
     // 首字母快速匹配
@@ -647,6 +714,49 @@ class VocabService {
   /// 返回 { "total": 总次数, "byYear": { "2023全国卷I": [{"text":..., "filePath":..., "offset":...}, ...], ... } }；
   /// 每个例句携带来源文件路径 filePath 与关键词在原文中的字符偏移 offset，供点击跳转定位。
   /// 若目录不存在或读取失败返回 null。
+  /// 同一个词的完整词族（与高频导出共用 word_family 实现）。
+  WordFamily familyFor(String word) {
+    final base = _familyBaseMap();
+    // extendWords 并入映射表键：课标库 extensions（spelled/bled/re 等）
+    // 也必须出现在词族成员里，与导出按同一张表结算。
+    return wordFamily(
+      word,
+      standardKeys: standardWords.keys,
+      extendWords: <String>{...extendWordKeySet, ...base.keys},
+      extBaseMap: base,
+      extensionAliases: spellingExtensionAliases,
+    );
+  }
+
+  /// 批量取词族根（一次构建映射表，供检测页「词族合并数」列使用）。
+  Map<String, String> familyRoots(Iterable<String> words) {
+    final base = _familyBaseMap();
+    final aliases = buildSpellingAliases(
+      standardWords.keys,
+      extraVariants: spellingExtensionAliases,
+    );
+    return {for (final w in words) w: familyRoot(w, aliases, base)};
+  }
+
+  Map<String, String> _familyBaseMap() {
+    final base = buildExtendBaseMap(
+      raw: extendBaseMap,
+      standardKeys: standardWords.keys,
+    );
+    // 课标库 extensions（英美拼写合并后的变体、合并过去的词形）全部纳入词族，
+    // 与导出一致：不再按界面「拓展词汇」列表做白名单过滤；
+    // 形同义不同的独立词条（found/left/born/lay/lost/rose/thought/would/
+    // should/might）不并入词族。
+    final stdKeys = <String>{
+      for (final k in standardWords.keys) foldWordText(k).trim().toLowerCase(),
+    };
+    extendReverseIndex.forEach((ext, root) {
+      if (stdKeys.contains(ext)) return;
+      base.putIfAbsent(ext, () => root);
+    });
+    return base;
+  }
+
   Future<Map<String, dynamic>?> getWordFrequency(
     String word,
     String corpusDirPath, {
@@ -655,13 +765,37 @@ class VocabService {
     final dir = Directory(corpusDirPath);
     if (!await dir.exists()) return null;
 
-    final wordPattern = RegExp(r'\b' + RegExp.escape(word) + r'\b', caseSensitive: false);
     final byYear = <String, List<Map<String, dynamic>>>{};
     int total = 0;
 
+    // 词族：被查词 + 英美对应拼写 + 归属同一课标原词的拓展变形。
+    // 与高频导出共用 word_family 的归并实现，保证两处数字一致。
+    final family = familyFor(word);
+    final formsSet = family.forms.toSet();
+    final formRank = <String, int>{
+      for (var i = 0; i < family.forms.length; i++) family.forms[i]: i,
+    };
+
+    // 短语与大小写异义词口径（与高频导出共用 phrase_stats）：
+    //  - 查询是课标短语、或查询是某短语首词时，先按覆盖关系判定是否合并；
+    //  - 大小写异义词（March/march 等）页面保持分别计数，按原始大小写精确匹配。
+    final phrases = buildStandardPhrases(standardWords.keys);
+    final caseGroups = buildCaseVariantGroups(standardWords.keys);
+    final query = word.trim();
+    final queryKey = foldToken(query);
+    final phrase = phraseTargetFor(query, phrases);
+    final queryIsExactPhrase = phrase != null && queryKey == phrase;
+    final caseSensitive = caseGroups.containsKey(queryKey);
+    var usePhrase = queryIsExactPhrase;
+
+    bool hit(String tok) {
+      if (caseSensitive) return tok == query;
+      return formsSet.contains(foldToken(tok));
+    }
+
     try {
       final txtFiles = dir
-          .listSync(recursive: true)
+          .listSync()
           .whereType<File>()
           .where(
             (f) =>
@@ -672,11 +806,34 @@ class VocabService {
           .toList()
         ..sort((a, b) => a.path.compareTo(b.path));
 
+      // 覆盖关系需要全量语料才能判定：短语首词的每次出现都落在短语内，
+      // 才把「according」与「according to」视为同一个词频（只统计一次）。
+      if (phrase != null && !queryIsExactPhrase) {
+        final tracker = PhraseCoverageTracker({phrase: phrases[phrase]!});
+        for (final file in txtFiles) {
+          final content =
+              normalizeCorpusText(decodeTextBytes(await file.readAsBytes()));
+          tracker.addText(content);
+        }
+        usePhrase = tracker.result()[phrase]?.merged ?? false;
+      }
+
       for (final file in txtFiles) {
         final yearKey = file.uri.pathSegments.last
             .replaceAll(RegExp(r'\.txt$', caseSensitive: false), '');
-        final content = decodeTextBytes(await file.readAsBytes());
-        final matches = wordPattern.allMatches(content).toList();
+        // 与高频导出同一套预处理：全角标点/弯引号归一 + token 折叠。
+        final content =
+            normalizeCorpusText(decodeTextBytes(await file.readAsBytes()));
+        final List<RegExpMatch> matches;
+        if (usePhrase) {
+          matches = phraseRegExp(phrase!).allMatches(content).toList();
+        } else {
+          // 与高频导出同一个分词器：连字符、撇号整体成词
+          matches = wordTokenRegExp
+              .allMatches(content)
+              .where((m) => hit(m.group(0)!))
+              .toList();
+        }
         if (matches.isNotEmpty) {
           byYear.putIfAbsent(yearKey, () => []);
           for (final m in matches) {
@@ -686,16 +843,33 @@ class VocabService {
               'text': content.substring(start, end).replaceAll('\n', ' ').trim(),
               'filePath': file.path,
               'offset': m.start,
+              'word': usePhrase ? phrase : foldToken(m.group(0)!),
             });
           }
           total += matches.length;
         }
+      }
+      // 每年内按显示优先级排序：被查词 → 对应拼写/原词 → 其他拓展变化
+      for (final list in byYear.values) {
+        list.sort((a, b) {
+          final ra = formRank[a['word']] ?? 999;
+          final rb = formRank[b['word']] ?? 999;
+          if (ra != rb) return ra.compareTo(rb);
+          return (a['offset'] as int).compareTo(b['offset'] as int);
+        });
       }
     } catch (_) {
       return null;
     }
 
     if (total == 0) return null;
-    return {'total': total, 'byYear': byYear};
+    return {
+      'total': total,
+      'byYear': byYear,
+      'forms': family.forms,
+      // 供界面注明口径：短语整条合并统计（不做字面重复叠加）。
+      'phraseMerged': phrase != null && usePhrase,
+      'phrase': phrase,
+    };
   }
 }

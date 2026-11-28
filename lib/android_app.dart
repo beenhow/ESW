@@ -29,7 +29,10 @@ import 'shared/word_sync_service.dart';
 import 'shared/webdav_client.dart';
 import 'shared/doc_extractor.dart';
 import 'shared/text_normalize.dart';
+import 'shared/phrase_stats.dart';
+import 'shared/word_family.dart';
 import 'shared/builtin_corpus.dart';
+import 'shared/builtin_textbook.dart';
 import 'shared/imported_corpus.dart';
 import 'shared/export_extra_table.dart';
 import 'shared/base_word_candidates.dart';
@@ -39,6 +42,8 @@ import 'shared/export_annotate_markup.dart';
 import 'shared/export_word_style.dart';
 import 'export_summary.dart';
 import 'shared/app_snack_bar.dart';
+import 'shared/vocab_report.dart';
+import 'android/mobile_vocab_report_page.dart';
 import 'shared/export_progress_overlay.dart';
 import 'shared/scan_camera_page.dart';
 import 'shared/scan_photo_page.dart';
@@ -46,22 +51,23 @@ import 'shared/scan_ocr_service.dart';
 import 'dictionary_service.dart';
 
 /// 安卓端当前版本号（显示与更新比较的唯一来源，发布版需与 pubspec 保持一致）。
-const String kAndroidAppVersion = '1.6.3';
+const String kAndroidAppVersion = '1.6.7';
 
 /// 原生 docx→PDF 通道：WebView 按 docx 原排版渲染后逐页写出 PDF。
 const MethodChannel _docxPdfChannel = MethodChannel('esw/docx_pdf');
 
-/// 生成导出文件名：ESW + 原文件名(去扩展名) + 检测结果 + 时间戳防重后缀。
+/// 生成导出文件名：ESW + 原文件名(去扩展名) + 标注方案（彩色打印 / 格式打印）。
 /// 源文件场景取 widget.fileName；为空（粘贴文本）时用「文本检测」兜底；
 /// 过滤 Windows 非法字符（\ / : * ? " < > | 及首尾空格）。
-String _exportBaseName(String rawFileName, String stamp) {
+String _exportBaseName(String rawFileName, ExportAnnotateScheme scheme) {
   var name = rawFileName.trim();
   if (name.isEmpty) name = '文本检测';
   final dot = name.lastIndexOf('.');
   if (dot > 0) name = name.substring(0, dot);
   name = name.replaceAll(RegExp(r'[\\/:*?"<>|]'), '').trim();
   if (name.isEmpty) name = '文本检测';
-  return 'ESW$name检测结果_$stamp';
+  final label = scheme == ExportAnnotateScheme.color ? '彩色打印' : '格式打印';
+  return 'ESW$name$label';
 }
 
 /// 应用文档目录缓存：启动路径多处获取同一目录，跨插件通道 await 有固定开销，缓存一次复用。
@@ -162,13 +168,18 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     await Future.wait([
       _vocab.loadStandardWords(),
       _loadConfig(),
-      _refreshTextbookCount(),
     ]);
+    // 内置专有词并入用户专有词库（去重后持久化），课标库与用户库两处都有数据
+    if (_vocab.mergeBuiltinProperIntoManual() > 0) {
+      await _saveConfig();
+    }
     await _initBuiltinCorpus();
+    await _initBuiltinTextbooks();
     // 内置释放完成后再恢复用户导入项：两者分开持有，同名文件由内置链路避让，
     // 不会互相覆盖；路径已不存在的条目静默跳过。
     await _restoreUserCorpusNames();
     await _refreshCorpusCount();
+    await _refreshTextbookCount();
     if (mounted) setState(() {});
     _maybePromptSync();
     // 后台统计按年份命中单词数（不阻塞首屏，检测页显示"加载中…"直至完成）
@@ -1026,6 +1037,25 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     }
   }
 
+  /// 首启释放内置教材（8 套）到应用教材目录，复用现有教材扫描/统计链路。
+  ///
+  /// - 不覆盖用户同名教材（改写为「{id}（内置）.txt」）；
+  /// - 内置文件记入独立清单，不写用户配置；
+  /// - 失败静默降级：没有内置教材时，手动导入/检测仍照常可用。
+  Future<void> _initBuiltinTextbooks() async {
+    try {
+      final index = await BuiltinTextbook.loadIndex();
+      if (index == null) return;
+      await BuiltinTextbook.installFlat(
+        textbookDir: await _textbookDirPath(),
+        version: index.version,
+        books: index.books,
+      );
+    } catch (_) {
+      // 静默降级：内置教材释放失败不影响手动导入与检测
+    }
+  }
+
   /// 启动时恢复用户主动导入的真题文件名（仅本应用内导入并写入配置的项）。
   ///
   /// 只认 corpus 目录中仍存在的 .txt；已删除/失效的条目静默丢弃并回写配置，
@@ -1612,6 +1642,8 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
     if (!await tbDir.exists()) {
       await tbDir.create(recursive: true);
     }
+    // 内置教材文件名清单：用户同名导入不覆盖内置文件，改名为「（用户）」
+    final builtinNames = await BuiltinTextbook.flatNames(tbDir.path);
 
     int success = 0;
     final failed = <String>[];
@@ -1633,7 +1665,11 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
         // 保留原名去扩展名，如 人教版必修一.docx → 人教版必修一.txt
         final dotIdx = f.name.lastIndexOf('.');
         final baseName = dotIdx > 0 ? f.name.substring(0, dotIdx) : f.name;
-        final out = File('${tbDir.path}/$baseName.txt');
+        var outName = '$baseName.txt';
+        if (builtinNames.contains(outName)) {
+          outName = '$baseName（用户）.txt';
+        }
+        final out = File('${tbDir.path}/$outName');
         await out.writeAsString(content);
         success++;
       } catch (e) {
@@ -2647,6 +2683,21 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                     ),
                   ),
                 ),
+                // 口径说明（与 Windows 一致）：短语整条合并，不做字面重复叠加。
+                if (data['phraseMerged'] == true) ...[
+                  const SizedBox(width: 6),
+                  const Flexible(
+                    child: Text(
+                      '短语合并，不重复叠加',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: AppTheme.textHint,
+                      ),
+                    ),
+                  ),
+                ],
               ],
             ),
             const SizedBox(height: 8),
@@ -2807,7 +2858,8 @@ class _AndroidEswAppState extends State<AndroidEswApp> {
                         .cast<Map<String, dynamic>>();
                     for (final s in sentences) {
                       final text = s['text'] as String? ?? '';
-                      if (text.toLowerCase().contains(word.toLowerCase())) {
+                      // 整词匹配：避免 men 命中 women、he 命中 the 这类子串误判
+                      if (keywordMatchRegExp(word).hasMatch(text)) {
                         final filePath = s['filePath'] as String? ?? '';
                         final offset = ((s['offset'] as num?) ?? 0).toInt();
                         if (filePath.isNotEmpty) {
@@ -3368,7 +3420,8 @@ class _CorpusSheetState extends State<CorpusSheet> {
     for (final name in _files) {
       try {
         final text = await File('${widget.dirPath}/$name').readAsString();
-        if (text.toLowerCase().contains(keyword.toLowerCase())) {
+        // 整词匹配：只按完整词形命中，避免子串误判
+        if (keywordMatchRegExp(keyword).hasMatch(text)) {
           found = name;
           break;
         }
@@ -3446,7 +3499,8 @@ class _CorpusSheetState extends State<CorpusSheet> {
     final keyword = widget.keyword?.trim() ?? '';
     if (content.length > _kReaderMaxChars) {
       if (keyword.isNotEmpty) {
-        final idx = content.toLowerCase().indexOf(keyword.toLowerCase());
+        // 整词定位：与高亮/词频同一口径，不按子串取偏移
+        final idx = keywordMatchOffset(content, keyword);
         if (idx >= 0) {
           final start = (idx - _kReaderMaxChars ~/ 3).clamp(0, content.length);
           content = content.substring(
@@ -4121,23 +4175,81 @@ class _AnalysisPageState extends State<_AnalysisPage> {
     try {
       final freqMap = <String, int>{};
       final caseMap = <String, String>{};
+      final observedForms = <String, Set<String>>{};
 
-      // 与后台 worker / Windows 端共用同一分词实现
-      for (final original in extractWordTokens(_text)) {
-        final lower = original.toLowerCase();
-        freqMap[lower] = (freqMap[lower] ?? 0) + 1;
-        if (!caseMap.containsKey(lower)) caseMap[lower] = original;
+      // 与后台 worker / Windows 端共用同一分词口径：
+      // extractAnalysisTokens（选项粘连剥离 + 保留 a/I）。
+      // 词条按词形分行，不复用高频导出的词族归并/排名口径。
+      for (final original in extractAnalysisTokens(_text)) {
+        final w = foldToken(original);
+        freqMap[w] = (freqMap[w] ?? 0) + 1;
+        caseMap.putIfAbsent(w, () => original);
+        (observedForms[w] ??= <String>{}).add(original);
       }
 
+      final standardWords = widget.vocab.standardWords;
+      final caseGroups = buildCaseVariantGroups(standardWords.keys);
+      // 非句首大写专有词判据（与高频导出共用 ProperNounStats）
+      final properStats = ProperNounStats(standardWords: <String>{
+        for (final e in standardWords.entries)
+          if (e.value['category'] != '专有词')
+            foldWordText(e.key).trim().toLowerCase(),
+      });
+      final sentenceRe = RegExp(r'[^.!?。！？]+[.!?。！？]');
+      for (final m in sentenceRe.allMatches(_text)) {
+        var first = true;
+        for (final raw in extractAnalysisTokens(m.group(0)!)) {
+          properStats.addToken(raw, analysisWordKey(raw),
+              isFirstInSentence: first);
+          first = false;
+        }
+      }
+      final autoProper = properStats.excluded;
+      // 词族合并数（与导出同口径），供页面同时展示「本词词频 / 词族合并数」
+      final familyRootMap = widget.vocab.familyRoots(freqMap.keys);
+      final familyFreqMap = <String, int>{};
+      freqMap.forEach((word, f) {
+        final root = familyRootMap[word] ?? word;
+        familyFreqMap[root] = (familyFreqMap[root] ?? 0) + f;
+      });
+
       _words = freqMap.entries.map((e) {
-        final lower = e.key;
-        final original = caseMap[lower] ?? lower;
+        final w = e.key;
+        final original = caseMap[w] ?? w;
+        final caseMembers = caseGroups[w];
+        // 行名固定用词库词条写法（与 Windows 一致）：
+        // 大小写异义词取小写词条、同义词别名显示目标词条、其余取词库原写法。
+        final entryKey = findWordEntryKey(standardWords, original);
+        final aliasTarget = builtinWordAliases[w];
+        final String display;
+        if (caseMembers != null) {
+          display = w;
+        } else if (aliasTarget != null) {
+          display =
+              findWordEntryKey(standardWords, aliasTarget) ?? aliasTarget;
+        } else {
+          display = entryKey ?? original;
+        }
+        // 分类按词条判定：大小写写法不再参与；同义词仍按本词归类，
+        // 避免影响检测结果导出的标注与汇总。
+        final classifyToken = caseMembers != null ? w : original;
+        final noteForms = <String>{};
+        final forms = observedForms[w] ?? const <String>{};
+        if (caseMembers != null) {
+          noteForms.addAll(caseMembers.where(forms.contains));
+        } else if (aliasTarget != null) {
+          noteForms.add(original);
+        }
+        final variantNote =
+            noteForms.isEmpty ? null : '含 ${noteForms.join(' / ')}';
         // 词形保留完整（couldn't / China's），查表按「完整词形 → 基形」回退，
         // 否则所有格与缩略形式会整段丢失课标/拓展/超标/专有分类。
-        final keys = wordLookupKeys(original);
-        final standardHit = widget.vocab.isStandard(original);
+        final keys = wordLookupKeys(classifyToken);
+        final libraryHit =
+            findWordEntryKey(standardWords, classifyToken) != null;
+        final standardHit = widget.vocab.isStandard(classifyToken);
         String? cat;
-        if (apostropheBaseInStandard(original, standardHit)) {
+        if (apostropheBaseInStandard(classifyToken, standardHit)) {
           // 常见缩写/所有格按基形归课标：I'm / can't / you've 不被历史分类
           // 或专有词误判
           cat = '课标词';
@@ -4150,7 +4262,9 @@ class _AnalysisPageState extends State<_AnalysisPage> {
             }
           }
           if (cat == null) {
-            if (isProperNounHit(widget.vocab.extraLowerSet, original)) {
+            if (isProperNounHit(widget.vocab.extraLowerSet, classifyToken) ||
+                // 非句首大写专有词（Londoners 这类）：与导出同一判据
+                (!libraryHit && autoProper.contains(w))) {
               // 首字母大写 / 全大写写法优先命中专有词；小写写法留给用户确认
               cat = '专有词';
             } else {
@@ -4170,9 +4284,11 @@ class _AnalysisPageState extends State<_AnalysisPage> {
           }
         }
         return _AnalyzedWord(
-          word: original,
+          word: display,
           frequency: e.value,
           category: cat ?? '其他',
+          variantNote: variantNote,
+          familyFreq: familyFreqMap[familyRootMap[w] ?? w] ?? e.value,
         );
       }).toList()..sort((a, b) => b.frequency.compareTo(a.frequency));
 
@@ -4383,6 +4499,11 @@ class _AnalysisPageState extends State<_AnalysisPage> {
               onPressed: _openCorpusSheet,
             ),
             IconButton(
+              icon: const Icon(Icons.description_outlined),
+              tooltip: '生成报告',
+              onPressed: _analyzing || _words.isEmpty ? null : _openReport,
+            ),
+            IconButton(
               icon: const Icon(Icons.download),
               tooltip: '导出结果',
               onPressed: _exportResult,
@@ -4517,6 +4638,24 @@ class _AnalysisPageState extends State<_AnalysisPage> {
                                     fontSize: 15,
                                     fontWeight: FontWeight.w600,
                                   ),
+                                ),
+                              ),
+                              const SizedBox(width: 6),
+                              if (aw.variantNote != null) ...[
+                                Text(
+                                  aw.variantNote!,
+                                  style: TextStyle(
+                                    fontSize: 10,
+                                    color: AppTheme.textHint,
+                                  ),
+                                ),
+                                const SizedBox(width: 6),
+                              ],
+                              Text(
+                                '${aw.frequency}·族${aw.familyFreq ?? aw.frequency}',
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  color: AppTheme.textHint,
                                 ),
                               ),
                               const SizedBox(width: 6),
@@ -5291,6 +5430,138 @@ class _AnalysisPageState extends State<_AnalysisPage> {
     return choice == 'continue';
   }
 
+  /// 生成词汇检测报告：数据源取本页检测结果 + 当前真题 / 教材语料，
+  /// 与 Windows 端共用 buildVocabReport 同一口径，页面只做移动端排版。
+  Future<void> _openReport() async {
+    if (_words.isEmpty || _analyzing) return;
+    ExportProgressOverlay? progress;
+    try {
+      progress = ExportProgressOverlay.begin(
+        context,
+        stage: '正在生成词汇检测报告…',
+        hint: '词条越多耗时越长，请稍候',
+      );
+      final std = widget.vocab.standardWords;
+      final words = <Map<String, dynamic>>[];
+      for (final w in _words) {
+        var level = '';
+        var base = '';
+        if (w.category == '课标词') {
+          final key = findWordEntryKey(std, w.word);
+          level = key == null ? '' : (std[key]?['category'] ?? '');
+        } else if (w.category == '拓展词') {
+          base = _baseWordOfAndroid(w.word);
+        }
+        words.add({
+          'word': w.word,
+          'category': w.category,
+          'textFreq': w.frequency,
+          'familyFreq': w.familyFreq ?? w.frequency,
+          'level': level,
+          'base': base,
+        });
+      }
+
+      await progress.setStage('正在读取真题语料…');
+      final corpusDocs = <Map<String, dynamic>>[];
+      final years = <int>{};
+      final cdir = _corpusDir;
+      if (cdir != null) {
+        final yearRe = RegExp(r'^(\d{4})');
+        // corpusNames 可能不带扩展名或仅含部分文件：过滤后为空时回退全量，
+        // 保证报告不会因为匹配口径差异变成「零语料」。
+        var names = widget.corpusNames.isEmpty
+            ? _corpusFiles
+            : _corpusFiles
+                .where((n) => widget.corpusNames.contains(n))
+                .toList();
+        if (names.isEmpty) names = _corpusFiles;
+        for (final name in names) {
+          String text;
+          try {
+            text = await File('$cdir/$name').readAsString();
+          } catch (_) {
+            continue;
+          }
+          final y =
+              int.tryParse(yearRe.firstMatch(name)?.group(1) ?? '') ?? 0;
+          if (y > 0) years.add(y);
+          var nm = name.replaceFirst(RegExp(r'\.txt$', caseSensitive: false), '');
+          nm = nm.replaceFirst(RegExp(r'^\d{4}\s*[-_· ]*'), '').trim();
+          corpusDocs.add({
+            'text': text,
+            'year': y,
+            'source': y <= 0 ? nm : '$y · $nm',
+          });
+        }
+      }
+
+      await progress.setStage('正在读取教材语料…');
+      final textbookDocs = <Map<String, dynamic>>[];
+      final tbIndex = <String, int>{};
+      final tdir = _textbookDir;
+      if (tdir != null) {
+        for (final name in _textbookFiles) {
+          String text;
+          try {
+            text = await File('$tdir/$name').readAsString();
+          } catch (_) {
+            continue;
+          }
+          final nm = name
+              .replaceFirst(RegExp(r'\.txt$', caseSensitive: false), '')
+              .replaceAll('_', ' ')
+              .trim();
+          final i = tbIndex[nm];
+          if (i == null) {
+            tbIndex[nm] = textbookDocs.length;
+            textbookDocs.add({'text': text, 'source': nm});
+          } else {
+            textbookDocs[i]['text'] = '${textbookDocs[i]['text']}\n$text';
+          }
+        }
+      }
+      final textbookNames = [
+        for (final d in textbookDocs) '${d['source']}'
+      ];
+
+      await progress.setStage('正在统计年份 / 教材覆盖与教学建议…');
+      final now = DateTime.now();
+      String two(int v) => v.toString().padLeft(2, '0');
+      var fileName = widget.fileName;
+      fileName =
+          fileName.replaceFirst(RegExp(r'\.(docx|doc|pdf|txt)$', caseSensitive: false), '');
+      final data = await buildVocabReport({
+        'fileName': fileName.isEmpty ? '文本检测' : fileName,
+        'text': _text,
+        'generatedAt': '${now.year}-${two(now.month)}-${two(now.day)} '
+            '${two(now.hour)}:${two(now.minute)}',
+        'corpusFileCount': corpusDocs.length,
+        'textbookNames': textbookNames,
+        'standardFolded': widget.vocab.standardWordsLowerKeySet.toList(),
+        'words': words,
+        'corpus': corpusDocs,
+        'textbooks': textbookDocs,
+        'years': (years.toList()..sort()),
+      });
+      progress.close();
+      progress = null;
+      if (!mounted) return;
+      await Navigator.of(context).push<void>(
+        MaterialPageRoute<void>(
+          builder: (_) => MobileVocabReportPage(data: data),
+        ),
+      );
+    } catch (e, st) {
+      progress?.close();
+      progress = null;
+      debugPrint('[VocabReport] android error: $e\n$st');
+      if (mounted) {
+        showAppSnackBar(context, '生成报告失败: $e', type: AppSnackBarType.error);
+      }
+    }
+  }
+
   /// 导出分析结果：标注方案 → 导出格式（docx / pdf）→ 生成文件。
   Future<void> _exportResult() async {
     // 导出前提示：仍有未筛选（安卓侧分类键为「其他」）的词时询问用户，
@@ -5326,10 +5597,6 @@ class _AnalysisPageState extends State<_AnalysisPage> {
     try {
       final dir = await _pickExportDir(context, isVocab: false);
       final exportDir = dir;
-      final ts = DateTime.now();
-      final stamp =
-          '${ts.year}${ts.month.toString().padLeft(2, '0')}${ts.day.toString().padLeft(2, '0')}'
-          '_${ts.hour.toString().padLeft(2, '0')}${ts.minute.toString().padLeft(2, '0')}${ts.second.toString().padLeft(2, '0')}';
 
       // 导出数据在主 isolate 同步构建并直接写盘，规避 isolate 消息合法性检查
       // （object is unsendable）导致的导出不可用；进度提示兜底长文档等待。
@@ -5342,7 +5609,7 @@ class _AnalysisPageState extends State<_AnalysisPage> {
       try {
         await progress.setStage('正在整理检测数据…');
         final exportData = await _buildExportTableDataAndroid(_text);
-        final baseName = _exportBaseName(widget.fileName, stamp);
+        final baseName = _exportBaseName(widget.fileName, scheme);
         final isPdf = choice == 'pdf';
         final path = '${exportDir.path}/$baseName.${isPdf ? 'pdf' : 'docx'}';
         await progress.setStage('正在写入${isPdf ? 'PDF' : 'DOCX'}文件…');
@@ -6020,6 +6287,8 @@ ${bodyParts.join('\n')}
     final map = <String, String>{};
     for (final w in _words) {
       final lower = w.word.toLowerCase();
+      // 单字母（a / I）不参与标注高亮：词频统计照旧，只在标注层跳过。
+      if (lower.length == 1) continue;
       final level = w.category == '课标词'
           ? (widget.vocab.lookup(w.word)['category'] ?? '')
           : '';
@@ -6646,6 +6915,8 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
 
     _catByLower = <String, String>{};
     for (final w in widget.words) {
+      // 单字母（a / I）不上高亮，避免整篇满屏标记。
+      if (w.word.length == 1) continue;
       _catByLower.putIfAbsent(wordLookupKey(w.word), () => w.category);
     }
 
@@ -6871,6 +7142,7 @@ class _SourcePopupViewerState extends State<_SourcePopupViewer> {
       _chunks = _splitChunks(replaced);
       _catByLower.clear();
       for (final w in widget.words) {
+        if (w.word.length == 1) continue; // 单字母不高亮
         _catByLower.putIfAbsent(w.word.toLowerCase(), () => w.category);
       }
       final offset = _locateTargetOffset();
@@ -6935,10 +7207,18 @@ class _AnalyzedWord {
   final int frequency;
   final String category;
 
+  /// 并列成员提示（「含 March」「含 TV」）：频次已合并计入 [frequency]。
+  final String? variantNote;
+
+  /// 词族合并数（本词 + 全部拓展形/变体），与导出口径一致。
+  final int? familyFreq;
+
   _AnalyzedWord({
     required this.word,
     required this.frequency,
     required this.category,
+    this.variantNote,
+    this.familyFreq,
   });
 }
 

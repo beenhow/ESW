@@ -20,11 +20,20 @@ class ImportedWordRow extends StatelessWidget {
     required this.onClassify,
     required this.onRemoveExtra,
     required this.onRemoveChaoGang,
+    this.variantNote,
+    this.familyFreq,
   });
 
   final String word;
   final String category;
   final int frequency;
+
+  /// 并列成员提示（「含 March」「含 TV」）：大小写异义词 / 同义词归并行的
+  /// 展示层补充，频次已合并计入 [frequency]。
+  final String? variantNote;
+
+  /// 词族合并数（本词 + 全部拓展形/变体）；为空时只展示本词词频。
+  final int? familyFreq;
 
   /// 当前筛选列（真题词 / 未筛选 / 课标词 / 拓展词 / 超标词 / 专有词）
   final String activeFilter;
@@ -82,21 +91,40 @@ class ImportedWordRow extends StatelessWidget {
                 const SizedBox(width: kGap10),
                 SizedBox(
                   width: 130,
-                  child: Text(
-                    word,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600,
-                      color: GlassTheme.ink,
-                      letterSpacing: 0.2,
-                    ),
+                  child: Row(
+                    children: [
+                      Flexible(
+                        child: Text(
+                          word,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                            color: GlassTheme.ink,
+                            letterSpacing: 0.2,
+                          ),
+                        ),
+                      ),
+                      if (variantNote != null) ...[
+                        const SizedBox(width: 4),
+                        Flexible(
+                          child: Text(
+                            variantNote!,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 10,
+                              color: GlassTheme.ink3,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
                   ),
                 ),
                 const Spacer(),
                 // ---- 未筛选：频次 + 筛选按钮 ----
                 if (isUnfilteredColumn) ...[
-                  _freqColumn(frequency, color),
+                  _freqColumns(),
                   const SizedBox(width: kGap6),
                   _classifyButton(),
                 ]
@@ -117,17 +145,17 @@ class ImportedWordRow extends StatelessWidget {
                   const Spacer(),
                   _removeChip(color, onRemoveChaoGang),
                   const Spacer(),
-                  _freqColumn(frequency, color),
+                  _freqColumns(),
                 ]
                 // ---- 课标词 / 拓展词：标签 + 频次 ----
                 else if (!isUnclassified) ...[
                   _categoryTag(category, color),
                   const Spacer(),
-                  _freqColumn(frequency, color),
+                  _freqColumns(),
                 ]
                 // ---- 真题词列中的未归类词：仅频次（归类入口在未筛选列）----
                 else ...[
-                  _freqColumn(frequency, color),
+                  _freqColumns(),
                   const Spacer(),
                 ],
                 const SizedBox(width: kGap4),
@@ -162,18 +190,32 @@ class ImportedWordRow extends StatelessWidget {
     );
   }
 
-  Widget _freqColumn(int frequency, Color color) {
+  /// 本词词频 + 词族合并数（与导出同口径）并排展示。
+  Widget _freqColumns() {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _freqColumn('本词', frequency, color),
+        if (familyFreq != null) ...[
+          const SizedBox(width: kGap6),
+          _freqColumn('词族', familyFreq!, color),
+        ],
+      ],
+    );
+  }
+
+  Widget _freqColumn(String label, int value, Color color) {
     return SizedBox(
-      width: 56,
+      width: 48,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          const Text(
-            '频次',
-            style: TextStyle(fontSize: 9, color: GlassTheme.ink3),
+          Text(
+            label,
+            style: const TextStyle(fontSize: 9, color: GlassTheme.ink3),
           ),
           Text(
-            '$frequency',
+            '$value',
             style: TextStyle(
               fontSize: 12,
               fontWeight: FontWeight.bold,

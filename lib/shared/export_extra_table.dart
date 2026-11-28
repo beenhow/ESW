@@ -48,6 +48,31 @@ final List<_SectionRule> _sectionRules = [
   _SectionRule('写作', RegExp(r'书面表达|写作[（(共]|^\s*写作')),
 ];
 
+/// 识别文本中的题型区块起点（行级匹配，规则与下面的拓展词题型分组同源）。
+///
+/// 返回按出现顺序排列的 (题型名, 字符偏移)；同一题型只取首次出现。
+/// 供词汇检测报告按「该词所在题型」分组，避免报告与拓展词表出现两套题型口径。
+List<({String name, int start})> detectQuestionSections(String text) {
+  final result = <({String name, int start})>[];
+  final seen = <String>{};
+  var offset = 0;
+  for (final line in text.split('\n')) {
+    final l = line.trim().toLowerCase();
+    if (l.isNotEmpty) {
+      for (final rule in _sectionRules) {
+        if (seen.contains(rule.name)) continue;
+        if (rule.re.hasMatch(l)) {
+          seen.add(rule.name);
+          result.add((name: rule.name, start: offset));
+          break;
+        }
+      }
+    }
+    offset += line.length + 1;
+  }
+  return result;
+}
+
 /// 句子切分/选项碎片/汉字/词切分等正则均为模块级复用，避免在例句提取
 /// 热路径中反复编译；单词匹配用 indexOf + 字母边界手工校验代替正则。
 final RegExp _sentenceRe = RegExp(r'[^.!?。！？]+[.!?。！？]');

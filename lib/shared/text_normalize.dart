@@ -230,6 +230,33 @@ String foldWordText(String raw) {
   return buf.toString();
 }
 
+/// 语料统一预处理：全角标点转半角、弯引号转直引号。
+///
+/// 与 [foldWordText] 分工：本函数只改标点/引号（全部为 1:1 替换，不改变
+/// 字符串长度，因此既有的字符偏移仍可用于原文定位/高亮），不改单词字符；
+/// 单词级折叠由 [foldToken] 负责。检测页与高频导出必须共用本函数，
+/// 否则同一语料在页面与导出表会得到不同的切句/分词结果。
+String normalizeCorpusText(String raw) {
+  if (raw.isEmpty) return raw;
+  return raw
+      .replaceAll('\uFF0C', ',')
+      .replaceAll('\uFF0E', '.')
+      .replaceAll('\uFF1B', ';')
+      .replaceAll('\uFF1A', ':')
+      .replaceAll('\uFF01', '!')
+      .replaceAll('\uFF1F', '?')
+      .replaceAll('\u2018', "'")
+      .replaceAll('\u2019', "'")
+      .replaceAll('\u201C', '"')
+      .replaceAll('\u201D', '"');
+}
+
+/// 统一 token 折叠：先小写，再做 [foldWordText] 的字符折叠。
+///
+/// 检测页、短语覆盖判定与高频导出都用它，保证 café / o’clock / 全角字母
+/// 在页面与导出表得到同一个键。
+String foldToken(String raw) => foldWordText(raw.toLowerCase());
+
 /// Latin-1 常见变音字母 → ASCII（大小写保持）。
 const Map<int, String> _foldLatin1 = {
   0xC0: 'A', 0xC1: 'A', 0xC2: 'A', 0xC3: 'A', 0xC4: 'A', 0xC5: 'A',
@@ -283,6 +310,17 @@ final RegExp annotatedWordRegExp = RegExp(
 /// 词表与分类映射都以折叠后的小写为键；原文里的 `couldn’t` 必须与词表里的
 /// `couldn't` 命中同一条，否则会落到「未筛选」。
 String wordLookupKey(String token) => foldWordText(token).toLowerCase();
+
+/// 词频/整词统计口径：与分词器一致，连字符、撇号整体成词，大小写不敏感。
+///
+/// 用于替代 `\b关键词\b`：后者会把 `the-based`、`he's` 里的片段单独计数，
+/// 与导出高频表（按 [wordTokenRegExp] 切词）产生差异。
+Iterable<RegExpMatch> wordTokenMatches(String text, String keyword) {
+  final kw = keyword.toLowerCase();
+  return wordTokenRegExp
+      .allMatches(text)
+      .where((m) => m.group(0)!.toLowerCase() == kw);
+}
 
 /// 原文定位/高亮用的关键词正则（与 [wordTokenRegExp] 同一口径）。
 ///
@@ -567,6 +605,53 @@ bool _hasUppercaseBeforeOptionLetter(String token) {
   return prev >= 0x41 && prev <= 0x5A;
 }
 
+/// 选项字母粘连剥离（itB → it）。
+///
+/// 与 [extractWordTokens] 内部规则同源，供检测页与高频导出逐 token 复用，
+/// 保证两侧对同一条粘连词得到同一个词形。
+String stripOptionGlueFromToken(String token) {
+  if (token.length < 3 ||
+      _isAllCaps(token) ||
+      _optionGlueExceptions.contains(token) ||
+      // McA/McB/McC 这类三字母人名缩写不按选项粘连处理
+      (token.length == 3 && token.startsWith('Mc')) ||
+      // MoMA 这类真缩写：末尾 A-H 紧跟大写，属于缩写块，不能剥离
+      _hasUppercaseBeforeOptionLetter(token)) {
+    return token;
+  }
+  final glued = _optionGlueRe.firstMatch(token);
+  return glued?.group(1) ?? token;
+}
+
+/// 检测页与高频导出共用的单 token 分析归一：
+///  - 选项字母粘连剥离（与 [extractWordTokens] 同一规则，itB → it）；
+///  - 单字母只保留 a / I（英语中仅这两个单字母词有实义），其余丢弃。
+///
+/// 返回 null 表示该 token 不参与统计。
+String? normalizeAnalysisToken(String token) {
+  final t = stripOptionGlueFromToken(token);
+  if (t.isEmpty) return null;
+  if (t.length == 1) {
+    final lower = t.toLowerCase();
+    if (lower != 'a' && lower != 'i') return null;
+  }
+  return t;
+}
+
+/// 检测页与高频导出共用的分析分词：与 [extractWordTokens] 完全同一实现
+/// （字符折叠 + 撇号空格并回 + 选项字母剥离），并在其基础上保留单字母 a / I。
+///
+/// 两侧必须都调用本方法，否则 `a`/`I` 与 `itB` 这类粘连词在两处会得到不同词形。
+List<String> extractAnalysisTokens(String raw) {
+  if (raw.isEmpty) return const <String>[];
+  final out = <String>[];
+  for (final token in extractWordTokens(raw, minLength: 1)) {
+    final normalized = normalizeAnalysisToken(token);
+    if (normalized != null) out.add(normalized);
+  }
+  return out;
+}
+
 /// 从任意文本提取统一词 token（已折叠连字/变音/全角，并剥离选项字母粘连）。
 ///
 /// 两端（Windows / Android）以及语料统计、年份命中统计都应使用本方法，
@@ -588,17 +673,7 @@ List<String> extractWordTokens(
   for (final m in wordTokenRegExp.allMatches(folded)) {
     var token = m.group(0)!;
     if (token.length < minLength) continue;
-    if (stripOptionGlue &&
-        token.length >= 3 &&
-        !_isAllCaps(token) &&
-        !_optionGlueExceptions.contains(token) &&
-        // McA/McB/McC 这类三字母人名缩写不按选项粘连处理
-        !(token.length == 3 && token.startsWith('Mc')) &&
-        // MoMA 这类真缩写：末尾 A-H 紧跟大写，属于缩写块，不能剥离
-        !_hasUppercaseBeforeOptionLetter(token)) {
-      final glued = _optionGlueRe.firstMatch(token);
-      if (glued != null) token = glued.group(1)!;
-    }
+    if (stripOptionGlue) token = stripOptionGlueFromToken(token);
     if (token.length >= minLength) out.add(token);
   }
   return out;

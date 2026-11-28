@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "generatedAt": "2026-11-26",
+  "count": 8,
+  "totalChars": 2683781,
+  "books": [
+    {
+      "id": "人教版",
+      "title": "人教版",
+      "file": "txt/人教版.txt",
+      "chars": 390178
+    },
+    {
+      "id": "冀教版",
+      "title": "冀教版",
+      "file": "txt/冀教版.txt",
+      "chars": 488989
+    },
+    {
+      "id": "北师大版",
+      "title": "北师大版",
+      "file": "txt/北师大版.txt",
+      "chars": 321367
+    },
+    {
+      "id": "外研社",
+      "title": "外研社",
+      "file": "txt/外研社.txt",
+      "chars": 346430
+    },
+    {
+      "id": "沪外版",
+      "title": "沪外版",
+      "file": "txt/沪外版.txt",
+      "chars": 184435
+    },
+    {
+      "id": "沪教版",
+      "title": "沪教版",
+      "file": "txt/沪教版.txt",
+      "chars": 277380
+    },
+    {
+      "id": "译林版",
+      "title": "译林版",
+      "file": "txt/译林版.txt",
+      "chars": 433750
+    },
+    {
+      "id": "重大版",
+      "title": "重大版",
+      "file": "txt/重大版.txt",
+      "chars": 241252
+    }
+  ]
+}

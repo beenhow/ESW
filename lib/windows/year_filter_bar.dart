@@ -15,6 +15,9 @@ class YearFilterBar extends StatelessWidget {
     required this.yearCounts,
     required this.yearTotal,
     required this.textbookTotal,
+    required this.word,
+    required this.wordFreq,
+    required this.textbookWordFreq,
     required this.selectedYear,
     required this.selectedTextbook,
     required this.selectedTextbookName,
@@ -37,6 +40,15 @@ class YearFilterBar extends StatelessWidget {
   /// 标题里的总次数：真题命中总数 / 教材命中总数
   final int yearTotal;
   final int textbookTotal;
+
+  /// 当前被查词本身（不含变体）与其真题命中次数。
+  /// 与 [yearTotal] 同一合并口径（含短语覆盖合并，不做字面重复叠加），
+  /// 因此两处数字一致。
+  final String word;
+  final int wordFreq;
+
+  /// 教材侧命中数，与 [textbookTotal] 同口径。
+  final int textbookWordFreq;
 
   final int? selectedYear;
   final String? selectedTextbook;
@@ -83,8 +95,12 @@ class YearFilterBar extends StatelessWidget {
                 children: [
                   Expanded(
                     child: Text(
-                      '词频年份 ($yearTotal 次) 与教材分布($textbookTotal 次)',
+                      word.isEmpty
+                          ? '年份词频（共 $yearTotal 次）'
+                          : '年份词频（共 $yearTotal 次，$word 本词 $wordFreq 次）',
                       textAlign: TextAlign.left,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
                         fontSize: GlassTheme.fBody,
                         fontWeight: FontWeight.w600,
@@ -92,11 +108,19 @@ class YearFilterBar extends StatelessWidget {
                       ),
                     ),
                   ),
-                  const Text(
-                    '检测后自动标注高频年份',
-                    style: TextStyle(
-                      fontSize: GlassTheme.fMicro,
-                      color: GlassTheme.ink3,
+                  Expanded(
+                    child: Text(
+                      word.isEmpty
+                          ? '教材分布（共 $textbookTotal 次）'
+                          : '教材分布（共 $textbookTotal 次，$word 本词 $textbookWordFreq 次）',
+                      textAlign: TextAlign.right,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: GlassTheme.fBody,
+                        fontWeight: FontWeight.w600,
+                        color: GlassTheme.ink,
+                      ),
                     ),
                   ),
                 ],

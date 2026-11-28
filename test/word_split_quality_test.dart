@@ -1,5 +1,7 @@
 import 'dart:io';
 
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:xml/xml.dart';
 
@@ -122,6 +124,13 @@ void main() {
       expect(wordLookupKeys("can't").any(<String>{'can'}.contains), isTrue);
       expect(wordLookupKeys("we're").any(<String>{'we'}.contains), isTrue);
       expect(wordLookupKeys('couldn').any(<String>{'china'}.contains), isFalse);
+    });
+
+    test('词频统计口径与分词一致（the-based 不计入 the）', () {
+      // 页面频次与导出高频表必须用同一分词口径，否则同一单词两处数字不一致
+      expect(wordTokenMatches('the-based the day The', 'the').length, 2);
+      expect(wordTokenMatches("he's he", 'he').length, 1);
+      expect(wordTokenMatches('TV tv Television', 'tv').length, 2);
     });
 
     test('多选项粘连行经规范化后不残留 realB 类 token', () {
@@ -402,6 +411,51 @@ void main() {
     test('空关键词不产生零宽命中', () {
       expect(keywordMatchRegExp('').hasMatch('anything'), isFalse);
       expect(keywordMatchOffset('anything', ''), -1);
+    });
+  });
+
+  group('检测链路一律整词匹配（不得子串命中）', () {
+    test('men 不命中 women / achievement', () {
+      final re = keywordMatchRegExp('men');
+      expect(re.hasMatch('men and women'), isTrue);
+      expect(re.hasMatch('women'), isFalse);
+      expect(re.hasMatch('achievement'), isFalse);
+      expect(re.hasMatch('menus'), isFalse);
+      // 所有格仍按整词命中
+      expect(re.hasMatch("the men's room"), isTrue);
+    });
+
+    test('分词统计里 men 只计独立词形', () {
+      final toks = extractWordTokens('women achievement men menus');
+      expect(toks.where((t) => t.toLowerCase() == 'men').length, 1);
+    });
+  });
+
+  group('课标词库数据：撇号与变体扩展', () {
+    late Map<String, dynamic> std;
+    setUpAll(() {
+      std = jsonDecode(File('assets/standard_words.json').readAsStringSync())
+          as Map<String, dynamic>;
+    });
+
+    test("o'clock 以直撇号收录，直/弯撇号都能命中", () {
+      expect(std.containsKey("o'clock"), isTrue);
+      expect(std.containsKey('o\u2019clock'), isFalse,
+          reason: '不应保留弯撇号键，否则两种写法都查不到');
+      expect(findWordEntryKey(std, "o'clock"), "o'clock");
+      expect(findWordEntryKey(std, 'o\u2019clock'), "o'clock",
+          reason: '弯撇号写法应折叠后命中同一条');
+    });
+
+    test('men/women/mice 挂在 man/woman/mouse 的 extensions', () {
+      List<String> exts(String base) =>
+          ((std[base] as Map<String, dynamic>)['extensions'] as List)
+              .map((e) => '$e')
+              .toList();
+      expect(exts('man'), contains('men'));
+      expect(exts('woman'), contains('women'));
+      expect(exts('mouse'), contains('mice'));
+      expect(exts('internet'), contains('Internet'));
     });
   });
 }

@@ -4,7 +4,7 @@ project(ESW LANGUAGES CXX)
 
 # The name of the executable created for the application. Change this to change
 # the on-disk name of your application.
-set(BINARY_NAME "ESW1.6.4")
+set(BINARY_NAME "ESW1.6.7")
 
 # Explicitly opt in to modern CMake behaviors to avoid warnings with recent
 # versions of CMake.
@@ -56,6 +56,29 @@ add_subdirectory("runner")
 # Generated plugin build rules, which manage building the plugins and adding
 # them to the application.
 include(flutter/generated_plugins.cmake)
+
+# pdfrx 在配置阶段用符号链接把 .lib/latest 指向 pdfium 解压目录。
+# 在无符号链接权限（或文件系统重定向）的构建环境里该链接会失效，
+# 表现为编译期找不到 fpdfview.h、安装期找不到 pdfium.dll。
+# 这里直接把真实解压目录补进 pdfrx 的头文件路径，并把随包 dll 换成真实路径；
+# 链接正常时这些设置与链接结果等价，不影响常规构建。
+if(WIN32 AND TARGET pdfrx)
+  set(_esw_pdfium_src "${CMAKE_BINARY_DIR}/pdfium/chromium%2F7202")
+  if(EXISTS "${_esw_pdfium_src}/include/fpdfview.h")
+    target_include_directories(pdfrx PRIVATE "${_esw_pdfium_src}/include")
+    if(EXISTS "${_esw_pdfium_src}/x64/pdfium.dll")
+      set(_esw_fixed_libs "")
+      foreach(_lib IN LISTS PLUGIN_BUNDLED_LIBRARIES)
+        if(_lib MATCHES "[/\\\\]\\.lib[/\\\\]latest[/\\\\]x64[/\\\\]pdfium\\.dll$")
+          list(APPEND _esw_fixed_libs "${_esw_pdfium_src}/x64/pdfium.dll")
+        else()
+          list(APPEND _esw_fixed_libs "${_lib}")
+        endif()
+      endforeach()
+      set(PLUGIN_BUNDLED_LIBRARIES "${_esw_fixed_libs}")
+    endif()
+  endif()
+endif()
 
 
 # === Installation ===

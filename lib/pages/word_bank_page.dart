@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/cupertino.dart' show CupertinoPageRoute;
-import 'package:flutter/services.dart' show rootBundle;
+import 'package:flutter/services.dart'
+    show rootBundle, FilteringTextInputFormatter;
 import 'dart:convert';
 import 'dart:io';
 import 'package:file_picker/file_picker.dart';
@@ -324,8 +325,120 @@ class _WordBankPageState extends State<WordBankPage> {
   /// 导出高频词表（Word(docx) / Excel(xlsx) 可选）：复用 HighFreqExporter
   /// 核心逻辑（词频口径、课标/拓展归属、停用词与星期月份序数词排除、例句
   /// 精确匹配、双格式生成），保存到 Download/esw_exports 并提示完整路径。
+  /// 选导出词数：只保留「全部导出」与「自定义词数」两档。
+  /// 「全部导出」= 整本课标词库（含频次 0），不做前 N 截断。
+  Future<({bool all, int limit})?> _askExportWordLimit(
+      String sourceLabel) async {
+    final ctrl = TextEditingController(text: '3000');
+    String? error;
+    var allStdWords = true;
+    final result = await showDialog<({bool all, int limit})>(
+      context: context,
+      builder: (dctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) {
+          int? parse() => int.tryParse(ctrl.text.trim());
+          return AlertDialog(
+            title: const Text('选择导出词数'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  '$sourceLabel语料：选择「全部导出」或输入自定义词数',
+                  style: const TextStyle(fontSize: 13),
+                ),
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 8,
+                  children: [
+                    ChoiceChip(
+                      label: const Text('全部导出'),
+                      selected: allStdWords,
+                      onSelected: (_) => setDialogState(() {
+                        allStdWords = true;
+                        error = null;
+                      }),
+                    ),
+                    ChoiceChip(
+                      label: const Text('自定义词数'),
+                      selected: !allStdWords,
+                      onSelected: (_) => setDialogState(() {
+                        allStdWords = false;
+                        error = null;
+                      }),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: ctrl,
+                  enabled: !allStdWords,
+                  keyboardType: TextInputType.number,
+                  inputFormatters: [
+                    FilteringTextInputFormatter.digitsOnly,
+                  ],
+                  decoration: InputDecoration(
+                    labelText: '自定义词数（1–50000）',
+                    hintText: '例如 1500',
+                    errorText: error,
+                  ),
+                  onChanged: (_) => setDialogState(() {
+                    allStdWords = false;
+                    error = null;
+                  }),
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(dctx),
+                child: const Text('取消'),
+              ),
+              FilledButton(
+                onPressed: () {
+                  if (allStdWords) {
+                    Navigator.pop(dctx, (all: true, limit: 0));
+                    return;
+                  }
+                  final n = parse();
+                  if (n == null || n < 1 || n > 50000) {
+                    setDialogState(() => error = '请输入 1–50000 之间的整数');
+                    return;
+                  }
+                  Navigator.pop(dctx, (all: false, limit: n));
+                },
+                child: const Text('确定'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    ctrl.dispose();
+    return result;
+  }
+
   Future<void> _exportHighFreq() async {
     if (_exportingHighFreq) return;
+    // 1) 语料来源：真题 / 教材
+    final source = await showEswChoice<String>(
+      context,
+      title: '选择导出语料',
+      message: '请选择要统计的语料来源：',
+      icon: Icons.library_books_outlined,
+      choices: const [
+        EswDialogChoice(label: '真题', value: 'exam', primary: true),
+        EswDialogChoice(label: '教材', value: 'textbook'),
+      ],
+    );
+    if (source == null || !mounted) return;
+    final isTextbook = source == 'textbook';
+    final sourceLabel = isTextbook ? '教材' : '真题';
+    // 2) 导出词数：全部导出 / 自定义词数
+    final limitChoice = await _askExportWordLimit(sourceLabel);
+    if (limitChoice == null || !mounted) return;
+    final allStdWords = limitChoice.all;
+    final wordLimit = limitChoice.limit;
     final format = await showEswChoice<String>(
       context,
       title: '选择导出格式',
@@ -342,23 +455,42 @@ class _WordBankPageState extends State<WordBankPage> {
     ExportProgressOverlay? progress;
     try {
       final docsDir = await _appDocDir();
-      final corpusDir = '$docsDir/corpus';
-      if (!await _hasRealCorpus()) {
-        final imported = await _promptCorpusImport();
-        if (!imported) return;
-        if (!await _hasRealCorpus()) {
+      final String corpusDir;
+      final Set<String>? activeNames;
+      if (isTextbook) {
+        // 教材：内置 8 套 + 用户导入都在应用文档目录/textbook（均为 txt）
+        corpusDir = '$docsDir/textbook';
+        final dir = Directory(corpusDir);
+        final hasTxt = dir.existsSync() &&
+            dir.listSync().whereType<File>().any(
+                (f) => f.path.toLowerCase().endsWith('.txt'));
+        if (!hasTxt) {
           if (mounted) {
-            showAppSnackBar(
-              context,
-              '未找到真题语料目录（应用文档目录/corpus），请先导入真题语料',
-              type: AppSnackBarType.error,
-            );
+            showAppSnackBar(context, '未找到教材语料，请先导入教材',
+                type: AppSnackBarType.error);
           }
           return;
         }
+        activeNames = null;
+      } else {
+        corpusDir = '$docsDir/corpus';
+        if (!await _hasRealCorpus()) {
+          final imported = await _promptCorpusImport();
+          if (!imported) return;
+          if (!await _hasRealCorpus()) {
+            if (mounted) {
+              showAppSnackBar(
+                context,
+                '未找到真题语料目录（应用文档目录/corpus），请先导入真题语料',
+                type: AppSnackBarType.error,
+              );
+            }
+            return;
+          }
+        }
+        activeNames = await widget.resolveCorpusNames();
       }
       // 预估导出耗时（对齐 Windows 版）：按 corpus 目录 .txt 总字节数估算（约 7 秒/MB）
-      final activeNames = await widget.resolveCorpusNames();
       int corpusBytes = 0;
       try {
         final cDir = Directory(corpusDir);
@@ -380,7 +512,7 @@ class _WordBankPageState extends State<WordBankPage> {
       // 统一导出等待提示：延迟 500ms 未完成才浮出，保留原「预计用时」信息
       progress = ExportProgressOverlay.begin(
         context,
-        stage: '正在统计真题词频并生成词表…请稍候',
+        stage: '正在统计$sourceLabel词频并生成词表…请稍候',
         hint: '预计用时约$estMin 分钟，请耐心等待',
       );
 
@@ -409,6 +541,8 @@ class _WordBankPageState extends State<WordBankPage> {
         extendWordsRaw: extendWordsRaw,
         format: format,
         onlyFileNames: activeNames,
+        wordLimit: wordLimit,
+        allStdWords: allStdWords,
       );
       final outBytes = result.format == 'docx'
           ? result.docxBytes!
@@ -419,18 +553,16 @@ class _WordBankPageState extends State<WordBankPage> {
       if (!mounted) return;
       final dir = await _pickExportDir(context, isVocab: false);
       final ext = result.format == 'docx' ? 'docx' : 'xlsx';
-      final now = DateTime.now();
-      final stamp =
-          '${now.year}${now.month.toString().padLeft(2, '0')}${now.day.toString().padLeft(2, '0')}'
-          '_${now.hour.toString().padLeft(2, '0')}${now.minute.toString().padLeft(2, '0')}${now.second.toString().padLeft(2, '0')}';
-      final savePath = '${dir.path}/ESW-高考高频词表_$stamp.$ext';
+      final savePath =
+          '${dir.path}/ESW-${isTextbook ? '教材' : '高考'}高频'
+          '${allStdWords ? '课标词表' : '$wordLimit词表'}.$ext';
       await File(savePath).writeAsBytes(outBytes);
 
       if (mounted) {
         final fmtName = result.format == 'docx' ? 'Word(docx)' : 'Excel(xlsx)';
         showAppSnackBar(
           context,
-          '导出高频完成（$fmtName）：${result.exportedWords} 词（${result.corpusFileCount} 篇真题语料，已排除星期/月份/序数词 ${result.calendarOrdinalExcluded.length} 个），已保存至 $savePath',
+          '导出高频完成（$fmtName）：${result.exportedWords} 词（${result.corpusFileCount} 篇$sourceLabel语料），已保存至 $savePath',
         );
       }
     } catch (e, st) {
@@ -676,7 +808,7 @@ class _WordBankPageState extends State<WordBankPage> {
             }
           },
           child: Text(
-            'V1.6.3 · github.com/beenhow/ESW',
+            'V1.6.7 · github.com/beenhow/ESW',
             style: EswText.caption.copyWith(color: EswColors.textSecondary),
           ),
         ),

@@ -6,11 +6,13 @@
 ///   - 词典释义（ecdict.db，去除 [v:43/n:57] 词性频率标记）
 ///   - 优选真题例句（默认 2 条、优先最近年份、同词例句年份不重复、标注年份；
 ///     候选含词条归并的拓展词/变体，并剥离原文中文括号注释，保证高频课标词有例句）
-///   - 排除超标词与专有词（专有词按非句首大写比例启发式识别）
-///   - 排除星期/月份/序数词（含其缩写与词库拓展/屈折形式，如 Tuesdays）
+///   - 课标词表（3333）内的词一律参与统计，不再按专有词/星期月份/序数词/
+///     人称代词/情态助动词剔除；专有词启发式仅用于表外词
+///   - 课标短语（如 according to）按整条统计与展示，不拆成单词
 ///   - 同一课标原词的拓展词合并计频次（report/reporter/reporting 均以 report 记）
-///   - 每词条标注"真题频次"（课标原词 + 归并拓展词合计）
-///   - 每词一行，列结构：序号/单词/类型/真题频次/音标/词性/释义/例句1-4/
+///   - 每词条标注"频次"（课标原词 + 归并拓展词合计）：真题语料为「真题频次」，
+///     教材语料为「教材频次」；教材例句前缀用版本·册次（如「人教版 必修一」）
+///   - 每词一行，列结构：序号/单词/类型/频次/音标/词性/释义/例句1-4/
 ///     拓展词列表（said(1122)）/拓展词例句（said(1122): 例句；says(480): 例句）
 ///   - 拓展词列不显示中文释义，改为各自的真题例句（无例句则留空）
 ///
@@ -29,7 +31,21 @@ import 'package:sqlite3/sqlite3.dart' as sqlite3;
 
 import 'shared/doc_extractor.dart';
 import 'shared/export_word_style.dart';
+import 'shared/phrase_stats.dart';
 import 'shared/text_normalize.dart';
+import 'shared/word_family.dart';
+
+/// 「导出高频」年份窗口：0 = 全部年份，>0 = 近 N 年。
+///
+/// 只认用户在对话框里的显式选择：选了「全部年份」时必须返回 0，
+/// 不能用输入框默认的 5 年兜底（否则全部年份会退化成近五年）。
+int exportYearWindowFromSelection({
+  required bool allYears,
+  required int recentYears,
+}) {
+  if (allYears) return 0;
+  return recentYears.clamp(1, 30);
+}
 
 /// 导出结果统计信息
 class HighFreqExportResult {
@@ -147,14 +163,15 @@ class _WordEntry {
   final bool isStd; // 是否课标词
   final String? category; // 课标级别类型（初中/必修/选修等，取自 standard_words.json category）
   final Map<String, String>? dict; // pos/definition/phonetic/exchange（pos 已净化）
-  final List<({String text, int year})> examples; // 例句 + 年份
-  // 归并的拓展成员：词形 + 释义 + 真题频次 + 各自的真题例句（无则留空）
+  // 例句 + 年份 + 来源（真题卷别 / 教材版本；教材例句年份为 0，用来源标注）
+  final List<({String text, int year, String source})> examples;
+  // 归并的拓展成员：词形 + 释义 + 频次 + 各自的例句（无则留空）
   final List<
       ({
         String word,
         Map<String, String>? dict,
         int freq,
-        List<({String text, int year})> examples
+        List<({String text, int year, String source})> examples
       })> members;
   _WordEntry({
     required this.word,
@@ -193,6 +210,13 @@ class HighFreqExporter {
     String? extendWordsRaw,
     String format = 'xlsx',
     Set<String>? onlyFileNames,
+    int wordLimit = 3000,
+    /// true 时导出「全部课标词」：补入语料中未出现的课标词条（频次 0），
+    /// 且不做前 N 截断（wordLimit 不再生效）。
+    bool allStdWords = false,
+    /// true 表示语料来自教材：频次列改为「教材频次」，例句前缀用教材版本
+    /// （如「人教版 必修一」）代替年份。
+    bool textbookCorpus = false,
   }) async {
     // worker 返回纯 Map（Dart 3 自定义类默认不可跨 isolate 发送），
     // 在主 isolate 侧组装结果对象，彻底规避 "object is unsendable"。
@@ -204,6 +228,9 @@ class HighFreqExporter {
       'extendWordsRaw': extendWordsRaw ?? '',
       'format': format == 'docx' ? 'docx' : 'xlsx',
       'onlyFileNames': onlyFileNames?.toList(),
+      'wordLimit': wordLimit,
+      'allStdWords': allStdWords,
+      'textbookCorpus': textbookCorpus,
     });
     return HighFreqExportResult(
       format: m['format'] as String,
@@ -307,7 +334,7 @@ Map<String, dynamic> _wordBankWorker(Map<String, dynamic> args) {
         isStd: false,
         category: meta.category,
         dict: dict,
-        examples: const <({String text, int year})>[],
+        examples: const <({String text, int year, String source})>[],
         members: const [],
       ));
     }
@@ -362,17 +389,23 @@ Map<String, dynamic> _wordBankWorker(Map<String, dynamic> args) {
 // 与检测/标注共用同一分词口径：带点缩写（a.m. / U.S.）视为一个词元
 final RegExp _wordRe = wordTokenRegExp;
 final RegExp _sentenceRe = RegExp(r'[^.!?。！？]+[.!?。！？]');
+
 final RegExp _hanRe = RegExp(r'[\u4e00-\u9fa5]');
 final RegExp _trailNumRe = RegExp(r'\d+\.\s*$');
 final RegExp _yearRe = RegExp(r'(?:19|20)\d{2}');
+/// 教材册次标题行（必修一第一单元 / 选择性必修二第三单元）：与界面教材
+/// 单元切分同一正则，用于给教材例句标注「版本 册次」来源。
+final RegExp _textbookModuleRe = RegExp(
+  r'^[ \t]*((?:选择性)?必修[一二三四五六七八九十0-9]+)第[一二三四五六七八九十0-9]+单元[ \t]*$',
+  multiLine: true,
+);
 /// 形如 [v:43/n:57] 的词性频率标记（词典 pos 字段为 "n:49/v:51" 原始形态，
 /// 展示时解析为 "n./v."；此处正则用于兜底清理释义文本中的残留标记）
 final RegExp _freqTagRe = RegExp(r'\[[a-zA-Z]+:\d+(?:/[a-zA-Z]+:\d+)*\]');
 
-bool _isUpper(String c) => c == c.toUpperCase() && c != c.toLowerCase();
-
 /// 频率区间分组名
 String _groupName(int f) {
+  if (f <= 0) return '0次（语料未出现）';
   if (f >= 5001) return '5000次以上';
   if (f >= 1001) return '1001-5000次';
   if (f >= 501) return '501-1000次';
@@ -428,6 +461,9 @@ sqlite3.PreparedStatement? _stmtExact;
 /// 内存词典索引：word 全集（判定是否收录）+ exchange 0:base 反向索引
 /// （base -> 变形词列表，替代原先逐词 LIKE 全表扫描）
 final _dictWordSet = <String>{};
+/// 小写键 -> 词典中的原始拼写（China / OK 等大写词条）。
+/// SQLite 的 `word = ?` 区分大小写，必须用原始拼写回查，否则小写键取不到释义。
+final _dictWordOriginal = <String, String>{};
 final _dictExchangeIndex = <String, List<String>>{};
 final _dictBaseMap = <String, String>{}; // 变形词 -> 0:base（词库原始归属，如 noting->note）
 final _dictCache = <String, Map<String, String>?>{};
@@ -436,8 +472,10 @@ final _dictCache = <String, Map<String, String>?>{};
 void _loadDictIndex(sqlite3.Database db) {
   if (_dictWordSet.isNotEmpty) return;
   for (final row in db.select('SELECT word, exchange FROM dict')) {
-    final w = (row['word'] as String).toLowerCase();
+    final original = row['word'] as String;
+    final w = original.toLowerCase();
     _dictWordSet.add(w);
+    _dictWordOriginal.putIfAbsent(w, () => original);
     final ex = row['exchange'] as String?;
     if (ex != null && ex.isNotEmpty) {
       for (final seg in ex.split('/')) {
@@ -486,10 +524,13 @@ Map<String, String>? _lookupLocal(sqlite3.Database db, String word) {
   if (!_dictWordSet.contains(lower)) {
     final variant = _dictExchangeIndex[lower];
     if (variant == null || variant.isEmpty) return null;
-    final rows = _stmtExact!.select([variant.first]).toList();
+    final original = _dictWordOriginal[variant.first] ?? variant.first;
+    final rows = _stmtExact!.select([original]).toList();
     return rows.isNotEmpty ? _rowToSimple(rows.first) : null;
   }
-  final rows = _stmtExact!.select([lower]).toList();
+  // 用词典里的原始拼写回查（China / OK 等大写词条），避免小写键查不到。
+  final original = _dictWordOriginal[lower] ?? lower;
+  final rows = _stmtExact!.select([original]).toList();
   final result = rows.isNotEmpty ? _rowToSimple(rows.first) : null;
   if (result == null) return null;
 
@@ -504,7 +545,9 @@ Map<String, String>? _lookupLocal(sqlite3.Database db, String word) {
     for (final seg in ex.split('/')) {
       final parts = seg.split(':');
       if (parts.length == 2 && parts[0] == '0') {
-        final baseRows = _stmtExact!.select([parts[1]]).toList();
+        final baseLower = parts[1].toLowerCase();
+        final baseWord = _dictWordOriginal[baseLower] ?? baseLower;
+        final baseRows = _stmtExact!.select([baseWord]).toList();
         final baseResult =
             baseRows.isNotEmpty ? _rowToSimple(baseRows.first) : null;
         if (baseResult != null) return baseResult;
@@ -526,7 +569,9 @@ Map<String, String>? _lookupLocal(sqlite3.Database db, String word) {
 /// 在语料中无完整句（如 analyse 只出现在选项碎片、applaud 原形无正文句）时，
 /// 用变体词的完整句补位，保证高频课标词都有真题例句。
 /// [excludeYears]：需避开的年份（如同词条已占用的例句年份），保证年份不重复。
-List<({String text, int year})> _pickExamples(
+/// [sentSources]：与 [sentences] 同下标的来源标签（卷别 / 教材版本）；教材例句
+/// 年份为 0，展示时用来源标签代替年份。
+List<({String text, int year, String source})> pickExamples(
   String target,
   List<String> sentences,
   List<List<String>> sentTokens,
@@ -537,6 +582,7 @@ List<({String text, int year})> _pickExamples(
   int max, {
   List<String> altWords = const [],
   Set<int> excludeYears = const {},
+  List<String> sentSources = const [],
 }) {
   // 候选池分层：target 自身词形句（倒排索引按 token 精确匹配）优先；
   // altWords（base/其它归并变体）的句子仅作补位，绝不与 target 句混选，
@@ -630,13 +676,18 @@ List<({String text, int year})> _pickExamples(
 
   // 贪心去重年份（含调用方指定需避开的年份）：先取含 target 自身词形的句，
   // 不足 max 条时才用变体词句补位。
-  final out = <({String text, int year})>[];
+  final out = <({String text, int year, String source})>[];
   final usedYears = <int>{...excludeYears};
   void greedy(List<(int hard, int year, int pos, String text)> scored) {
     for (final s in scored) {
       if (usedYears.contains(s.$2)) continue;
       usedYears.add(s.$2);
-      out.add((text: s.$4, year: s.$2));
+      final idx = -s.$3;
+      out.add((
+        text: s.$4,
+        year: s.$2,
+        source: idx >= 0 && idx < sentSources.length ? sentSources[idx] : '',
+      ));
       if (out.length >= max) return;
     }
   }
@@ -644,6 +695,115 @@ List<({String text, int year})> _pickExamples(
   greedy(scoreIdx(targetIdx, isTarget: true));
   if (out.length < max) greedy(scoreIdx(altIdx, isTarget: false));
   return out;
+}
+
+/// 例句候选池：与「导出高频」完全同一分词 / 切句 / 年份口径。
+///
+/// 检测报告页直接复用本池与 [pickExamples]，保证报告与导出表不会出现
+/// 两套例句或两套词频口径。每段文本追加一次，随后按词取优选例句。
+class ExampleSentencePool {
+  ExampleSentencePool({
+    required Set<String> standardWords,
+    Set<String>? onlyWords,
+  })  : _standardWords = standardWords,
+        _onlyWords = onlyWords;
+
+  final Set<String> _standardWords;
+
+  /// 只对这些词累计年份 / 来源分布（检测报告用，避免为全语料建大表）。
+  final Set<String>? _onlyWords;
+
+  final List<String> _sentences = <String>[];
+  final List<List<String>> _sentTokens = <List<String>>[];
+  final List<int> _sentYears = <int>[];
+  final List<String> _sentSources = <String>[];
+  final Map<String, List<int>> _sentIndex = <String, List<int>>{};
+
+  /// 全量 token 词频（例句难度打分用，与导出口径一致）。
+  final Map<String, int> freq = <String, int>{};
+
+  /// token → 年份 → 次数（仅 [onlyWords]）。
+  final Map<String, Map<int, int>> yearCounts = <String, Map<int, int>>{};
+
+  /// token → 来源标签 → 次数（仅 [onlyWords]），标签为卷别或教材版本。
+  final Map<String, Map<String, int>> sourceCounts = <String, Map<String, int>>{};
+
+  final Map<String, String> _sentenceSource = <String, String>{};
+
+  /// 追加一段文本。[year] 用于年份分布与「同词不重复年份」，
+  /// [source] 用于例句来源标注（卷别 / 教材版本）。
+  void addText(String rawText, {required int year, required String source}) {
+    if (rawText.trim().isEmpty) return;
+    final text = normalizeCorpusText(rawText);
+    for (final m in _wordRe.allMatches(text)) {
+      final token = normalizeAnalysisToken(m.group(0)!);
+      if (token == null) continue;
+      final w = foldToken(token);
+      if (w == "'" || w == "''") continue;
+      freq[w] = (freq[w] ?? 0) + 1;
+      if (_onlyWords == null || _onlyWords.contains(w)) {
+        final ym = yearCounts[w] ??= <int, int>{};
+        ym[year] = (ym[year] ?? 0) + 1;
+        final sm = sourceCounts[w] ??= <String, int>{};
+        sm[source] = (sm[source] ?? 0) + 1;
+      }
+    }
+    for (final m in _sentenceRe.allMatches(text)) {
+      final s = m.group(0)!.trim();
+      if (s.isEmpty) continue;
+      final tokens = <String>[];
+      for (final tm in _wordRe.allMatches(s)) {
+        final token = normalizeAnalysisToken(tm.group(0)!) ?? tm.group(0)!;
+        tokens.add(foldToken(token));
+      }
+      if (s.length < 15 ||
+          s.length > 400 ||
+          tokens.length < 5 ||
+          tokens.length > 80) {
+        continue;
+      }
+      final si = _sentences.length;
+      final seen = <String>{};
+      for (final t in tokens) {
+        if (seen.add(t)) (_sentIndex[t] ??= <int>[]).add(si);
+      }
+      _sentences.add(s);
+      _sentTokens.add(tokens);
+      _sentYears.add(year);
+      _sentSources.add(source);
+      _sentenceSource.putIfAbsent(s, () => source);
+    }
+  }
+
+  /// 按与导出一致的规则挑 [max] 条例句，并带出来源标签。
+  List<({String text, int year, String source})> pick(
+    String target, {
+    List<String> altWords = const <String>[],
+    int max = 1,
+    Set<int> excludeYears = const <int>{},
+  }) {
+    final picked = pickExamples(
+      foldToken(target),
+      _sentences,
+      _sentTokens,
+      _sentIndex,
+      freq,
+      _standardWords,
+      _sentYears,
+      max,
+      altWords: [for (final a in altWords) foldToken(a)],
+      excludeYears: excludeYears,
+      sentSources: _sentSources,
+    );
+    return [
+      for (final e in picked)
+        (
+          text: e.text,
+          year: e.year,
+          source: e.source.isNotEmpty ? e.source : (_sentenceSource[e.text] ?? ''),
+        ),
+    ];
+  }
 }
 
 /// 判断词条是否"义项较多"（词性数量 >=2 或释义含多行），用于放宽例句条数。
@@ -666,37 +826,31 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
   final standardWordsRaw = args['standardWordsRaw'] as String;
   final dbPath = args['dbPath'] as String;
   final extendBaseMapRaw = (args['extendBaseMapRaw'] as String?) ?? '';
-  final extendWordsRaw = (args['extendWordsRaw'] as String?) ?? '';
   final format = (args['format'] as String?) ?? 'xlsx';
+  final wordLimit = (args['wordLimit'] as int?) ?? 3000;
+  final allStdWords = (args['allStdWords'] as bool?) ?? false;
+  final textbookCorpus = (args['textbookCorpus'] as bool?) ?? false;
   final onlyRaw = args['onlyFileNames'];
   final Set<String>? onlyFileNames = onlyRaw is List
       ? onlyRaw.map((e) => '$e').toSet()
       : null;
 
-  // 界面"拓展词汇"列表完整集合（与列表页同一数据源：esw_config.json
-  // extendWords 字段）。非空时作为拓展词白名单：stdExtMap / extendBaseMapRaw
-  // 中凡不在该集合内的键一律剔除，保证导出词表拓展词 ⊆ 界面词库拓展词集合。
-  final extendWordsSet = <String>{};
-  if (extendWordsRaw.isNotEmpty) {
-    try {
-      final ewList = jsonDecode(extendWordsRaw) as List<dynamic>;
-      for (final w in ewList) {
-        final lw = (w as String).toLowerCase().trim();
-        if (lw.isNotEmpty) extendWordsSet.add(lw);
-      }
-    } catch (_) {
-      // 词库数据异常时静默降级：白名单为空则不做该层过滤
-    }
-  }
+  // 注：界面「拓展词汇」列表（args.extendWordsRaw）不再作为导出的拓展词白名单；
+  // 课标库 extensions 与用户 extendBaseMap 声明的词形一律参与归并。
 
-  // 课标词库：小写集合 + 小写→原始词形（用于展示大小写规范化）
+  // 课标词库：折叠规范（弯撇号→直撇号、全角/变音→ASCII）+ 小写集合。
+  // 折叠保证词库里的 o’clock 与语料中的 o'clock 命中同一条。
   final stdJson = jsonDecode(standardWordsRaw) as Map<String, dynamic>;
+  // 词库内全部词条参与排名：内置专有词（America / Monday / China 等）按
+  // 用户要求进入高频表；用户自建专有词不在课标库里（只在用户词库），
+  // 因此天然不参与排名。
+  final stdKeys = stdJson.keys.toList();
   final stdSet = <String>{};
   final lowerToOrig = <String, String>{};
-  final stdExtMap = <String, String>{}; // 拓展词(小写) -> 课标原词
   final stdCategory = <String, String>{}; // 课标词(小写) -> 类型（初中/必修/选修等）
-  for (final k in stdJson.keys) {
-    final lk = k.toLowerCase();
+  for (final k in stdKeys) {
+    final lk = foldWordText(k).trim().toLowerCase();
+    if (lk.isEmpty) continue;
     final meta = stdJson[k] as Map<String, dynamic>?;
     final cat = (meta?['category'] as String?)?.trim();
     // 末尾点可省略：a.m. 与 a.m、Mr. 与 Mr 归同一条目；普通词不扩展
@@ -704,28 +858,77 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
     if (lk.endsWith('.')) {
       final trimmed = lk.substring(0, lk.length - 1);
       if (trimmed.length >= 2) variants.add(trimmed);
-    } else if (lk.contains('.')) {
+    } else if (lk.contains('.') && !lk.contains(' ')) {
       variants.add('$lk.');
     }
     for (final v in variants) {
       stdSet.add(v);
       lowerToOrig.putIfAbsent(v, () => k);
-      if (cat != null && cat.isNotEmpty) stdCategory.putIfAbsent(v, () => cat);
-    }
-    final exts = meta?['extensions'];
-    if (exts is List) {
-      for (final ex in exts) {
-        final le = (ex as String).toLowerCase();
-        if (le != lk) stdExtMap.putIfAbsent(le, () => lk);
+      if (cat != null && cat.isNotEmpty) {
+        // 同名小写词条与专有词并存时（china / China），类型取普通词条，
+        // 专有义项由 displayWord/categoryOf 按语料写法另行判定。
+        final prev = stdCategory[v];
+        if (prev == null || (prev == '专有词' && cat != '专有词')) {
+          stdCategory[v] = cat;
+        }
       }
     }
   }
-  // standard_words.json extensions 同样按界面词库白名单过滤：课标词库声明了
-  // 但界面"拓展词汇"列表不存在的词形（如 borne/bled/sung/spelled 等）不进入
-  // 导出词表，保证与界面词库完全一致（同一数据源、同一集合）。
-  if (extendWordsSet.isNotEmpty) {
-    stdExtMap.removeWhere((k, _) => !extendWordsSet.contains(k));
+  // 与普通小写词条同名的内置专有词（China/china、March/march、May/may）：
+  // 保留小写统计键（大小写不敏感计数不变），只在展示时按语料实际写法
+  // 判断该行以哪一义为主（China 122 : china 0 → 中国；May 42 : may 410 → 情态动词）。
+  final stdKeySet = stdKeys.toSet();
+  final properSpellings = <String, String>{
+    for (final k in stdKeys)
+      if (((stdJson[k] as Map<String, dynamic>?)?['category'] as String?)
+                  ?.trim() ==
+              '专有词' &&
+          k != k.toLowerCase() &&
+          stdKeySet.contains(k.toLowerCase()))
+        k.toLowerCase(): k,
+  };
+  // 小写键下「与专有词写法完全一致」的出现次数，用于判定主导义项。
+  final properCapitalFreq = <String, int>{};
+  // 课标库 extensions → 主条（第二遍：stdSet 已完整，才能识别「形同义不同」的
+  // 独立词条；found/left/born/lay/lost/rose/thought/would/should/might 不并入）。
+  final extByBase = <String, Iterable<String>>{};
+  for (final k in stdKeys) {
+    final exts = (stdJson[k] as Map<String, dynamic>?)?['extensions'];
+    if (exts is List && exts.isNotEmpty) {
+      extByBase[k] = exts.map((x) => '$x');
+    }
   }
+  final stdExtMap = buildLibraryExtensionBaseMap(
+    standardKeys: stdSet,
+    extensionsByBase: extByBase,
+  ); // 拓展词(小写) -> 课标原词
+
+  // 课标短语表与检测页共用同一实现（含空格、纯词形的词条才整条统计）。
+  final stdPhrases = buildStandardPhrases(stdKeys);
+  // 大小写异义词组（Miss/miss 等）：只由普通词条构成，避免把同名专有词
+  // （China / March / May）并成同一条目、改写词条名。
+  final caseVariantGroups = buildCaseVariantGroups(<String>[
+    for (final k in stdKeys)
+      if (((stdJson[k] as Map<String, dynamic>?)?['category'] as String?)
+              ?.trim() !=
+          '专有词')
+        k,
+  ]);
+  // 大写形在语料中的出现次数：仅用于成员展示，不重复计入词条频次。
+  final caseVariantFreq = <String, int>{};
+  // 英美拼写归并：color / colour、center / centre、organize / organise 等
+  // 统计为同一个词；与 TV→television 的别名表合并使用。
+  // 数据侧已把英美拼写对合并为一条、变体挂主条 extensions，
+  // 这里从 extensions 还原「变体 → 主条」，保证与页面词频同口径。
+  final extensionSpellingAliases =
+      buildExtensionSpellingAliases(extByBase);
+  final spellingAliases =
+      buildSpellingAliases(stdKeys, extraVariants: extensionSpellingAliases);
+  final wordAliases = <String, String>{...spellingAliases, ...builtinWordAliases};
+
+  // 课标库 extensions 一律参与归并（不再按界面「拓展词汇」列表做白名单过滤）：
+  // 词库声明的词形（borne/bled/sung/mice 等）即使未出现在用户拓展词列表，
+  // 也属于该课标词的正常词形，频次必须计入对应课标词条。
 
   // 1) 读取全部真题 txt（兼容 UTF-8/GBK），逐文件切句记录年份，同时统计词频
   final files = Directory(corpusDir)
@@ -740,46 +943,80 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
       .toList()
     ..sort((a, b) => a.path.compareTo(b.path));
 
-  final freq = <String, int>{}; // 全 token 词频（小写口径）
-  final capNonHead = <String, int>{}; // 非句首出现时首字母大写次数
-  final totalNonHead = <String, int>{}; // 非句首出现总次数
-  // 非句首位置首字母大写的专有名词候选（Londoners 等）：语料中凡前一 token
-  // 非句末标点（即非句首位置）仍首字母大写，几乎必然是专有名词（人名/地名/
-  // 机构名等），不应进入词频统计。句首大写是正常句法现象，不算专有词。
-  // 课标词（London/Tuesday 等大小写敏感专有词在课标库内本身成词条）除外，
-  // 句中大写仍正常统计（London 例句/频次不受影响）。
-  final nonHeadCaps = <String, int>{}; // 非句首大写专有词计数（小写口径）
+  final freq = <String, int>{}; // 全 token 词频（归并规范形口径）
+  // 原始词形词频（未做英美拼写/TV 别名归并）：仅供归并成员展示，
+  // 如 programme(52) 跟在 program 后面、colour(1) 跟在 color 后面。
+  final rawFreq = <String, int>{};
+  // 非句首大写专有词判据（与检测页共用 phrase_stats.ProperNounStats）
+  final properStats = ProperNounStats(standardWords: stdSet);
   final sentences = <String>[];
   final sentTokens = <List<String>>[];
   final sentYears = <int>[];
+  /// 与 [sentences] 同下标的来源标签：教材语料为「版本 册次」，真题为 ''。
+  final sentSources = <String>[];
   final sentIndex = <String, List<int>>{};
+  // 短语首词集合与覆盖累计器（与检测页共用 phrase_stats 的判据）。
+  final phraseHeads = {for (final p in stdPhrases.keys) phraseHead(p)};
+  final coverageTracker = PhraseCoverageTracker(stdPhrases);
 
   for (final f in files) {
     final year = _yearFromName(f.path);
     String text;
     final bytes = f.readAsBytesSync();
     text = decodeTextBytes(bytes);
-    // 全角标点/弯引号归一化：早期试卷用全角标点（．，；：！？）会把整段
-    // 粘成"超长句"导致例句候选被长度过滤；统一转半角后切句与词频统计更准。
-    text = text
-        .replaceAll('\uFF0C', ',')
-        .replaceAll('\uFF0E', '.')
-        .replaceAll('\uFF1B', ';')
-        .replaceAll('\uFF1A', ':')
-        .replaceAll('\uFF01', '!')
-        .replaceAll('\uFF1F', '?')
-        .replaceAll('\u2018', "'")
-        .replaceAll('\u2019', "'")
-        .replaceAll('\u201C', '"')
-        .replaceAll('\u201D', '"');
+    // 统一预处理（与检测页共用 normalizeCorpusText）：全角标点/弯引号
+    // 归一化，避免全角句点把整段粘成"超长句"、弯撇号漏计 o'clock。
+    text = normalizeCorpusText(text);
+    // 教材语料：例句来源标注为「版本 册次」（如「人教版 必修一」）。
+    // 册次按单元标题行定位，句子的来源取其之前最近的一个册次标题。
+    final fileLabel =
+        p.basenameWithoutExtension(f.path).replaceAll('_', ' ').trim();
+    final moduleStarts = <({int start, String name})>[];
+    if (textbookCorpus) {
+      for (final mm in _textbookModuleRe.allMatches(text)) {
+        moduleStarts.add((start: mm.start, name: mm.group(1)!));
+      }
+    }
     // 词频统计（覆盖全部 token）
+    final headSpans = <String, List<(int, int)>>{};
     for (final m in _wordRe.allMatches(text)) {
       final raw = m.group(0)!;
-      final w = raw.toLowerCase();
-      if (w.length == 1 && w != 'a' && w != 'i') continue;
+      // 与检测页同一分词口径：折叠（café → cafe）、选项字母粘连剥离（itB → it）、
+      // 单字母只保留 a / I，再按别名归并（TV → television）。
+      final token = normalizeAnalysisToken(raw);
+      if (token == null) continue;
+      final lw = foldToken(token);
+      final w = wordAliases[lw] ?? lw;
       if (w == "'" || w == "''") continue;
       freq[w] = (freq[w] ?? 0) + 1;
+      // 同名专有词写法（China / March / May）的精确计数，用于判定主导义项。
+      final properForm = properSpellings[w];
+      if (properForm != null && raw == properForm) {
+        properCapitalFreq[w] = (properCapitalFreq[w] ?? 0) + 1;
+      }
+      if (lw != w) rawFreq[lw] = (rawFreq[lw] ?? 0) + 1;
+      if (phraseHeads.contains(w)) {
+        (headSpans[w] ??= <(int, int)>[]).add((m.start, m.end));
+      }
+      // 大小写异义词：记录大写形出现次数（仅成员展示，不重复计入）。
+      final variants = caseVariantGroups[lw];
+      if (variants != null && variants.contains(raw)) {
+        caseVariantFreq[lw] = (caseVariantFreq[lw] ?? 0) + 1;
+      }
     }
+    // 课标短语按整条统计（不拆成单词条目），如 according to / ice cream；
+    // 同时记录匹配区间，供覆盖关系判定（首词是否每次都在短语内）。
+    final phraseSpans = <String, List<(int, int)>>{};
+    for (final phrase in stdPhrases.keys) {
+      final ms = phraseRegExp(phrase).allMatches(text).toList();
+      if (ms.isEmpty) continue;
+      freq[phrase] = (freq[phrase] ?? 0) + ms.length;
+      phraseSpans[phrase] = [for (final m in ms) (m.start, m.end)];
+    }
+    coverageTracker.addPositions(
+      headTokenSpans: headSpans,
+      phraseSpans: phraseSpans,
+    );
     // 逐句处理：句首判定（供专有词识别）+ 例句倒排索引
     for (final m in _sentenceRe.allMatches(text)) {
       final s = m.group(0)!.trim();
@@ -788,23 +1025,12 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
       var first = true;
       for (final tm in _wordRe.allMatches(s)) {
         final raw = tm.group(0)!;
-        final w = raw.toLowerCase();
-        if (first) {
-          first = false;
-        } else {
-          // 非句首大写统计：对全部句子生效（不随例句长度过滤而缩小样本）
-          if (raw.isNotEmpty && _isUpper(raw[0])) {
-            capNonHead[w] = (capNonHead[w] ?? 0) + 1;
-            // 非句首首字母大写且词内含小写字母（排除 THE/2024 类全大写
-            // 缩写/标题）→ 记入专有名词候选；课标词（London/Tuesday 等）
-            // 除外，句中大写仍正常统计。
-            if (raw.length > 1 && RegExp(r'[a-z]').hasMatch(raw) &&
-                !stdSet.contains(w)) {
-              nonHeadCaps[w] = (nonHeadCaps[w] ?? 0) + 1;
-            }
-          }
-          totalNonHead[w] = (totalNonHead[w] ?? 0) + 1;
-        }
+        final token = normalizeAnalysisToken(raw) ?? raw;
+        final lw = foldToken(token);
+        final w = wordAliases[lw] ?? lw;
+        // 非句首大写专有词判据统计（与检测页共用 ProperNounStats）
+        properStats.addToken(raw, w, isFirstInSentence: first);
+        if (first) first = false;
         tokens.add(w);
       }
       // 长度/词数过滤仅作用于例句候选，不影响上述专有词统计
@@ -820,20 +1046,39 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
       sentences.add(s);
       sentTokens.add(tokens);
       sentYears.add(year);
+      var source = '';
+      if (textbookCorpus) {
+        var moduleName = '';
+        for (final ms in moduleStarts) {
+          if (ms.start > m.start) break;
+          moduleName = ms.name;
+        }
+        source = fileLabel;
+        if (moduleName.isNotEmpty && !fileLabel.contains(moduleName)) {
+          source = '$fileLabel $moduleName';
+        }
+      }
+      sentSources.add(source);
     }
   }
 
-  // 2) 专有词识别
+  // 短语覆盖结算：首词（如 according）在语料中每次出现都落在短语
+  // （according to）内 → 二者是同一个词频，只保留短语条目，删掉首词条目，
+  // 避免短语与组成词各计一遍。未完全覆盖时维持原口径（短语、组成词各自统计）。
+  final mergedPhraseHeads = <String>{
+    for (final c in coverageTracker.result().values)
+      if (c.merged) c.head,
+  };
+  for (final h in mergedPhraseHeads) {
+    freq.remove(h);
+    rawFreq.remove(h);
+  }
+
+  // 2) 专有词识别（判据与检测页共用 ProperNounStats）
   //    （人名/地名/机构/语言名等）。注意：课标词库中混有的大写专有词
   //    （如 Olympic/America/China/English/Mr 等）同样按此规则排除；
   //    单字母词（I/a/i 等）除外，避免误伤代词。
-  final properSet = <String>{};
-  for (final w in totalNonHead.keys) {
-    if (w.length <= 1) continue;
-    final total = totalNonHead[w]!;
-    final cap = capNonHead[w] ?? 0;
-    if (total >= 3 && cap / total >= 0.75) properSet.add(w);
-  }
+  final properSet = properStats.properSet;
 
   // 非句首大写专有词（Londoners 等）排除集：语料中凡前一 token 非句末标点
   // （即非句首位置）仍首字母大写，且占比显著（>=50% 且至少 2 次非句首出现），
@@ -841,17 +1086,7 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
   //   - Londoners：非句首出现 2 次全大写（ratio 1.0）→ 排除（原 properSet
   //     的 total>=3 门槛将其漏放，故此处放宽到 2 次）。
   //   - made：900 次中出现仅 3 次 Made（产品标签式大写，ratio 极低）→ 保留。
-  //   - aug：非句首 4 次全大写（缩写本身即大写，Aug→August 合理月份缩写），
-  //     新需求将月份（含 Aug 缩写）整体排除，故不再按专有词豁免（日历排除集
-  //     统一剔除，见下方 calendarOrdinalSet）。
-  final nhCapsExcluded = <String>{};
-  const keepCapsWhite = <String>{}; // 合理缩写/特殊大写保留白名单（月份缩写已整体排除）
-  for (final w in nonHeadCaps.keys) {
-    if (keepCapsWhite.contains(w)) continue;
-    final nhTotal = totalNonHead[w] ?? 0;
-    final nhCap = capNonHead[w] ?? 0;
-    if (nhTotal >= 2 && nhCap / nhTotal >= 0.5) nhCapsExcluded.add(w);
-  }
+  final nhCapsExcluded = properStats.nonHeadCapsExcluded;
 
   // 非句首大写专有词（Londoners 等）完整清单：供导出结果回执与测试断言。
   final nonHeadCapsExcluded = nhCapsExcluded.toList()..sort();
@@ -874,27 +1109,38 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
   extBaseMap.addAll(stdExtMap);
   if (extendBaseMapRaw.isNotEmpty) {
     try {
-      final libJson = jsonDecode(extendBaseMapRaw) as Map<String, dynamic>;
-      for (final e in libJson.entries) {
-        final ext = e.key.toLowerCase().trim();
-        final base = (e.value as String).toLowerCase().trim();
-        if (ext.isEmpty || base.isEmpty) continue;
-        if (!RegExp(r'^[a-z]+$').hasMatch(ext)) continue; // 非纯小写字母不作词形拓展
-        if (ext == base) continue;
-        // 归属必须是课标词库内的原词，否则该词不在导出体系内
-        if (!stdSet.contains(base)) continue;
-        extBaseMap.putIfAbsent(ext, () => base);
-      }
+      final rawBase = (jsonDecode(extendBaseMapRaw) as Map<String, dynamic>)
+          .map((k, v) => MapEntry(k, v.toString()));
+      // 与检测页共用同一张映射表（同样的过滤 + 内置补充）
+      extBaseMap.addAll(buildExtendBaseMap(raw: rawBase, standardKeys: stdSet));
     } catch (_) {
       // 词库数据异常时静默降级：仅保留 standard_words.json extensions
     }
+  } else {
+    extBaseMap.addAll(buildExtendBaseMap(raw: const {}, standardKeys: stdSet));
   }
+  // 短语不能作为归并根：若词库把 due 声明为 due to 的拓展词，会让短语条目
+  // 把 due 的独立出现也计入，短语频次被抬高。短语条目只统计整条出现，
+  // 单词仍按自身词条统计（页面同口径）。
+  extBaseMap.removeWhere((k, v) => v.contains(' '));
   // 异常/古式变形剔除：wrought 是 work 的古式过去式（词典 exchange 0:work），
   // 非正常屈折变形，不得作为 work 的拓展词（work 保留 working/works/worked）。
   extBaseMap.remove('wrought');
   // 词典脏数据修正：also 行 exchange 错误标注为 0:conjurer（词典数据本身有误），
   // 从反向归属映射剔除，避免 also 被误归并。
   extBaseMap.remove('also');
+  // 拓展词归并到英美规范形：colours → colour → color，保证两种拼写的
+  // 变形形式频次都计入同一个词条
+  if (spellingAliases.isNotEmpty) {
+    for (final k in extBaseMap.keys.toList()) {
+      final v = extBaseMap[k]!;
+      final nv = spellingAliases[v] ?? v;
+      if (nv != v) extBaseMap[k] = nv;
+    }
+    extBaseMap.removeWhere((k, v) => k == v);
+  }
+  // 词频按词族根归并发生在下方词条汇总处（保留 token 级计数，供拓展词成员展示）
+
   // 可疑拓展词全量剔除（词库脏数据，非正常屈折变形）：
   //   soes：ecdict 中独立词条为金融缩写（词性 t，股票期权），exchange 误标 0:so，
   //         导致 so 词条出现 "Why soes..." 假例句；so 的正常拓展不存在（副词/连词）。
@@ -933,142 +1179,183 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
   final cleanedExtWords = <String>[];
   for (final w in [
     'nots', 'eco', 'isn', 'wasn',
-    'tue', 'mon', 'tues', 'thu', 'fri', 'nov', 'oct', 'sept', 'wed',
+    // 星期/月份缩写（fri/sept/oct/nov 等）不再按固定排除集剔除：
+    // 它们是课标词的正常拓展形式，检测页也计入词根频次。
   ]) {
     if (extBaseMap.remove(w) != null) cleanedExtWords.add(w);
   }
   // 保险：凡含非小写字母字符（撇号/点号等）的变体一律不当作词形拓展
   extBaseMap.removeWhere((k, _) => !RegExp(r'^[a-z]+$').hasMatch(k));
 
-  // 5.0) 星期/月份/序数词排除集（用户需求1：统计与词表一律排除）：
-  //    - 星期全名 + 常见缩写（Mon/Tue/Wed/Thu/Fri/Sat/Sun）；
-  //    - 月份全名 + 常见缩写（Jan~Dec；may 不在此列——may/might 同为情态
-  //      动词由停用词集剔除，避免 might→may 映射误入日历回执；march 同时
-  //      是普通动词"行进"，按用户明确要求将 March 月份整体排除，
-  //      marching/marched 等屈折随 base 排除）；
-  //    - 序数词 first~twentieth/thirtieth（含数字序数 1st/2nd/3rd——词频
-  //      正则不含数字，天然不进词表，此处一并声明保证口径一致）。
-  //    屈折/拓展形式覆盖：星期/月份加 s（Tuesdays/Mondays）经 extBaseMap
-  //    键/值双向剔除自动覆盖（键为拓展词、值为课标原词，命中任一侧即剔除），
-  //    词频归并循环再对 base 命中排除集做兜底，双重保证。
-  const calendarOrdinalSet = <String>{
-    // 星期全名
-    'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
-    // 星期缩写
-    'mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun',
-    // 月份全名（注意：may 不在此声明——may/might 同为情态动词，已由
-    // 下方 stopSet 停用词整体剔除；若此处再声明 may，会把 might→may 的
-    // 词库拓展映射误判为日历词剔除，污染清理回执口径）
-    'january', 'february', 'march', 'april', 'june',
-    'july', 'august', 'september', 'october', 'november', 'december',
-    // 月份缩写
-    'jan', 'feb', 'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'sept', 'oct', 'nov', 'dec',
-    // 序数词
-    'first', 'second', 'third', 'fourth', 'fifth', 'sixth', 'seventh', 'eighth',
-    'ninth', 'tenth', 'eleventh', 'twelfth', 'thirteenth', 'fourteenth',
-    'fifteenth', 'sixteenth', 'seventeenth', 'eighteenth', 'nineteenth',
-    'twentieth', 'thirtieth',
-    // 数字序数表达（词频正则不含数字，天然排除；声明保持口径一致）
-    '1st', '2nd', '3rd',
-  };
-  // 词库拓展映射双向剔除：键或值命中排除集（如 Tuesdays→Tuesday、
-  // Sundays→Sunday、firsts→first 等）一律移除，防止星期/月份/序数词及其
-  // 屈折形式以拓展词身份进入词表。
-  final calendarOrdinalExcluded = <String>[];
-  extBaseMap.removeWhere((k, v) {
-    if (calendarOrdinalSet.contains(k) || calendarOrdinalSet.contains(v)) {
-      calendarOrdinalExcluded.add(k);
-      return true;
-    }
-    return false;
-  });
-  // 语料中实际出现的星期/月份/序数词（含缩写）一并记录，供回执与测试断言。
-  calendarOrdinalExcluded.addAll(freq.keys.where(calendarOrdinalSet.contains));
-  final calendarOrdinalExcludedSorted =
-      (calendarOrdinalExcluded.toSet().toList()..sort());
+  // 5.0) 固定的星期/月份/序数词、人称/物主代词、情态/助动词排除集已移除：
+  //    这些词本身就在 3333 课标词表内，必须参与高频统计与展示。
+  //    课标词表的 62 条短语（如 according to）已在词频阶段按整条计数，
+  //    不再拆成单词。
 
   // 5) 词族归并：
   //    - 课标词出现 → 以其自身为词条（freq 含全部归并拓展词）
   //    - 课标词未出现、仅拓展词出现 → 仍以课标原词为词条，频次为全部
   //      拓展词之和（派生/变形形式一并计入该词的统计）
-  //    - 非课标体系词（超标词）与专有词一律排除
+  //    - 表外词（超标词）与专有词仍按原口径排除
   final familyFreq = <String, int>{}; // 展示词 -> 总频
   final baseFreqRaw = <String, int>{}; // 课标原词本身的原始频次
   final extGroup = <String, List<String>>{}; // 课标原词 -> 归并过来的拓展词
   final extFreq = <String, int>{}; // 拓展词自身频次
 
-  // 停用词（暂不计入统计，整体剔除；含其屈折变形）：
-  // 人称代词 / 物主代词 / 情态动词 / 助动词。be 家族 is/are/am/was/were/been/being
-  // 不再单独列词条或分开计数，随 be 一并剔除；will 被排除则 wills/willed 一并排除。
-  const stopSet = <String>{
-    // 人称代词
-    'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them',
-    // 物主代词
-    'my', 'your', 'his', 'hers', 'its', 'our', 'their', 'mine', 'yours', 'ours', 'theirs',
-    // 情态动词
-    'can', 'could', 'may', 'might', 'must', 'shall', 'should', 'will', 'would',
-    // 助动词
-    'be', 'am', 'is', 'are', 'was', 'were', 'been', 'being',
-    'do', 'does', 'did', 'have', 'has', 'had',
-    // 用户明确级联：will 的屈折变形一并排除
-    'wills', 'willed',
-  };
-
   for (final w in freq.keys) {
     final f = freq[w]!;
-    if (properSet.contains(w)) continue; // 专有词（含混入课标库的大写专有词）一律排除
-    if (nhCapsExcluded.contains(w)) continue; // 非句首大写专有词（Londoners 等）一律排除
-    if (calendarOrdinalSet.contains(w)) continue; // 星期/月份/序数词（含缩写）一律排除
-    if (stopSet.contains(w)) continue; // 停用词（含课标词身份，如 be/will/can）整体剔除
-    if (stdSet.contains(w)) {
-      familyFreq[w] = (familyFreq[w] ?? 0) + f;
-      baseFreqRaw[w] = f;
-    } else if (extBaseMap.containsKey(w)) {
-      final base = extBaseMap[w]!;
-      if (!stdSet.contains(base)) continue;
-      // base 为星期/月份/序数词（如 Tuesday/March/first）→ 其归并成员
-      // （Tuesdays/Marching/firsts 等）一并排除，不进入词表
-      if (calendarOrdinalSet.contains(base)) continue;
-      // base 为停用词（如 will/can/be/do/have）→ 其归并成员（wills/willed/cans/
-      // could/being/been/was/were/did/done/had 等）一并排除，不进入词表
-      if (stopSet.contains(base)) continue;
-      (extGroup[base] ??= []).add(w);
-      extFreq[w] = f;
+    final r = familyRoot(w, spellingAliases, extBaseMap);
+    // 课标词（含短语）一律保留：即使同时是专有名词（China/Monday/Mr/OK）、
+    // 人称代词、情态/助动词或序数词，也必须参与统计。
+    // 专有词启发式（properSet / nhCapsExcluded）仅对表外词生效，表外词
+    // 由下方 stdSet 判定统一排除。
+    if (!stdSet.contains(r) &&
+        (properSet.contains(r) || nhCapsExcluded.contains(r))) {
+      continue;
+    }
+    if (!stdSet.contains(r)) continue; // 表外词（超标/专有）→ 排除
+    // 被短语完全覆盖的首词（according）已由短语条目代表；它的其他派生形
+    // （如 accordingly 映射到 according）也不再单独成条，避免页面搜 according
+    // 显示短语频次、导出却另有一条 according 的小数字。
+    if (mergedPhraseHeads.contains(r) && w != r) continue;
+    // 与检测页同一口径：按 familyRoot 汇总，practise/colour/TV 都归入原词
+    familyFreq[r] = (familyFreq[r] ?? 0) + f;
+    if (w == r) {
+      baseFreqRaw[r] = (baseFreqRaw[r] ?? 0) + f;
     } else {
-      // 超标词或专有词 → 排除
+      (extGroup[r] ??= []).add(w);
+      extFreq[w] = f;
+    }
+  }
+
+  // 英美拼写/TV 等别名归并后，原始词形（programme/colour/tv 等）不再独立
+  // 成条，但必须作为词根成员跟在词根后展示（频次不重复计入）。
+  for (final e in rawFreq.entries) {
+    final raw = e.key;
+    if (!familyFreq.containsKey(familyRoot(raw, spellingAliases, extBaseMap))) {
+      continue;
+    }
+    final base = familyRoot(raw, spellingAliases, extBaseMap);
+    if (raw == base) continue;
+    if (mergedPhraseHeads.contains(base)) continue;
+    final members = extGroup[base] ??= <String>[];
+    if (!members.contains(raw)) {
+      members.add(raw);
+      extFreq[raw] = e.value;
+    }
+  }
+
+  // 课标短语例句：按整条短语在切句结果里匹配（与单词语料统计同一批句子）
+  final phraseExamples =
+      <String, List<({String text, int year, String source})>>{};
+  for (final phrase in stdPhrases.keys) {
+    if (!freq.containsKey(phrase)) continue;
+    final re = phraseRegExp(phrase);
+    final hits = <({String text, int year, String source})>[];
+    for (var i = 0; i < sentences.length; i++) {
+      if (re.hasMatch(sentences[i])) {
+        hits.add((
+          text: sentences[i],
+          year: sentYears[i],
+          source: sentSources[i],
+        ));
+      }
+    }
+    hits.sort((a, b) => b.year.compareTo(a.year));
+    final picked = <({String text, int year, String source})>[];
+    final years = <int>{};
+    for (final h in hits) {
+      if (picked.length >= 2) break;
+      if (!years.add(h.year)) continue;
+      picked.add(h);
+    }
+    phraseExamples[phrase] = picked;
+  }
+
+  // 展示词形：保留课标库原始大小写；弯撇号统一为直撇号（o’clock → o'clock）。
+  // 大小写异义词组（March/march 等）按新口径统一用小写形作词条名，
+  // 大写形作为成员跟在后面（见下方 members 追加）。
+  bool properDominant(String key) =>
+      (properCapitalFreq[key] ?? 0) * 2 > (freq[key] ?? 0);
+
+  String displayWord(String key) {
+    if (caseVariantGroups.containsKey(key)) {
+      return key.replaceAll('\u2019', "'");
+    }
+    // 同名专有词：语料里专有写法占多数就用专有词条名，否则保留普通词条名。
+    final properForm = properSpellings[key];
+    if (properForm != null) {
+      return (properDominant(key) ? properForm : key)
+          .replaceAll('\u2019', "'");
+    }
+    final orig = lowerToOrig[key] ?? key;
+    return orig.replaceAll('\u2019', "'");
+  }
+
+  /// 词条类型：专有写法主导的同名专有词按「专有词」展示，其余取词库类型。
+  String wordCategory(String key) {
+    final properForm = properSpellings[key];
+    if (properForm != null && properDominant(key)) return '专有词';
+    return stdCategory[key] ?? '';
+  }
+
+  // 「全部课标词」模式：语料中未出现的课标词条以频次 0 补入，
+  // 在下方统一建词条（无例句/无成员）。
+  if (allStdWords) {
+    for (final v in stdSet) {
+      if (v.contains(' ')) continue; // 短语按整条处理，不拆成单词词条
+      if (v.endsWith('.')) continue; // a.m. 等缩写变体，保留无点形式
+      final r = familyRoot(v, spellingAliases, extBaseMap);
+      if (!stdSet.contains(r)) continue;
+      if (mergedPhraseHeads.contains(r)) continue;
+      if (familyFreq.containsKey(r)) continue;
+      familyFreq[r] = 0;
     }
   }
 
   // 汇总：把拓展词频次并入原词；原词未出现时拓展词单独成词条
   final finalEntries = <_WordEntry>[];
   for (final base in familyFreq.keys) {
-    final members = extGroup[base] ?? const <String>[];
-    var total = familyFreq[base]!;
-    for (final m in members) {
-      total += extFreq[m] ?? 0;
-    }
+    // 归并成员跟在词根词后展示：按各自频次降序，频次相同按字母序
+    final members = <String>[...?extGroup[base]]
+      ..sort((a, b) {
+        final c = (extFreq[b] ?? 0).compareTo(extFreq[a] ?? 0);
+        return c != 0 ? c : a.compareTo(b);
+      });
+    // familyFreq 已按 familyRoot 汇总（含成员），这里不再重复相加
+    final total = familyFreq[base]!;
     final baseDict = _lookupCached(db, base);
-    final baseExamples = _pickExamples(base, sentences, sentTokens, sentIndex,
-        freq, stdSet, sentYears, _multiSense(baseDict) ? 4 : 2,
-        altWords: members);
+    final baseExamples = phraseExamples[base] ??
+        pickExamples(base, sentences, sentTokens, sentIndex, freq, stdSet,
+            sentYears, _multiSense(baseDict) ? 4 : 2,
+            altWords: members, sentSources: sentSources);
     // 词条例句已占用的年份：成员例句避开，保证同词条年份不重复
     final usedYears = {for (final e in baseExamples) e.year};
     finalEntries.add(_WordEntry(
-      word: lowerToOrig[base] ?? base,
+      word: displayWord(base),
       freq: total,
       isStd: true,
-      category: stdCategory[base] ?? '',
+      category: wordCategory(base),
       dict: baseDict,
       examples: baseExamples,
       members: [
         for (final m in members)
           (
-            word: lowerToOrig[m] ?? m,
+            word: displayWord(m),
             dict: _lookupCached(db, m),
             freq: extFreq[m] ?? 0,
-            examples: _pickExamples(m, sentences, sentTokens, sentIndex, freq,
+            examples: pickExamples(m, sentences, sentTokens, sentIndex, freq,
                 stdSet, sentYears, 1,
                 excludeYears: usedYears),
+          ),
+        // 大小写异义词的大写形：只展示、不重复计入频次；
+        // 例句不选（语料倒排索引按折叠小写建键，无法区分大小写义项）。
+        for (final v in caseVariantGroups[base] ?? const <String>[])
+          (
+            word: v,
+            dict: _lookupCached(db, v),
+            freq: caseVariantFreq[base] ?? 0,
+            examples: const <({String text, int year, String source})>[],
           ),
       ],
     ));
@@ -1090,28 +1377,35 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
     final base = e.key;
     final members = e.value;
     final dict = _lookupCached(db, base);
-    final examples = _pickExamples(base, sentences, sentTokens, sentIndex, freq,
+    final examples = pickExamples(base, sentences, sentTokens, sentIndex, freq,
         stdSet, sentYears, _multiSense(dict) ? 4 : 2,
-        altWords: members);
+        altWords: members, sentSources: sentSources);
     final usedYears = {for (final ex in examples) ex.year};
     finalEntries.add(_WordEntry(
-      word: lowerToOrig[base] ?? base,
+      word: displayWord(base),
       // 词条本身就是课标原词，无需再标「对应课标原词」
       baseStd: null,
       freq: familyFreq[base]!,
       isStd: true,
-      category: stdCategory[base] ?? '',
+      category: wordCategory(base),
       dict: dict,
       examples: examples,
       members: [
         for (final m in members)
           (
-            word: lowerToOrig[m] ?? m,
+            word: displayWord(m),
             dict: _lookupCached(db, m),
             freq: extFreq[m] ?? 0,
-            examples: _pickExamples(m, sentences, sentTokens, sentIndex, freq,
+            examples: pickExamples(m, sentences, sentTokens, sentIndex, freq,
                 stdSet, sentYears, 1,
-                excludeYears: usedYears),
+                excludeYears: usedYears, sentSources: sentSources),
+          ),
+        for (final v in caseVariantGroups[base] ?? const <String>[])
+          (
+            word: v,
+            dict: _lookupCached(db, v),
+            freq: caseVariantFreq[base] ?? 0,
+            examples: const <({String text, int year, String source})>[],
           ),
       ],
     ));
@@ -1119,14 +1413,15 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
 
   db.dispose();
 
-  // 6) 排序取前 3000，按频率区间分组
+  // 6) 排序取前 N（用户选择的 1000 / 2000 / 3000），按频率区间分组
+  //    「全部课标词」模式：取全部词条（含频次 0），不做截断
   final entries = finalEntries.toList()
     ..sort((a, b) {
       final c = b.freq.compareTo(a.freq);
       if (c != 0) return c;
       return a.word.toLowerCase().compareTo(b.word.toLowerCase());
     });
-  final top = entries.take(3000).toList();
+  final top = allStdWords ? entries : entries.take(wordLimit).toList();
 
   final groups = <String, List<_WordEntry>>{};
   final groupOrder = <String>[];
@@ -1140,10 +1435,35 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
   }
 
   // 7) 生成目标格式文件（docx / xlsx）
+  // 教材语料：频次列与文档标题、说明行统一改为教材口径（教材频次 /
+  // 教材高频词表 / 例句标注教材版本），避免出现「真题」字样造成口径混淆。
   final totalTokens = freq.values.fold<int>(0, (a, b) => a + b);
   final isDocx = format == 'docx';
-  final xlsxBytes = isDocx ? null : _buildXlsx(top, corpusFileCount: files.length, totalTokens: totalTokens);
-  final docxBytes = isDocx ? _buildDocx(top, corpusFileCount: files.length, totalTokens: totalTokens) : null;
+  final freqLabel = textbookCorpus ? '教材频次' : '真题频次';
+  final docTitle = textbookCorpus ? '教材高频词表' : '高考高频词表';
+  final subtitle = textbookCorpus
+      ? '共 ${top.length} 个高频词 · 教材 ${files.length} 册 · 总词次 $totalTokens · '
+          '例句标注教材版本，一般词 2 条、多义项 4 条'
+      : null;
+  final xlsxBytes = isDocx
+      ? null
+      : _buildXlsx(
+          top,
+          corpusFileCount: files.length,
+          totalTokens: totalTokens,
+          sheetName: docTitle,
+          freqLabel: freqLabel,
+        );
+  final docxBytes = isDocx
+      ? _buildDocx(
+          top,
+          corpusFileCount: files.length,
+          totalTokens: totalTokens,
+          title: docTitle,
+          subtitle: subtitle,
+          freqLabel: freqLabel,
+        )
+      : null;
 
   return {
     'format': isDocx ? 'docx' : 'xlsx',
@@ -1155,7 +1475,8 @@ Map<String, dynamic> _exportWorker(Map<String, dynamic> args) {
     'groupSummary': groupOrder.map((g) => '$g: ${groups[g]!.length}个').toList(),
     'cleanedExtWords': cleanedExtWords,
     'nonHeadCapsExcluded': nonHeadCapsExcluded,
-    'calendarOrdinalExcluded': calendarOrdinalExcludedSorted,
+    // 星期/月份/序数词不再剔除（均在课标词表内），保留字段兼容旧调用方
+    'calendarOrdinalExcluded': const <String>[],
   };
 }
 
@@ -1285,9 +1606,17 @@ String _xmlEscape(String s) => s
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&apos;');
 
+/// 例句前缀标签：真题按年份（2022），教材按版本·册次（人教版 必修一），
+/// 两者都取不到时退回「年份未知」。
+String _exampleTag(int year, String source) {
+  if (year > 0) return '（$year）';
+  final s = source.trim();
+  return s.isEmpty ? '（年份未知）' : '（$s）';
+}
+
 /// 构造行数据（xlsx / docx / txt 三格式共用，保证列与内容完全一致）。
 ///
-/// [showFreq] true = 高频统计（序号/单词/类型/真题频次/音标/词性/释义/例句1~4/
+/// [showFreq] true = 高频统计（序号/单词/类型/频次/音标/词性/释义/例句1~4/
 /// 拓展词列表/拓展词例句，13 列）；false = 词库导出（序号/单词/类型/音标/
 /// 词性/释义[+对应课标原词]，与高频统计同名列同宽，不另立版式）。
 List<List<String>> _buildTableRows(
@@ -1295,8 +1624,6 @@ List<List<String>> _buildTableRows(
   bool showFreq = true,
   bool showBaseStd = false,
 }) {
-  String yearTag(int year) => year > 0 ? '（$year）' : '（年份未知）';
-
   final rows = <List<String>>[];
   var idx = 0;
   for (final e in entries) {
@@ -1335,11 +1662,11 @@ List<List<String>> _buildTableRows(
       ]);
       continue;
     }
-    // 例句列：最多 4 条，标注年份
+    // 例句列：最多 4 条，标注年份 / 教材版本
     final exCols = <String>[
       for (var i = 0; i < 4; i++)
         i < e.examples.length
-            ? '${yearTag(e.examples[i].year)}${e.examples[i].text}'
+            ? '${_exampleTag(e.examples[i].year, e.examples[i].source)}${e.examples[i].text}'
             : '',
     ];
     // 拓展词列表：said(1122), says(480)；无拓展词则留空
@@ -1349,7 +1676,7 @@ List<List<String>> _buildTableRows(
       final head = '${m.word}(${m.freq})';
       if (m.examples.isEmpty) return '$head: ';
       final ex = m.examples.first;
-      return '$head: ${yearTag(ex.year)}${ex.text}';
+      return '$head: ${_exampleTag(ex.year, ex.source)}${ex.text}';
     }).join('；');
 
     rows.add([
@@ -1391,8 +1718,9 @@ Uint8List _buildDocx(
   bool showFreq = true,
   bool showBaseStd = false,
   bool styleEntries = true,
+  /// 频次标签：真题语料为「真题频次」，教材语料为「教材频次」。
+  String freqLabel = '真题频次',
 }) {
-  String yearTag(int year) => year > 0 ? '（$year）' : '（年份未知）';
 
   // 段落 helper：词条行加粗，普通行常规字号；blank 用于词条间空行。
   // colorHex 取七类规范色（[kExportWordStyles]）：Word 不加底纹，只写字色。
@@ -1442,7 +1770,7 @@ Uint8List _buildDocx(
     final bold = styleEntries ? (spec?.bold ?? true) : false;
     final headBuf = StringBuffer('$idx. ${e.word}');
     if (type.isNotEmpty) headBuf.write('（$type）');
-    if (showFreq) headBuf.write('真题频次：${e.freq}');
+    if (showFreq) headBuf.write('$freqLabel：${e.freq}');
     if (ph.isNotEmpty) headBuf.write(' /$ph/');
     bodyText.write(para(headBuf.toString(), bold: bold, colorHex: colorHex));
 
@@ -1456,11 +1784,12 @@ Uint8List _buildDocx(
       bodyText.write(para('对应课标原词：${e.baseStd}'));
     }
 
-    // 例句行：标注年份、按年份倒序（优先最近年份），一般词 2 条、多义项 4 条
+    // 例句行：标注年份 / 教材版本，一般词 2 条、多义项 4 条
     final examples = [...e.examples]..sort((a, b) => b.year.compareTo(a.year));
     for (var i = 0; i < examples.length; i++) {
       final ex = examples[i];
-      bodyText.write(para('例句${i + 1}${yearTag(ex.year)}：${ex.text}'));
+      bodyText.write(
+          para('例句${i + 1}${_exampleTag(ex.year, ex.source)}：${ex.text}'));
     }
 
     // 拓展词：标题独立一行，每个拓展词独立一行（word(频次): 例句；无例句仅 word(频次):）。
@@ -1473,7 +1802,8 @@ Uint8List _buildDocx(
           bodyText.write(para('$head:'));
         } else {
           final ex = m.examples.first;
-          bodyText.write(para('$head: ${yearTag(ex.year)}${ex.text}'));
+          bodyText.write(
+              para('$head: ${_exampleTag(ex.year, ex.source)}${ex.text}'));
         }
       }
     }
@@ -1535,6 +1865,8 @@ Uint8List _buildXlsx(
   String sheetName = '高考高频词表',
   bool showFreq = true,
   bool showBaseStd = false,
+  /// 频次列名：真题语料为「真题频次」，教材语料为「教材频次」。
+  String freqLabel = '真题频次',
 }) {
   final excel = Excel.createExcel();
   excel.rename('Sheet1', sheetName);
@@ -1544,7 +1876,7 @@ Uint8List _buildXlsx(
 
   final headers = <String>[
     '序号', '单词', '类型',
-    if (showFreq) '真题频次',
+    if (showFreq) freqLabel,
     '音标', '词性', '释义',
     if (showFreq) ...['例句1', '例句2', '例句3', '例句4'],
     if (showBaseStd) '对应课标原词',
@@ -1598,10 +1930,11 @@ Uint8List _buildTxt(
   required String subtitle,
   bool showFreq = true,
   bool showBaseStd = false,
+  String freqLabel = '真题频次',
 }) {
   final headers = <String>[
     '序号', '单词', '类型',
-    if (showFreq) '真题频次',
+    if (showFreq) freqLabel,
     '音标', '词性', '释义',
     if (showFreq) ...['例句1', '例句2', '例句3', '例句4'],
     if (showBaseStd) '对应课标原词',
